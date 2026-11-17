@@ -12,7 +12,7 @@
     },
     "stage": {
       "type": "string",
-      "enum": ["ocr", "llm"],
+      "enum": ["ocr", "llm", "render"],
       "description": "Which Python worker stage to run."
     },
     "workdir": {
@@ -78,6 +78,21 @@
           "type": "string",
           "default": "stub-v1",
           "description": "Model identifier passed to the LLM client."
+        }
+      }
+    },
+    "render": {
+      "type": "object",
+      "properties": {
+        "font": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a CJK TTF/OTF font. Falls back to MINIRETAIN_CJK_FONT env; required by the render stage."
+        },
+        "output": {
+          "type": "string",
+          "default": "translated.pdf",
+          "description": "Output filename inside the job workdir for the layout-preserved PDF."
         }
       }
     }

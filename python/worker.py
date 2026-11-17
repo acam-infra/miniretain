@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -17,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import load_schema, normalize  # noqa: E402
 from llm.scheduler import Scheduler, get_client  # noqa: E402
 from ocr.adapter import get_provider  # noqa: E402
+from render.layout import group_lines, render_pdf  # noqa: E402
 
 
 def _dump(path: Path, payload: dict) -> None:
@@ -42,11 +44,22 @@ def run_ocr(spec: dict, wd: Path) -> dict:
 
 def run_llm(spec: dict, wd: Path) -> dict:
     doc = json.loads((wd / "document.v1.json").read_text(encoding="utf-8"))
-    items = [
-        {"block_id": block["block_id"], "page_index": page["page_index"], "text": block["text"]}
+    lines = [
+        {"block_id": block["block_id"], "page_index": page["page_index"],
+         "text": block["text"], "bbox": block.get("bbox")}
         for page in doc["pages"]
         for block in page["blocks"]
     ]
+    # Group OCR lines in the same column into paragraphs for coherent translation,
+    # keeping the union bbox of each group for the render stage.
+    if any(line["bbox"] for line in lines):
+        items = group_lines(lines)
+    else:
+        items = [
+            {"block_id": line["block_id"], "page_index": line["page_index"],
+             "text": line["text"], "bbox": None, "line_bboxes": None}
+            for line in lines
+        ]
 
     cfg = spec["llm"]
     scheduler = Scheduler(
@@ -62,6 +75,8 @@ def run_llm(spec: dict, wd: Path) -> dict:
         {
             "block_id": item["block_id"],
             "page_index": item["page_index"],
+            "bbox": item.get("bbox"),
+            "line_bboxes": item.get("line_bboxes"),
             "translation": value,
         }
         for item, value in zip(items, translated)
@@ -87,6 +102,23 @@ def run_llm(spec: dict, wd: Path) -> dict:
     }
 
 
+def run_render(spec: dict, wd: Path) -> dict:
+    """Paint translated paragraphs back at their original OCR bboxes."""
+    payload = json.loads((wd / "translation.payload.json").read_text(encoding="utf-8"))
+    doc = json.loads((wd / "document.v1.json").read_text(encoding="utf-8"))
+    cfg = spec.get("render", {})
+    font = cfg.get("font") or os.environ.get("MINIRETAIN_CJK_FONT", "")
+    if not font or not Path(font).is_file():
+        raise SystemExit("render stage needs an existing CJK font (render.font or MINIRETAIN_CJK_FONT)")
+    widths = {
+        page["page_index"]: page.get("width", 1275)
+        for page in doc["pages"]
+    }
+    output = wd / cfg.get("output", "translated.pdf")
+    stats = render_pdf(spec["source"], payload["items"], str(output), font, widths)
+    return {"stage": "render", **stats}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--spec", required=True, help="path to the stage spec JSON")
@@ -105,6 +137,8 @@ def main() -> None:
         result = run_ocr(spec, wd)
     elif stage == "llm":
         result = run_llm(spec, wd)
+    elif stage == "render":
+        result = run_render(spec, wd)
     else:
         raise SystemExit(f"unknown stage {stage!r}")
 

@@ -37,17 +37,22 @@ func New(python, workerPath, schemaPath, dataRoot string, maxWorkers int, store 
 	}
 }
 
-// Run executes the minimal chain: ocr -> llm. Each stage gets its own spec
-// file and result file, so a failed stage can be retried independently.
+// Run executes ocr -> llm, plus an optional render stage when the caller asks
+// for layout-preserving output. Each stage has its own spec/result files so a
+// failed stage can be retried independently.
 func (e *Executor) Run(ctx context.Context, j *job.Job) {
-	setStatus(e.Store, j.ID, job.Running, "ocr", "")
-	for _, stage := range []string{"ocr", "llm"} {
+	stages := []string{"ocr", "llm"}
+	if _, ok := j.Params["render"]; ok {
+		stages = append(stages, "render")
+	}
+	setStatus(e.Store, j.ID, job.Running, stages[0], "")
+	for _, stage := range stages {
 		if err := e.runStage(ctx, j, stage); err != nil {
 			setStatus(e.Store, j.ID, job.Failed, stage, err.Error())
 			return
 		}
 	}
-	setStatus(e.Store, j.ID, job.Succeeded, "llm", "")
+	setStatus(e.Store, j.ID, job.Succeeded, stages[len(stages)-1], "")
 }
 
 func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error {

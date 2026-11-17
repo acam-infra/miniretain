@@ -18,6 +18,7 @@
 - `python/ocr/adapter.py` — `OCRProvider` 抽象；`paddle_adapter.py` 是 CPU 实现。
 - `python/llm/scheduler.py` — `LLMClient` 抽象 + `Scheduler`（分批/并发/重试/保序）。
 - `python/llm/openai_client.py` — OpenAI-compatible HTTP client（stdlib urllib）。
+- `python/render/layout.py` — 版式保持渲染：OCR 行按栏合并成段，翻译后回填原 bbox。
 - `contracts/task.spec.schema.json` — Go/Python 共用单一真源的契约。
 - `tools/smoke.sh` / `tools/smoke_real.sh` — stub / 真实 provider 端到端冒烟。
 
@@ -70,6 +71,34 @@
 调到 4~8 来并行请求，也支持 `-max-workers > 1` 并行多个 job，但那次验证
 两者都没打开。另外**未实现客户端限流**：提高并发会直接压到单一网关上，
 生产环境应先加 limiter 再放大并发。
+
+## 版式保持渲染（layout-preserving）
+
+retain-pdf 的核心特点是「翻译后仍保持原排版」。本仓库把这条链路补齐为三段：
+
+1. **ocr**：`paddle-cpu` provider 把 PDF 每页按 150dpi 渲染后做 PaddleOCR，产出
+   `document.v1.json`，每个文本行带像素坐标 `bbox` 与页面 `width/height`。
+2. **llm**：`run_llm` 用 `render.layout.group_lines()` 把同一栏、行距小于 1.2 倍行高的
+   相邻 OCR 行合并成段落（跨栏/居中标题按 x 中心分栏），整段送翻以保语义；
+   payload 里每个条目保留合并后的 `bbox` 和逐行 `line_bboxes`。
+3. **render**（可选 stage）：`run_render` 读 payload，用 PyMuPDF redaction 抹掉原英文
+   文本矩形（`apply_redactions(images=0, graphics=0)`，不动图表），再用 CJK 字体把译文
+   写回原 bbox，自动缩小字号至能放下，输出 `translated.pdf`。
+
+开启方式：建任务时带 `render` 对象（Go 执行器据此决定是否追加 render 阶段）：
+
+```json
+"render": {"font": "/abs/path/NotoSansCJKsc-Regular.otf", "output": "translated.pdf"}
+```
+
+字体也可经 `MINIRETAIN_CJK_FONT` 环境变量给出。实测（OSDI '24 ServerlessLLM 论文
+第 1 页，2 栏）：OCR 81 行 → 合并 8 段 → 8/8 段翻译成功 → 8/8 段回填，
+输出 PDF 保留标题/作者/双栏/页脚位置，英文文本已从内容流真正移除。
+`tools/smoke_layout.sh` 给出复跑方式。
+
+**当前边界**：字号上限 14pt、按字符断行（中英混排时英文单词可能被拆行）、
+段末若译文字数多于原文可能溢出到相邻区域；未做公式保护、跨页段落续接、
+字体子集嵌入与版面质量自动评分。
 
 ## 跨语言契约
 
