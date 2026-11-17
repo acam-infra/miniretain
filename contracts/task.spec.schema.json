@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "miniretain/task.spec.v1",
+  "title": "Miniretain task spec v1",
+  "description": "Single source of truth for the Go <-> Python boundary. Both sides load THIS file to validate and to fill defaults. Never hardcode a default in Go or Python separately.",
+  "type": "object",
+  "required": ["job_id", "stage", "workdir", "source", "target_lang", "ocr", "llm"],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "description": "Caller-visible job identifier, also the artifact directory name."
+    },
+    "stage": {
+      "type": "string",
+      "enum": ["ocr", "llm"],
+      "description": "Which Python worker stage to run."
+    },
+    "workdir": {
+      "type": "string",
+      "description": "Directory where spec.json / result.json / document.v1.json live."
+    },
+    "source": {
+      "type": "string",
+      "description": "Inline text to translate. A real build would pass a source_path here and the OCR adapter would read the PDF."
+    },
+    "target_lang": {
+      "type": "string",
+      "default": "zh",
+      "description": "Target language code."
+    },
+    "ocr": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["stub", "paddle-cpu"],
+          "default": "stub",
+          "description": "OCR adapter name. Register real providers in python/ocr/adapter.py."
+        }
+      }
+    },
+    "llm": {
+      "type": "object",
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["stub", "openai-compat"],
+          "default": "stub",
+          "description": "LLM client name. Register real clients in python/llm/scheduler.py."
+        },
+        "concurrency": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 1,
+          "description": "Max parallel LLM requests (scheduler-level)."
+        },
+        "batch_size": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "description": "Items per LLM request. Missing key MUST use the same default on both sides."
+        },
+        "max_retries": {
+          "type": "integer",
+          "default": 2,
+          "minimum": 0,
+          "description": "Retries per failed batch."
+        },
+        "timeout_ms": {
+          "type": "integer",
+          "default": 30000,
+          "minimum": 1,
+          "description": "Per-request timeout, milliseconds."
+        },
+        "model": {
+          "type": "string",
+          "default": "stub-v1",
+          "description": "Model identifier passed to the LLM client."
+        }
+      }
+    }
+  }
+}
