@@ -74,31 +74,32 @@
 
 ## 版式保持渲染（layout-preserving）
 
-retain-pdf 的核心特点是「翻译后仍保持原排版」。本仓库把这条链路补齐为三段：
+retain-pdf 的核心特点是「翻译后仍保持原排版」。本仓库把这条链路补齐为三段，并支持两种渲染引擎与双版本交付：
 
 1. **ocr**：`paddle-cpu` provider 把 PDF 每页按 150dpi 渲染后做 PaddleOCR，产出
    `document.v1.json`，每个文本行带像素坐标 `bbox` 与页面 `width/height`。
 2. **llm**：`run_llm` 用 `render.layout.group_lines()` 把同一栏、行距小于 1.2 倍行高的
    相邻 OCR 行合并成段落（跨栏/居中标题按 x 中心分栏），整段送翻以保语义；
-   payload 里每个条目保留合并后的 `bbox` 和逐行 `line_bboxes`。
-3. **render**（可选 stage）：`run_render` 读 payload，用 PyMuPDF redaction 抹掉原英文
-   文本矩形（`apply_redactions(images=0, graphics=0)`，不动图表），再用 CJK 字体把译文
-   写回原 bbox，自动缩小字号至能放下，输出 `translated.pdf`。
+   payload 保留合并后的 `bbox`、逐行 `line_bboxes` 与原始英文 `text`。
+3. **render**（可选 stage）：提供两大渲染引擎，均支持**同时输出纯中文版（CN）与双语合并对照版（Merged）**：
+   - **Typst 引擎（`engine: "typst"`，默认推荐）**：自动调用本地 Typst（如 0.12.0），利用结构化排版与网格/表格分别编译输出纯中文排版 PDF（`translated_cn.pdf`）与双语左右分栏对照 PDF（`translated_merged.pdf`）。排版工整，无溢出与字符断字风险。
+   - **PyMuPDF 引擎（`engine: "pymupdf"`）**：用 PyMuPDF redaction 抹掉原英文文本矩形（`apply_redactions(images=0, graphics=0)`，不动图表），再用 CJK 字体把译文写回原 bbox（输出 `translated_cn.pdf`）；同时自动将原 PDF 页面与翻译 PDF 页面交替穿插，生成逐页双语合并 PDF（`translated_merged.pdf`）。
 
 开启方式：建任务时带 `render` 对象（Go 执行器据此决定是否追加 render 阶段）：
 
 ```json
-"render": {"font": "/abs/path/NotoSansCJKsc-Regular.otf", "output": "translated.pdf"}
+"render": {
+  "engine": "typst",
+  "output_cn": "translated_cn.pdf",
+  "output_merged": "translated_merged.pdf"
+}
 ```
 
-字体也可经 `MINIRETAIN_CJK_FONT` 环境变量给出。实测（OSDI '24 ServerlessLLM 论文
-第 1 页，2 栏）：OCR 81 行 → 合并 8 段 → 8/8 段翻译成功 → 8/8 段回填，
-输出 PDF 保留标题/作者/双栏/页脚位置，英文文本已从内容流真正移除。
-`tools/smoke_layout.sh` 给出复跑方式。
+实测：
+- `tools/smoke_typst.sh`：端到端跑通 Go server + Typst，同时输出纯中文与双语合并对照两份 PDF。
+- `tools/smoke_layout.sh`：PyMuPDF 原位擦除回填测试。
 
-**当前边界**：字号上限 14pt、按字符断行（中英混排时英文单词可能被拆行）、
-段末若译文字数多于原文可能溢出到相邻区域；未做公式保护、跨页段落续接、
-字体子集嵌入与版面质量自动评分。
+**当前边界**：未做公式深度保护与跨页段落续接；PyMuPDF 模式下按字符断行，字号上限 14pt；Typst 模式依赖环境已安装 `typst`。
 
 ## 跨语言契约
 
@@ -111,7 +112,8 @@ Go 侧 `internal/worker/spec.go` 与 Python 侧 `python/contract.py` 都加载�
 
 ```sh
 go test ./...
-sh tools/smoke.sh          # stub provider，无需密钥
+sh tools/smoke.sh          # stub provider，无需密钥，测试基础管线
+sh tools/smoke_typst.sh    # 端到端 Typst 渲染，同时产出 cn 与 merged 译文 PDF
 # 真实 provider：先建隧道 ssh -N -L 18083:127.0.0.1:8083 ccds@100.99.0.3
 OPENAI_API_KEY_FILE=... OPENAI_BASE_URL=http://127.0.0.1:18083/v1 \
   MINIRETAIN_PYTHON=... sh tools/smoke_real.sh <pdf>

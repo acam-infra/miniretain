@@ -44,6 +44,7 @@ type createReq struct {
 	TargetLang string         `json:"target_lang"`
 	OCR        map[string]any `json:"ocr"`
 	LLM        map[string]any `json:"llm"`
+	Render     map[string]any `json:"render"`
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +87,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	if llm == nil {
 		llm = map[string]any{}
 	}
-	params, err := worker.Normalize(map[string]any{
+	taskParams := map[string]any{
 		"job_id":      id,
 		"stage":       "ocr",
 		"workdir":     "pending",
@@ -94,7 +95,11 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		"target_lang": lang,
 		"ocr":         ocr,
 		"llm":         llm,
-	}, h.Schema)
+	}
+	if req.Render != nil {
+		taskParams["render"] = req.Render
+	}
+	params, err := worker.Normalize(taskParams, h.Schema)
 	if err != nil {
 		writeErr(w, 400, "bad task parameters: "+err.Error())
 		return

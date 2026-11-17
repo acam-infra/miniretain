@@ -19,6 +19,7 @@ from contract import load_schema, normalize  # noqa: E402
 from llm.scheduler import Scheduler, get_client  # noqa: E402
 from ocr.adapter import get_provider  # noqa: E402
 from render.layout import group_lines, render_pdf  # noqa: E402
+from render.typst_renderer import render_typst  # noqa: E402
 
 
 def _dump(path: Path, payload: dict) -> None:
@@ -77,6 +78,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
             "page_index": item["page_index"],
             "bbox": item.get("bbox"),
             "line_bboxes": item.get("line_bboxes"),
+            "text": item.get("text"),
             "translation": value,
         }
         for item, value in zip(items, translated)
@@ -103,20 +105,59 @@ def run_llm(spec: dict, wd: Path) -> dict:
 
 
 def run_render(spec: dict, wd: Path) -> dict:
-    """Paint translated paragraphs back at their original OCR bboxes."""
+    """Render translated document into pure Chinese (cn) and bilingual merged versions."""
     payload = json.loads((wd / "translation.payload.json").read_text(encoding="utf-8"))
     doc = json.loads((wd / "document.v1.json").read_text(encoding="utf-8"))
     cfg = spec.get("render", {})
-    font = cfg.get("font") or os.environ.get("MINIRETAIN_CJK_FONT", "")
-    if not font or not Path(font).is_file():
-        raise SystemExit("render stage needs an existing CJK font (render.font or MINIRETAIN_CJK_FONT)")
-    widths = {
-        page["page_index"]: page.get("width", 1275)
-        for page in doc["pages"]
-    }
-    output = wd / cfg.get("output", "translated.pdf")
-    stats = render_pdf(spec["source"], payload["items"], str(output), font, widths)
-    return {"stage": "render", **stats}
+    engine = cfg.get("engine", "typst")
+
+    output_cn = wd / cfg.get("output_cn", "translated_cn.pdf")
+    output_merged = wd / cfg.get("output_merged", "translated_merged.pdf")
+    legacy_output = wd / cfg.get("output", "translated.pdf")
+
+    if engine == "typst":
+        stats = render_typst(
+            items=payload["items"],
+            workdir=wd,
+            output_cn=output_cn,
+            output_merged=output_merged,
+            legacy_output=legacy_output,
+            font=cfg.get("font", ""),
+        )
+        return {"stage": "render", **stats}
+    elif engine == "pymupdf":
+        font = cfg.get("font") or os.environ.get("MINIRETAIN_CJK_FONT", "")
+        if not font or not Path(font).is_file():
+            system_cjk = "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"
+            if Path(system_cjk).is_file():
+                font = system_cjk
+            else:
+                raise SystemExit("render stage needs an existing CJK font (render.font or MINIRETAIN_CJK_FONT)")
+        widths = {
+            page["page_index"]: page.get("width", 1275)
+            for page in doc["pages"]
+        }
+        stats = render_pdf(
+            source=spec["source"],
+            payload=payload["items"],
+            out=str(output_cn),
+            font=font,
+            page_widths=widths,
+            out_merged=str(output_merged),
+        )
+        if str(legacy_output) != str(output_cn):
+            import shutil
+            shutil.copyfile(output_cn, legacy_output)
+        return {
+            "stage": "render",
+            "engine": "pymupdf",
+            "output_cn": str(output_cn),
+            "output_merged": str(output_merged),
+            "output": str(legacy_output),
+            **stats,
+        }
+    else:
+        raise SystemExit(f"unknown render engine: {engine!r}")
 
 
 def main() -> None:

@@ -33,6 +33,13 @@ type Spec struct {
 		TimeoutMS   int    `json:"timeout_ms"`
 		Model       string `json:"model"`
 	} `json:"llm"`
+	Render *struct {
+		Engine       string `json:"engine"`
+		Font         string `json:"font"`
+		Output       string `json:"output"`
+		OutputCN     string `json:"output_cn"`
+		OutputMerged string `json:"output_merged"`
+	} `json:"render,omitempty"`
 }
 
 type Prop struct {

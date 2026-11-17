@@ -84,15 +84,31 @@
     "render": {
       "type": "object",
       "properties": {
+        "engine": {
+          "type": "string",
+          "enum": ["typst", "pymupdf"],
+          "default": "typst",
+          "description": "Render engine: 'typst' for structured typesetting, 'pymupdf' for in-place bbox replacement."
+        },
         "font": {
           "type": "string",
           "default": "",
-          "description": "Path to a CJK TTF/OTF font. Falls back to MINIRETAIN_CJK_FONT env; required by the render stage."
+          "description": "Path to a CJK TTF/OTF font (for PyMuPDF) or font family name (for Typst)."
         },
         "output": {
           "type": "string",
           "default": "translated.pdf",
-          "description": "Output filename inside the job workdir for the layout-preserved PDF."
+          "description": "Output filename inside the job workdir for backwards compatibility."
+        },
+        "output_cn": {
+          "type": "string",
+          "default": "translated_cn.pdf",
+          "description": "Output filename for the pure Chinese translated PDF."
+        },
+        "output_merged": {
+          "type": "string",
+          "default": "translated_merged.pdf",
+          "description": "Output filename for the bilingual merged comparison PDF."
         }
       }
     }

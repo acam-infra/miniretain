@@ -6,7 +6,7 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$ROOT"
 mkdir -p data
 
-export PATH=/usr/local/go/bin:$PATH
+export PATH=/data/tools/go/bin:/usr/local/go/bin:$PATH
 go build -o data/server ./cmd/server
 
 PORT=${PORT:-18080}

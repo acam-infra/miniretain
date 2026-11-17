@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import statistics
 
-import pymupdf
+try:
+    import pymupdf
+except ImportError:
+    pymupdf = None
 
 
 def _columns(lines: list[dict]) -> list[list[dict]]:
@@ -91,11 +94,34 @@ def _merge(lines: list[dict], page_index: int) -> dict:
     }
 
 
-def pdf_rect(bbox: list[float], scale: float) -> pymupdf.Rect:
+def pdf_rect(bbox: list[float], scale: float):
     """Pixel bbox (at OCR DPI) -> PDF-point rect."""
+    if pymupdf is None:
+        raise RuntimeError("pymupdf is required for pdf_rect")
     return pymupdf.Rect(
         bbox[0] / scale, bbox[1] / scale, bbox[2] / scale, bbox[3] / scale
     )
+
+
+def merge_interleaved(source_pdf: str, translated_pdf: str, out_merged: str) -> bool:
+    """Interleave original and translated pages: p0_orig, p0_trans, p1_orig, p1_trans..."""
+    try:
+        doc_orig = pymupdf.open(source_pdf)
+        doc_trans = pymupdf.open(translated_pdf)
+        doc_out = pymupdf.open()
+        max_p = max(len(doc_orig), len(doc_trans))
+        for i in range(max_p):
+            if i < len(doc_orig):
+                doc_out.insert_pdf(doc_orig, from_page=i, to_page=i)
+            if i < len(doc_trans):
+                doc_out.insert_pdf(doc_trans, from_page=i, to_page=i)
+        doc_out.save(out_merged, deflate=True)
+        doc_out.close()
+        doc_orig.close()
+        doc_trans.close()
+        return True
+    except Exception:
+        return False
 
 
 def render_pdf(
@@ -105,6 +131,7 @@ def render_pdf(
     font: str,
     page_widths: dict[int, float],
     min_size: float = 5.0,
+    out_merged: str | None = None,
 ) -> dict:
     """Write a copy of `source` with translated text painted at original bboxes.
 
@@ -145,4 +172,14 @@ def render_pdf(
             placed += 1
     doc.save(out, deflate=True)
     doc.close()
-    return {"placed": placed, "shrunk_steps": shrunk, "output": out}
+
+    merged_created = False
+    if out_merged:
+        merged_created = merge_interleaved(source, out, out_merged)
+
+    return {
+        "placed": placed,
+        "shrunk_steps": shrunk,
+        "output": out,
+        "output_merged": out_merged if merged_created else None,
+    }
