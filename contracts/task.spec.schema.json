@@ -34,7 +34,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["stub", "paddle-cpu"],
+          "enum": ["stub", "paddle-cpu", "pymupdf", "auto"],
           "default": "stub",
           "description": "OCR adapter name. Register real providers in python/ocr/adapter.py."
         }
@@ -78,6 +78,11 @@
           "type": "string",
           "default": "stub-v1",
           "description": "Model identifier passed to the LLM client."
+        },
+        "allow_partial": {
+          "type": "boolean",
+          "default": false,
+          "description": "If false, any failed/missing/empty translation item fails the llm stage."
         }
       }
     },
@@ -109,6 +114,23 @@
           "type": "string",
           "default": "translated_merged.pdf",
           "description": "Output filename for the bilingual merged comparison PDF."
+        },
+        "layout_mode": {
+          "type": "string",
+          "enum": ["auto", "preserve", "flow"],
+          "default": "auto",
+          "description": "Layout mode: 'preserve' for original-page overlay, 'flow' for A4 streaming, 'auto' picks preserve when PDF+bboxes exist."
+        },
+        "bilingual_mode": {
+          "type": "string",
+          "enum": ["auto", "side_by_side", "interleaved", "table"],
+          "default": "auto",
+          "description": "Bilingual output mode: 'side_by_side' (left orig + right trans), 'interleaved', 'table', or 'auto'."
+        },
+        "strict": {
+          "type": "boolean",
+          "default": false,
+          "description": "If true, any unplaced/overflowed block fails the render stage instead of preserving source text."
         }
       }
     }

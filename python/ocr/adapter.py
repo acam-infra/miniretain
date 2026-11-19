@@ -1,13 +1,14 @@
 """OCR adapter boundary.
 
-A real implementation (PaddleOCR / MinerU / GLM) only has to implement
-OCRProvider.parse(source) -> pages in the document.v1 shape below. The rest of
-the service does not change. The stub keeps this demo runnable offline.
+A real implementation (PyMuPDF / PaddleOCR / MinerU) only has to implement
+OCRProvider.parse(source) -> pages in the document.v1 shape below.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+
+from ocr.normalize import normalize_pages
 
 
 class OCRProvider(ABC):
@@ -15,7 +16,7 @@ class OCRProvider(ABC):
 
     @abstractmethod
     def parse(self, source: str) -> list[dict]:
-        """Return pages: [{page_index, width, height, blocks:[{block_id, kind, text}, ...]}]."""
+        """Return pages in document.v1 format."""
 
 
 class StubOCRProvider(OCRProvider):
@@ -29,12 +30,18 @@ class StubOCRProvider(OCRProvider):
             text = " ".join(line.strip() for line in para.splitlines() if line.strip())
             if text:
                 blocks.append({"block_id": f"b{len(blocks):04d}", "kind": "text", "text": text})
-        return [{"page_index": 0, "width": 595, "height": 842, "blocks": blocks}]
+        raw_pages = [{"page_index": 0, "width": 595, "height": 842, "blocks": blocks}]
+        return normalize_pages(raw_pages, coord_space="pdf_pt", dpi=72.0)
 
 
 from ocr.paddle_adapter import PaddleOCRProvider  # noqa: E402,F401
+from ocr.pymupdf_adapter import AutoOCRProvider, PyMuPDFOCRProvider  # noqa: E402,F401
 
-REGISTRY: dict[str, OCRProvider] = {p.name: p for p in [StubOCRProvider()]}
+REGISTRY: dict[str, OCRProvider] = {
+    StubOCRProvider.name: StubOCRProvider(),
+    PyMuPDFOCRProvider.name: PyMuPDFOCRProvider(),
+    AutoOCRProvider.name: AutoOCRProvider(),
+}
 
 
 class _LazyPaddle(PaddleOCRProvider):

@@ -53,6 +53,8 @@ def _validate(node: dict, sch: dict, path: str) -> None:
             not isinstance(value, int) or isinstance(value, bool)
         ):
             raise ValueError(f"{path}.{name}: expected integer, got {value!r}")
+        if kind == "boolean" and not isinstance(value, bool):
+            raise ValueError(f"{path}.{name}: expected boolean, got {type(value).__name__}")
         choices = prop.get("enum")
         if choices and value not in choices:
             raise ValueError(f"{path}.{name}: {value!r} not in {choices}")

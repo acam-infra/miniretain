@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import time
 
+from ocr.normalize import normalize_pages
+
 
 class PaddleOCRProvider:
     name = "paddle-cpu"
@@ -50,4 +52,4 @@ class PaddleOCRProvider:
                 "blocks": blocks,
             })
         self.parse_seconds = round(time.time() - t0, 2)
-        return pages
+        return normalize_pages(pages, coord_space="pixel", dpi=150.0)
