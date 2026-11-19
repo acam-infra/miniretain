@@ -87,13 +87,17 @@ def register_provider(
     provider_or_factory: type[OCRProvider] | ProviderFactory | OCRProvider,
     *,
     replace: bool = False,
+    eager: bool = False,
 ) -> None:
-    """Register an OCR backend lazily by name for lookup via ``get_provider``.
+    """Register an OCR backend by name for lookup via ``get_provider``.
 
-    Provider classes and factory callables are stored without calling
-    ``factory(None)`` at registration time, so backends that require runtime
-    configuration (such as ``ocr.options.endpoint``) in ``__init__`` can be
-    registered at import time without failing or affecting other backends.
+    By default (``eager=False``), provider classes and factory callables are
+    stored lazily without calling ``factory(None)`` at registration time, so
+    backends that require runtime configuration (such as ``ocr.options.endpoint``)
+    in ``__init__`` can be registered at import time without failing or affecting
+    other backends. Built-in providers register with ``eager=True`` so
+    ``REGISTRY`` retains their default instances at import time (with
+    ``paddle-cpu`` still loading heavy models lazily on first ``parse()``).
     """
     if not isinstance(name, str) or not name.strip():
         raise OCRConfigError("provider name must be a non-empty string")
@@ -105,8 +109,12 @@ def register_provider(
         _FACTORIES[key] = lambda _cfg, _inst=inst: _inst
         REGISTRY[key] = inst
     else:
-        _FACTORIES[key] = _to_factory(provider_or_factory)
-        REGISTRY.pop(key, None)
+        factory = _to_factory(provider_or_factory)
+        _FACTORIES[key] = factory
+        if eager:
+            REGISTRY[key] = factory(None)
+        else:
+            REGISTRY.pop(key, None)
 
 
 def unregister_provider(name: str) -> None:
@@ -134,14 +142,13 @@ def get_provider(name: str, config: dict[str, Any] | None = None) -> OCRProvider
             return REGISTRY[name]
         if name in _FACTORIES:
             inst = _FACTORIES[name](None)
-            if name == _LazyPaddle.name:
-                REGISTRY[name] = inst
+            REGISTRY[name] = inst
             return inst
     raise OCRConfigError(f"unknown OCR provider {name!r}; available: {list_providers()}")
 
 
-register_provider(StubOCRProvider.name, StubOCRProvider)
-register_provider(PyMuPDFOCRProvider.name, PyMuPDFOCRProvider)
-register_provider(PaddleHTTPOCRProvider.name, PaddleHTTPOCRProvider)
-register_provider(AutoOCRProvider.name, AutoOCRProvider)
-register_provider(_LazyPaddle.name, _LazyPaddle)
+register_provider(StubOCRProvider.name, StubOCRProvider, eager=True)
+register_provider(PyMuPDFOCRProvider.name, PyMuPDFOCRProvider, eager=True)
+register_provider(PaddleHTTPOCRProvider.name, PaddleHTTPOCRProvider, eager=True)
+register_provider(AutoOCRProvider.name, AutoOCRProvider, eager=True)
+register_provider(_LazyPaddle.name, _LazyPaddle, eager=True)

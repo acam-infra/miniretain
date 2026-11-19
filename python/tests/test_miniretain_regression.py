@@ -967,3 +967,24 @@ def test_register_provider_is_lazy_for_required_options_endpoint(tmp_path: Path)
         srv.server_close()
 
 
+def test_builtin_registry_defaults_and_instance_reuse():
+    """Preserve baseline 680d079 REGISTRY contents, default instance reuse, lazy paddle-cpu, and isolated configured instances."""
+    from ocr.adapter import REGISTRY, get_provider
+
+    expected = ["auto", "paddle-cpu", "paddle-http", "pymupdf", "stub"]
+    assert sorted(REGISTRY) == expected
+
+    for name in expected:
+        assert get_provider(name) is REGISTRY[name]
+        assert get_provider(name) is get_provider(name)
+
+    # paddle-cpu remains lazy until first parse()
+    assert getattr(REGISTRY["paddle-cpu"], "_initialized", False) is False
+
+    # Passing config constructs a fresh independent instance without mutating the default singleton
+    custom_pymupdf = get_provider("pymupdf", config={"scanned_char_threshold": 5})
+    assert custom_pymupdf is not REGISTRY["pymupdf"]
+    assert custom_pymupdf.scanned_char_threshold == 5
+    assert REGISTRY["pymupdf"].scanned_char_threshold == 20
+
+
