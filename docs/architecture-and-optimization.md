@@ -17,8 +17,9 @@ Source PDF
   ▼ [Stage 2: LLM] python/worker.py:run_llm → formula_protect.py → llm/{context,planner,limiter,retry,scheduler,openai_client}.py
   │  Input : document.v1.json + llm.spec.json (+ optional MINIRETAIN_LLM_GLOBAL_CONCURRENCY / SLOT_DIR)
   │  Step 2a (Filter & Protect):
-  │    - Blocks with policy.translate=false (figure_label, formula, header_footer, unreliable_ocr,
-  │      reference_authors) are preserved verbatim (redact_source=false).
+  │    - Blocks with policy.translate=false (figure_label, numeric_axis_tick, formula, header_footer,
+  │      unreliable_ocr, reference_authors) are preserved verbatim (redact_source=false), keeping
+  │      log-scale exponent ticks (e.g., 10^3, 10^-1) and numeric axis ticks pixel-untouched.
   │    - Translatable blocks pass through protect_formulas(): display/inline math, LaTeX commands,
   │      O(...) complexity, URLs, DOIs, and reference [N]/authors become ⟪F0⟫... placeholders.
   │  Step 2b (Document Context):
@@ -110,5 +111,6 @@ Same input (`2611.20893.pdf`), same model (`gemini-3.6-flash`), same `geminiweb2
 
 - **Minor acronym casing drift**: Document context eliminated untranslated `Fig. N` (`0` remaining vs `Fig. 4` in baseline) and fixed `attention`/`expert` translation, but `KV Cache` vs `KV cache` still showed occasional casing variation (`12` vs `9` in `afcefde188018d85`). Deterministic post-pass normalization would be needed if 100% strict casing is required.
 - **Single-job gateway headroom**: Because the live `geminiweb2api` Go instance is configured with `per_ip_concurrent=32`, single-job runs at `concurrency=8` do not trigger 429s; the cross-process `max_llm_concurrency` limiter's benefit manifests under multi-job load or tighter upstream quotas.
-- **Pure-numeric axis ticks**: To keep 1:1 comparability with `536ecd3` (112 translatable / 72 preserved), pure numeric axis ticks (`5..35`, `10⁻¹..10³`) remain in the translatable set and render at `5.5–6.0pt`. A future `normalize.py` rule could preserve pure-numeric ticks as `figure_label`.
+- **Pure-numeric & log-scale axis ticks (fixed in Round 2)**: `normalize.py` now classifies pure numeric and power-of-10 exponent axis ticks (`5..35`, `10³..10⁻¹`, `10..1000`) as `figure_label` (`preserve_reason="numeric_axis_tick"`, `translate=false`, `redact_source=false`), excluding them from LLM translation and Typst redraw so superscript elevation (~3 pt) stays pixel-identical to the source PDF.
+- **Retry accounting invariant (fixed in Round 2)**: `scheduler.py` increments `retries` at dispatch time for every additional call (both batch retries and targeted single-item retries), guaranteeing `requests == batches + retries` across success, exhausted retries, and fatal-4xx fast-fail.
 

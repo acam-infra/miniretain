@@ -174,6 +174,8 @@ class Scheduler:
                 if decision.cooldown_s > 0:
                     self.retry_policy.note_cooldown(decision.cooldown_s)
                 if decision.retryable:
+                    with self._metrics_lock:
+                        self.stats["retries"] += 1
                     if decision.delay_s > 0:
                         time.sleep(decision.delay_s)
                     continue
@@ -221,9 +223,8 @@ class Scheduler:
                         assert isinstance(indexed_batch, list)
                         batch = [it for _, it in indexed_batch]
                         try:
-                            raw_out, retries, lat_s = fut.result()
+                            raw_out, _retries, lat_s = fut.result()
                             batch_latencies.append(lat_s)
-                            self.stats["retries"] += retries
                             norm = [
                                 _normalize_item_result(item, val)
                                 for item, val in zip(batch, raw_out)
@@ -250,6 +251,8 @@ class Scheduler:
                                 and orig_idx not in retried_indices
                             ):
                                 retried_indices.add(orig_idx)
+                                with self._metrics_lock:
+                                    self.stats["retries"] += 1
                                 rf = pool.submit(
                                     self._run_batch, [item], target_lang, model, doc_context
                                 )
@@ -263,11 +266,9 @@ class Scheduler:
                         assert isinstance(orig_idx, int)
                         item = items[orig_idx]
                         try:
-                            raw_out, retries, _lat = fut.result()
-                            self.stats["retries"] += 1 + retries
+                            raw_out, _retries, _lat = fut.result()
                             results[orig_idx] = _normalize_item_result(item, raw_out[0])
                         except Exception as exc:  # noqa: BLE001
-                            self.stats["retries"] += 1
                             results[orig_idx] = {
                                 "block_id": item["block_id"],
                                 "status": "failed",

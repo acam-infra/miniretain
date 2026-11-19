@@ -20,6 +20,13 @@ _HEADING_RE = re.compile(
 _REF_HEADING_RE = re.compile(r"^\s*(?:References|REFERENCES)\s*$")
 _EQ_NUM_RE = re.compile(r"\(\d+\)\s*$")
 _BIG_O_ONLY_RE = re.compile(r"^\s*O\([^)]+\)\s*$")
+_NUMERIC_TICK_RE = re.compile(
+    r"^(?:"
+    r"[+\-−]?\d+(?:[.,]\d+)?(?:\s*(?:[kKmMgGtT%]|e[+\-−]?\d+|×\s*10[+\-−⁰¹²³⁴⁵⁶⁷⁸⁹\d]*))?"
+    r"|10[+\-−⁰¹²³⁴⁵⁶⁷⁸⁹\d\-−]+"
+    r"|(?:[+\-−]?\d+(?:[.,]\d+)?[kKmM%]?(?:\s+|$)){2,8}"
+    r")$"
+)
 _MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεθλμσφψωΔΣΠΩ")
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
 
@@ -106,6 +113,18 @@ def cluster_figure_regions(
 
     # Keep only non-trivial regions (at least 30x20 pt)
     return [r for r in merged if (r[2] - r[0]) >= 30.0 and (r[3] - r[1]) >= 20.0]
+
+
+def _is_numeric_axis_tick(text: str) -> bool:
+    """Detect pure numeric / log-scale exponent axis ticks (e.g. '35', '1000', '103', '10−1', '10³').
+
+    Preserving these verbatim prevents PyMuPDF/Typst from flattening superscript
+    exponents (like 10^3 -> 103) and keeps axis tick geometry untouched.
+    """
+    s = text.strip()
+    if not s or len(s) > 32:
+        return False
+    return bool(_NUMERIC_TICK_RE.match(s))
 
 
 def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
@@ -256,6 +275,11 @@ def normalize_pages(
                 layout_role = "formula"
                 translate = False
                 preserve_reason = "formula"
+                redact_source = False
+            elif _is_numeric_axis_tick(text):
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "numeric_axis_tick"
                 redact_source = False
             elif bbox and (bbox[1] < page_h * 0.045 or bbox[3] > page_h * 0.96) and len(text) < 80:
                 layout_role = "header_footer"
