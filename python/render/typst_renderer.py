@@ -197,6 +197,7 @@ def _overlaps_neighbor(
     self_idx: int,
     neighbor_boxes: list[tuple[int, tuple[float, float, float, float]]],
     tol_pt: float = 1.5,
+    self_orig_box: tuple[float, float, float, float] | None = None,
 ) -> bool:
     for n_idx, nb in neighbor_boxes:
         if n_idx == self_idx:
@@ -206,6 +207,14 @@ def _overlaps_neighbor(
         x1 = min(placed_box[2], nb[2])
         y1 = min(placed_box[3], nb[3])
         if (x1 - x0) > tol_pt and (y1 - y0) > tol_pt:
+            if self_orig_box is not None:
+                ox0 = max(self_orig_box[0], nb[0])
+                oy0 = max(self_orig_box[1], nb[1])
+                ox1 = min(self_orig_box[2], nb[2])
+                oy1 = min(self_orig_box[3], nb[3])
+                # Ignore pre-existing source bbox touch/overlap if rendered box didn't grow past it
+                if (ox1 - ox0) > 0 and (oy1 - oy0) > 0 and (y1 - y0) <= (oy1 - oy0) + tol_pt:
+                    continue
             return True
     return False
 
@@ -291,7 +300,7 @@ def _find_compiled_overflow_blocks(
                         bad[bid] = "compiled_vertical_overflow"
                     elif sx1 > pw + 0.5 or sy1 > ph + 0.5 or sx0 < -0.5 or sy0 < -0.5:
                         bad[bid] = "compiled_out_of_bounds"
-                    elif _overlaps_neighbor((sx0, sy0, sx1, sy1), local_i, pm["neighbor_boxes"]):
+                    elif _overlaps_neighbor((sx0, sy0, sx1, sy1), local_i, pm["neighbor_boxes"], self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1)):
                         bad[bid] = "compiled_neighbor_overlap"
     return bad
 
