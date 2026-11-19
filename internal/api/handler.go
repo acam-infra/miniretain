@@ -2,6 +2,7 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -16,14 +17,42 @@ import (
 	"miniretain/internal/worker"
 )
 
+// JobDefaults holds server-level task defaults (typically loaded from --config YAML).
+// Per-request JSON fields in POST /v1/jobs override these defaults.
+type JobDefaults struct {
+	TargetLang    string
+	OCR           map[string]any
+	LLM           map[string]any
+	Render        map[string]any
+	RenderEnabled bool
+}
+
+// Options configures optional server-level defaults and redacted health metadata.
+type Options struct {
+	Defaults   JobDefaults
+	HealthInfo map[string]any
+}
+
 type Handler struct {
-	Store  *job.Store
-	Exec   *worker.Executor
-	Schema *worker.Schema
+	Store      *job.Store
+	Exec       *worker.Executor
+	Schema     *worker.Schema
+	Defaults   JobDefaults
+	HealthInfo map[string]any
 }
 
 func New(store *job.Store, exec *worker.Executor, schema *worker.Schema) http.Handler {
-	h := &Handler{Store: store, Exec: exec, Schema: schema}
+	return NewWithOptions(store, exec, schema, Options{})
+}
+
+func NewWithOptions(store *job.Store, exec *worker.Executor, schema *worker.Schema, opts Options) http.Handler {
+	h := &Handler{
+		Store:      store,
+		Exec:       exec,
+		Schema:     schema,
+		Defaults:   opts.Defaults,
+		HealthInfo: opts.HealthInfo,
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", h.health)
 	mux.HandleFunc("POST /v1/jobs", h.create)
@@ -35,16 +64,23 @@ func New(store *job.Store, exec *worker.Executor, schema *worker.Schema) http.Ha
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]any{"ok": true, "time": time.Now().UTC()})
+	resp := map[string]any{"ok": true, "time": time.Now().UTC()}
+	for k, v := range h.HealthInfo {
+		if k == "ok" || k == "time" {
+			continue
+		}
+		resp[k] = v
+	}
+	writeJSON(w, 200, resp)
 }
 
 type createReq struct {
-	Source     string         `json:"source"`
-	SourcePath string         `json:"source_path"`
-	TargetLang string         `json:"target_lang"`
-	OCR        map[string]any `json:"ocr"`
-	LLM        map[string]any `json:"llm"`
-	Render     map[string]any `json:"render"`
+	Source     string          `json:"source"`
+	SourcePath string          `json:"source_path"`
+	TargetLang string          `json:"target_lang"`
+	OCR        map[string]any  `json:"ocr"`
+	LLM        map[string]any  `json:"llm"`
+	Render     json.RawMessage `json:"render"`
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -77,16 +113,13 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	}
 	lang := req.TargetLang
 	if lang == "" {
+		lang = h.Defaults.TargetLang
+	}
+	if lang == "" {
 		lang = "zh"
 	}
-	ocr := req.OCR
-	if ocr == nil {
-		ocr = map[string]any{}
-	}
-	llm := req.LLM
-	if llm == nil {
-		llm = map[string]any{}
-	}
+	ocr := mergeMaps(h.Defaults.OCR, req.OCR)
+	llm := mergeMaps(h.Defaults.LLM, req.LLM)
 	taskParams := map[string]any{
 		"job_id":      id,
 		"stage":       "ocr",
@@ -96,8 +129,21 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		"ocr":         ocr,
 		"llm":         llm,
 	}
-	if req.Render != nil {
-		taskParams["render"] = req.Render
+	renderRaw := bytes.TrimSpace(req.Render)
+	switch {
+	case len(renderRaw) == 0:
+		if h.Defaults.RenderEnabled {
+			taskParams["render"] = mergeMaps(h.Defaults.Render, nil)
+		}
+	case bytes.Equal(renderRaw, []byte("null")):
+		// Explicit null disables default render for this job.
+	default:
+		var reqRender map[string]any
+		if err := json.Unmarshal(renderRaw, &reqRender); err != nil {
+			writeErr(w, 400, "invalid render object: "+err.Error())
+			return
+		}
+		taskParams["render"] = mergeMaps(h.Defaults.Render, reqRender)
 	}
 	params, err := worker.Normalize(taskParams, h.Schema)
 	if err != nil {
@@ -172,4 +218,27 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]any{"error": msg})
+}
+
+func mergeMaps(defaults, overrides map[string]any) map[string]any {
+	out := make(map[string]any, len(defaults)+len(overrides))
+	for k, v := range defaults {
+		if sub, ok := v.(map[string]any); ok {
+			out[k] = mergeMaps(sub, nil)
+		} else {
+			out[k] = v
+		}
+	}
+	for k, v := range overrides {
+		if subOver, ok := v.(map[string]any); ok {
+			if subDef, ok2 := out[k].(map[string]any); ok2 {
+				out[k] = mergeMaps(subDef, subOver)
+				continue
+			}
+			out[k] = mergeMaps(nil, subOver)
+			continue
+		}
+		out[k] = v
+	}
+	return out
 }

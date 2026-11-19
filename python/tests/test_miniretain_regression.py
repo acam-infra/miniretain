@@ -667,3 +667,182 @@ def test_scheduler_balanced_batching_preserves_order_and_parallel_retry():
     assert stats["retries"] >= 1
     assert stats["elapsed_s"] >= 0
 
+
+def test_ocr_provider_registration_and_config_passing():
+    """Verify custom OCR backend registration, config forwarding, and error contracts."""
+    from ocr.adapter import (
+        OCRConfigError,
+        OCRProvider,
+        get_provider,
+        list_providers,
+        register_provider,
+        unregister_provider,
+        validate_document_pages,
+    )
+    from ocr.normalize import normalize_pages
+
+    class _DemoCustomOCR(OCRProvider):
+        name = "demo-custom"
+
+        def parse(self, source: str) -> list[dict]:
+            prefix = (self.config.get("options") or {}).get("prefix", "custom")
+            raw = [{
+                "page_index": 0,
+                "width": 612.0,
+                "height": 792.0,
+                "blocks": [{
+                    "block_id": "p0b0000",
+                    "text": f"{prefix}: {source}",
+                    "bbox": [50.0, 50.0, 300.0, 70.0],
+                }],
+            }]
+            return normalize_pages(raw, coord_space="pdf_pt", dpi=72.0)
+
+    try:
+        register_provider("demo-custom", _DemoCustomOCR)
+        assert "demo-custom" in list_providers()
+
+        with pytest.raises(OCRConfigError):
+            register_provider("demo-custom", _DemoCustomOCR)
+
+        register_provider("demo-custom", _DemoCustomOCR, replace=True)
+        prov = get_provider("demo-custom", config={"options": {"prefix": "v2"}})
+        pages = validate_document_pages(prov.parse("hello"))
+        assert pages[0]["blocks"][0]["text"] == "v2: hello"
+
+        with pytest.raises(OCRConfigError):
+            get_provider("no-such-backend")
+    finally:
+        unregister_provider("demo-custom")
+
+
+def test_ocr_document_v1_contract_validation():
+    """Verify validate_document_pages rejects invalid coord_space, dpi, bbox, and policy."""
+    from ocr.adapter import OCRContractError, validate_document_pages
+
+    valid_page = {
+        "page_index": 0,
+        "width": 612.0,
+        "height": 792.0,
+        "coord_space": "pdf_pt",
+        "dpi": 72.0,
+        "is_scanned": False,
+        "ocr_reliable": True,
+        "figure_regions": [],
+        "blocks": [{
+            "block_id": "p0b0000",
+            "text": "ok",
+            "layout_role": "body",
+            "bbox": [10.0, 10.0, 100.0, 25.0],
+            "policy": {"translate": True, "preserve_reason": None, "redact_source": True},
+        }],
+    }
+    assert len(validate_document_pages([valid_page])) == 1
+
+    bad_coord = {**valid_page, "coord_space": "inches"}
+    with pytest.raises(OCRContractError, match="coord_space"):
+        validate_document_pages([bad_coord])
+
+    bad_bbox = {
+        **valid_page,
+        "blocks": [{**valid_page["blocks"][0], "bbox": [200.0, 10.0, 100.0, 25.0]}],
+    }
+    with pytest.raises(OCRContractError, match="inverted"):
+        validate_document_pages([bad_bbox])
+
+    bad_policy = {
+        **valid_page,
+        "blocks": [{**valid_page["blocks"][0], "policy": {"translate": "yes"}}],
+    }
+    with pytest.raises(OCRContractError, match="policy"):
+        validate_document_pages([bad_policy])
+
+
+def test_auto_ocr_mixed_digital_and_scanned_routing_via_config(tmp_path: Path, monkeypatch):
+    """Verify auto provider routes digital page -> PyMuPDF and scanned page -> paddle-http via config."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from ocr.adapter import get_provider, validate_document_pages
+
+    class _MockPaddle(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            body = json.dumps({"status": "ok", "paddleocr_version": "3.7.0", "coord_space": "pixel"}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or "0")
+            _ = self.rfile.read(n)
+            body = json.dumps({
+                "dpi": 150.0,
+                "coord_space": "pixel",
+                "bbox_format": "xyxy",
+                "blocks": [
+                    {"text": "Scanned page paragraph text.", "bbox": [100.0, 200.0, 800.0, 260.0], "score": 0.99},
+                ],
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), _MockPaddle)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        # Build a 2-page PDF: page 0 digital text, page 1 rasterized scanned image
+        vec = _make_pdf(tmp_path / "vec_mixed.pdf")
+        mixed = tmp_path / "mixed.pdf"
+        with pymupdf.open(vec) as vdoc:
+            pix = vdoc[0].get_pixmap(dpi=150)
+            mdoc = pymupdf.open()
+            mdoc.insert_pdf(vdoc, from_page=0, to_page=0)
+            spage = mdoc.new_page(width=vdoc[0].rect.width, height=vdoc[0].rect.height)
+            spage.insert_image(spage.rect, stream=pix.tobytes("png"))
+            mdoc.save(mixed)
+            mdoc.close()
+
+        monkeypatch.delenv("PADDLE_OCR_URL", raising=False)
+        cfg = {
+            "paddle_http": {"base_url": f"http://127.0.0.1:{port}", "dpi": 150},
+            "auto": {"scanned_char_threshold": 20, "fallback_provider": "paddle-http"},
+        }
+        auto = get_provider("auto", config=cfg)
+        pages = validate_document_pages(auto.parse(str(mixed)))
+        assert len(pages) == 2
+        assert pages[0]["coord_space"] == "pdf_pt" and pages[0]["is_scanned"] is False
+        assert pages[1]["coord_space"] == "pixel" and pages[1]["is_scanned"] is True
+        assert auto.routed_providers == {"pymupdf": [0], "paddle-http": [1]}
+
+        # fallback_provider="none" disables scanned routing
+        auto_none = get_provider("auto", config={"auto": {"fallback_provider": "none"}})
+        pages_none = validate_document_pages(auto_none.parse(str(mixed)))
+        assert pages_none[1]["is_scanned"] is True
+        assert pages_none[1]["ocr_reliable"] is False
+        assert auto_none.routed_providers == {"pymupdf": [0, 1]}
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_typst_bin_env_override(monkeypatch):
+    """Verify find_typst respects TYPST_BIN and fails clearly on invalid path."""
+    from render.typst_renderer import find_typst
+
+    real_typst = find_typst()
+    monkeypatch.setenv("TYPST_BIN", real_typst)
+    assert find_typst() == real_typst
+
+    monkeypatch.setenv("TYPST_BIN", "/nonexistent/typst-bin-xyz")
+    with pytest.raises(RuntimeError, match="TYPST_BIN"):
+        find_typst()
+
+

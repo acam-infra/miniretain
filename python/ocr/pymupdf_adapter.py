@@ -5,6 +5,7 @@ import re
 import time
 import pymupdf
 
+from ocr.base import OCRConfigError, OCRProvider
 from ocr.normalize import cluster_figure_regions, normalize_pages
 
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
@@ -125,7 +126,9 @@ def _build_block_from_lines(
     }, len(text)
 
 
-def _extract_page_blocks(page: pymupdf.Page) -> tuple[list[dict], list[list[float]], bool]:
+def _extract_page_blocks(
+    page: pymupdf.Page, *, scanned_char_threshold: int = 20
+) -> tuple[list[dict], list[list[float]], bool]:
     """Extract paragraph/line blocks and figure regions from a digital PDF page."""
     d = page.get_text("dict")
     raw_blocks = d.get("blocks", [])
@@ -149,7 +152,7 @@ def _extract_page_blocks(page: pymupdf.Page) -> tuple[list[dict], list[list[floa
                 blocks.append(blk)
                 total_chars += nchars
 
-    is_scanned = total_chars < 20 and len(image_rects) > 0
+    is_scanned = total_chars < scanned_char_threshold and len(image_rects) > 0
     blocks = _merge_split_references(blocks)
     return blocks, figure_regions, is_scanned
 
@@ -194,10 +197,19 @@ def _merge_split_references(blocks: list[dict]) -> list[dict]:
     return merged
 
 
-class PyMuPDFOCRProvider:
+class PyMuPDFOCRProvider(OCRProvider):
     """Native PDF layout extractor using PyMuPDF (fast, preserves fonts & drawings)."""
 
     name = "pymupdf"
+
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__(config=config)
+        auto_cfg = self.config.get("auto") if isinstance(self.config.get("auto"), dict) else {}
+        thresh = self.config.get("scanned_char_threshold", auto_cfg.get("scanned_char_threshold", 20))
+        self.scanned_char_threshold = int(thresh)
+        if self.scanned_char_threshold < 0:
+            raise OCRConfigError(f"scanned_char_threshold must be >= 0, got {self.scanned_char_threshold}")
+        self.parse_seconds: float = 0.0
 
     def parse(self, source: str) -> list[dict]:
         t0 = time.time()
@@ -205,7 +217,9 @@ class PyMuPDFOCRProvider:
         raw_pages: list[dict] = []
         try:
             for page in doc:
-                blocks, figure_regions, is_scanned = _extract_page_blocks(page)
+                blocks, figure_regions, is_scanned = _extract_page_blocks(
+                    page, scanned_char_threshold=self.scanned_char_threshold
+                )
                 raw_pages.append({
                     "page_index": page.number,
                     "width": float(page.rect.width),
@@ -221,14 +235,23 @@ class PyMuPDFOCRProvider:
         return normalize_pages(raw_pages, coord_space="pdf_pt", dpi=72.0)
 
 
-class AutoOCRProvider:
+class AutoOCRProvider(OCRProvider):
     """Uses native PyMuPDF on digital pages and routes scanned pages to local Paddle OCR."""
 
     name = "auto"
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__(config=config)
+        auto_cfg = self.config.get("auto") if isinstance(self.config.get("auto"), dict) else {}
+        self.scanned_char_threshold = int(auto_cfg.get("scanned_char_threshold", 20))
+        self.fallback_provider = str(auto_cfg.get("fallback_provider") or "").strip()
+        if self.fallback_provider and self.fallback_provider not in {"paddle-http", "paddle-cpu", "none"}:
+            raise OCRConfigError(
+                f"auto.fallback_provider must be one of ['paddle-http', 'paddle-cpu', 'none'], got {self.fallback_provider!r}"
+            )
         self.service_info: dict = {}
         self.paddle_pages: list[int] = []
+        self.routed_providers: dict[str, list[int]] = {}
         self.parse_seconds: float = 0.0
 
     def parse(self, source: str) -> list[dict]:
@@ -237,21 +260,32 @@ class AutoOCRProvider:
         t0 = time.perf_counter()
         self.service_info = {}
         self.paddle_pages = []
+        self.routed_providers = {}
         if not source.lower().endswith(".pdf"):
             from ocr.adapter import StubOCRProvider
-            return StubOCRProvider().parse(source)
+            pages = StubOCRProvider().parse(source)
+            self.routed_providers = {"stub": [p["page_index"] for p in pages]}
+            self.parse_seconds = round(time.perf_counter() - t0, 3)
+            return pages
 
-        pymupdf_prov = PyMuPDFOCRProvider()
+        pymupdf_prov = PyMuPDFOCRProvider(config={"scanned_char_threshold": self.scanned_char_threshold})
         pages = pymupdf_prov.parse(source)
         scanned_indices = {p["page_index"] for p in pages if p.get("is_scanned")}
-        paddle_url = os.environ.get("PADDLE_OCR_URL", "").strip()
+        digital_indices = sorted(p["page_index"] for p in pages if not p.get("is_scanned"))
 
-        if paddle_url:
+        paddle_http_cfg = (
+            self.config.get("paddle_http") if isinstance(self.config.get("paddle_http"), dict) else {}
+        )
+        paddle_url = str(paddle_http_cfg.get("base_url") or os.environ.get("PADDLE_OCR_URL", "")).strip()
+
+        if self.fallback_provider == "none":
+            self.routed_providers = {"pymupdf": [p["page_index"] for p in pages]}
+        elif (self.fallback_provider in ("", "paddle-http")) and paddle_url:
             from ocr.paddle_http_adapter import PaddleHTTPOCRProvider
 
-            paddle_http = PaddleHTTPOCRProvider(base_url=paddle_url)
+            paddle_http = PaddleHTTPOCRProvider(base_url=paddle_url, config=self.config)
             try:
-                self.service_info = paddle_http.health(timeout_s=3.0)
+                self.service_info = paddle_http.health(timeout_s=min(paddle_http.health_timeout_s, 5.0))
             except Exception as exc:  # noqa: BLE001
                 self.service_info = {"status": "unreachable", "error": str(exc)}
                 if scanned_indices:
@@ -271,15 +305,32 @@ class AutoOCRProvider:
                     self.paddle_pages = sorted(scanned_indices)
                 finally:
                     doc.close()
-        elif scanned_indices and len(scanned_indices) == len(pages):
+            if digital_indices:
+                self.routed_providers["pymupdf"] = digital_indices
+            if self.paddle_pages:
+                self.routed_providers["paddle-http"] = list(self.paddle_pages)
+        elif scanned_indices and (
+            self.fallback_provider == "paddle-cpu" or len(scanned_indices) == len(pages)
+        ):
             try:
                 from ocr.paddle_adapter import PaddleOCRProvider
 
-                paddle = PaddleOCRProvider()
-                pages = paddle.parse(source)
+                paddle = PaddleOCRProvider(config=self.config)
+                paddle_pages = {p["page_index"]: p for p in paddle.parse(source)}
+                pages = [
+                    paddle_pages[p["page_index"]] if p["page_index"] in scanned_indices else p
+                    for p in pages
+                ]
                 self.paddle_pages = sorted(scanned_indices)
+                if digital_indices:
+                    self.routed_providers["pymupdf"] = digital_indices
+                self.routed_providers["paddle-cpu"] = list(self.paddle_pages)
             except Exception:
-                pass
+                if self.fallback_provider == "paddle-cpu":
+                    raise
+                self.routed_providers = {"pymupdf": [p["page_index"] for p in pages]}
+        else:
+            self.routed_providers = {"pymupdf": [p["page_index"] for p in pages]}
 
         self.parse_seconds = round(time.perf_counter() - t0, 3)
         return pages

@@ -1,22 +1,29 @@
-"""OCR adapter boundary.
+"""OCR adapter boundary, provider registry, and document.v1 output contract.
 
-A real implementation (PyMuPDF / PaddleOCR / MinerU) only has to implement
-OCRProvider.parse(source) -> pages in the document.v1 shape below.
+To add a new OCR backend:
+1. Subclass ``OCRProvider`` and implement ``parse(self, source: str) -> list[dict]``.
+2. Return normalized pages produced by ``ocr.normalize.normalize_pages(...)`` in
+   either ``pdf_pt`` (72 DPI) or ``pixel`` (rasterization DPI) coordinate space.
+3. Register the backend via ``register_provider("my-backend", MyProvider)`` (and add
+   the name to ``contracts/task.spec.schema.json`` ``ocr.provider.enum`` when exposing
+   it through the Go HTTP API / YAML config).
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
+from collections.abc import Callable
+from typing import Any
 
+from ocr.base import (  # noqa: F401
+    ALLOWED_COORD_SPACES,
+    OCRBackendUnavailableError,
+    OCRConfigError,
+    OCRContractError,
+    OCRError,
+    OCRProvider,
+    validate_document_pages,
+)
 from ocr.normalize import normalize_pages
-
-
-class OCRProvider(ABC):
-    name = "base"
-
-    @abstractmethod
-    def parse(self, source: str) -> list[dict]:
-        """Return pages in document.v1 format."""
 
 
 class StubOCRProvider(OCRProvider):
@@ -38,32 +45,90 @@ from ocr.paddle_adapter import PaddleOCRProvider  # noqa: E402,F401
 from ocr.paddle_http_adapter import PaddleHTTPOCRProvider  # noqa: E402,F401
 from ocr.pymupdf_adapter import AutoOCRProvider, PyMuPDFOCRProvider  # noqa: E402,F401
 
-REGISTRY: dict[str, OCRProvider] = {
-    StubOCRProvider.name: StubOCRProvider(),
-    PyMuPDFOCRProvider.name: PyMuPDFOCRProvider(),
-    PaddleHTTPOCRProvider.name: PaddleHTTPOCRProvider(),
-    AutoOCRProvider.name: AutoOCRProvider(),
-}
-
 
 class _LazyPaddle(PaddleOCRProvider):
     """Registered lazily: heavy models load on first parse(), not at import."""
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        OCRProvider.__init__(self, config=config)
         self._ocr = None
         self._fitz = None
+        self._initialized = False
 
     def parse(self, source: str) -> list[dict]:
-        if self._ocr is None:
-            super().__init__()
+        if not self._initialized:
+            super().__init__(config=self.config)
+            self._initialized = True
         return super().parse(source)
 
 
-REGISTRY[_LazyPaddle.name] = _LazyPaddle()
+ProviderFactory = Callable[[dict[str, Any] | None], OCRProvider]
+
+REGISTRY: dict[str, OCRProvider] = {}
+_FACTORIES: dict[str, ProviderFactory] = {}
 
 
-def get_provider(name: str) -> OCRProvider:
-    try:
-        return REGISTRY[name]
-    except KeyError as exc:
-        raise ValueError(f"unknown OCR provider {name!r}; available: {sorted(REGISTRY)}") from exc
+def _to_factory(provider_or_factory: type[OCRProvider] | ProviderFactory | OCRProvider) -> ProviderFactory:
+    if isinstance(provider_or_factory, OCRProvider):
+        inst = provider_or_factory
+        return lambda _cfg: inst
+    if isinstance(provider_or_factory, type) and issubclass(provider_or_factory, OCRProvider):
+        cls = provider_or_factory
+        return lambda cfg: cls(config=cfg)
+    if callable(provider_or_factory):
+        return provider_or_factory
+    raise OCRConfigError(
+        f"provider registration expects an OCRProvider subclass, instance, or callable; got {type(provider_or_factory).__name__}"
+    )
+
+
+def register_provider(
+    name: str,
+    provider_or_factory: type[OCRProvider] | ProviderFactory | OCRProvider,
+    *,
+    replace: bool = False,
+) -> None:
+    """Register an OCR backend by name for lookup via ``get_provider``."""
+    if not isinstance(name, str) or not name.strip():
+        raise OCRConfigError("provider name must be a non-empty string")
+    key = name.strip()
+    if key in _FACTORIES and not replace:
+        raise OCRConfigError(f"OCR provider {key!r} is already registered (pass replace=True to override)")
+    factory = _to_factory(provider_or_factory)
+    _FACTORIES[key] = factory
+    REGISTRY[key] = factory(None)
+
+
+def unregister_provider(name: str) -> None:
+    """Remove a registered OCR provider (primarily for tests)."""
+    _FACTORIES.pop(name, None)
+    REGISTRY.pop(name, None)
+
+
+def list_providers() -> list[str]:
+    """Return sorted names of all registered OCR providers."""
+    return sorted(set(REGISTRY) | set(_FACTORIES))
+
+
+def get_provider(name: str, config: dict[str, Any] | None = None) -> OCRProvider:
+    """Resolve a registered OCR provider, optionally configured with ``config``."""
+    if config is not None and not isinstance(config, dict):
+        raise OCRConfigError(f"ocr config must be a dict or None, got {type(config).__name__}")
+    if config:
+        if name in _FACTORIES:
+            return _FACTORIES[name](config)
+        if name in REGISTRY:
+            return REGISTRY[name]
+    else:
+        if name in REGISTRY:
+            return REGISTRY[name]
+        if name in _FACTORIES:
+            return _FACTORIES[name](None)
+    raise OCRConfigError(f"unknown OCR provider {name!r}; available: {list_providers()}")
+
+
+register_provider(StubOCRProvider.name, StubOCRProvider)
+register_provider(PyMuPDFOCRProvider.name, PyMuPDFOCRProvider)
+register_provider(PaddleHTTPOCRProvider.name, PaddleHTTPOCRProvider)
+register_provider(AutoOCRProvider.name, AutoOCRProvider)
+register_provider(_LazyPaddle.name, _LazyPaddle)

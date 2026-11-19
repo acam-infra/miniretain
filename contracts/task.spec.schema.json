@@ -37,6 +37,10 @@
           "enum": ["stub", "paddle-cpu", "paddle-http", "pymupdf", "auto"],
           "default": "stub",
           "description": "OCR adapter name. Register real providers in python/ocr/adapter.py."
+        },
+        "config": {
+          "type": "object",
+          "description": "Optional provider-specific OCR configuration (e.g. paddle_http, paddle_cpu, auto, options) passed to get_provider(name, config)."
         }
       }
     },

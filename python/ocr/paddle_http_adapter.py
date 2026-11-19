@@ -11,6 +11,7 @@ import urllib.request
 
 import pymupdf
 
+from ocr.base import OCRBackendUnavailableError, OCRConfigError, OCRProvider
 from ocr.normalize import cluster_figure_regions, normalize_pages
 
 
@@ -91,7 +92,7 @@ def _detect_scanned_figure_regions(
     return [r for r in merged if (r[2] - r[0]) >= 100.0 and (r[3] - r[1]) >= 60.0]
 
 
-class PaddleHTTPOCRProvider:
+class PaddleHTTPOCRProvider(OCRProvider):
     """Calls a local/tailnet PaddleOCR HTTP server (see python/ocr/paddle_server.py)."""
 
     name = "paddle-http"
@@ -101,27 +102,59 @@ class PaddleHTTPOCRProvider:
         base_url: str | None = None,
         dpi: float | None = None,
         timeout_s: float | None = None,
+        health_timeout_s: float | None = None,
+        config: dict | None = None,
     ) -> None:
-        self.base_url = (
-            base_url or os.environ.get("PADDLE_OCR_URL", "http://127.0.0.1:18085")
-        ).rstrip("/")
-        self.dpi = float(dpi if dpi is not None else os.environ.get("PADDLE_OCR_DPI", "150"))
-        self.timeout_s = float(
-            timeout_s if timeout_s is not None else os.environ.get("PADDLE_OCR_TIMEOUT_S", "180")
+        super().__init__(config=config)
+        sub = self.config.get("paddle_http") if isinstance(self.config.get("paddle_http"), dict) else {}
+        cfg_url = sub.get("base_url") or self.config.get("base_url")
+        cfg_dpi = sub.get("dpi") if "dpi" in sub else self.config.get("dpi")
+        cfg_timeout = sub.get("timeout_s") if "timeout_s" in sub else self.config.get("timeout_s")
+        cfg_health_timeout = (
+            sub.get("health_timeout_s")
+            if "health_timeout_s" in sub
+            else self.config.get("health_timeout_s")
         )
+
+        raw_url = base_url or cfg_url or os.environ.get("PADDLE_OCR_URL", "http://127.0.0.1:18085")
+        self.base_url = str(raw_url).strip().rstrip("/")
+        self.dpi = float(
+            dpi if dpi is not None else (cfg_dpi if cfg_dpi is not None else os.environ.get("PADDLE_OCR_DPI", "150"))
+        )
+        self.timeout_s = float(
+            timeout_s
+            if timeout_s is not None
+            else (cfg_timeout if cfg_timeout is not None else os.environ.get("PADDLE_OCR_TIMEOUT_S", "180"))
+        )
+        self.health_timeout_s = float(
+            health_timeout_s
+            if health_timeout_s is not None
+            else (
+                cfg_health_timeout
+                if cfg_health_timeout is not None
+                else os.environ.get("PADDLE_OCR_HEALTH_TIMEOUT_S", "5")
+            )
+        )
+        if not self.base_url.startswith(("http://", "https://")):
+            raise OCRConfigError(f"paddle-http base_url must start with http:// or https://, got {self.base_url!r}")
+        if self.dpi <= 0:
+            raise OCRConfigError(f"paddle-http dpi must be > 0, got {self.dpi!r}")
+        if self.timeout_s <= 0:
+            raise OCRConfigError(f"paddle-http timeout_s must be > 0, got {self.timeout_s!r}")
         self.service_info: dict = {}
         self.parse_seconds: float = 0.0
 
-    def health(self, timeout_s: float = 5.0) -> dict:
+    def health(self, timeout_s: float | None = None) -> dict:
+        use_timeout = float(timeout_s if timeout_s is not None else self.health_timeout_s)
         url = f"{self.base_url}/health"
         req = urllib.request.Request(url, method="GET")
         try:
-            with _opener_for(url).open(req, timeout=timeout_s) as resp:
+            with _opener_for(url).open(req, timeout=use_timeout) as resp:
                 info = json.loads(resp.read().decode("utf-8"))
                 self.service_info = info
                 return info
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"paddle-http health failed ({url}): {exc}") from exc
+            raise OCRBackendUnavailableError(f"paddle-http health failed ({url}): {exc}") from exc
 
     def parse_page(self, page: pymupdf.Page, dpi: float | None = None) -> dict:
         use_dpi = float(dpi or self.dpi)
@@ -139,9 +172,13 @@ class PaddleHTTPOCRProvider:
                 data = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:300].decode("utf-8", errors="replace")
-            raise RuntimeError(f"paddle-http HTTP {exc.code} on page {page.number}: {detail}") from exc
+            raise OCRBackendUnavailableError(
+                f"paddle-http HTTP {exc.code} on page {page.number}: {detail}"
+            ) from exc
         except Exception as exc:  # noqa: BLE001
-            raise RuntimeError(f"paddle-http request failed on page {page.number}: {exc}") from exc
+            raise OCRBackendUnavailableError(
+                f"paddle-http request failed on page {page.number}: {exc}"
+            ) from exc
 
         raw_blocks = data.get("blocks") or []
         blocks: list[dict] = []

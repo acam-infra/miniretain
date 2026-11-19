@@ -23,6 +23,7 @@ type Executor struct {
 	DataRoot   string // absolute path to data/jobs
 	MaxWorkers int
 	Store      *job.Store
+	ExtraEnv   []string // optional KEY=VAL overrides passed to Python worker processes
 
 	sem chan struct{}
 }
@@ -97,6 +98,9 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	cmd := exec.CommandContext(ctx, e.Python, e.WorkerPath,
 		"--spec", specPath, "--schema", e.SchemaPath)
 	cmd.Dir = wd
+	if len(e.ExtraEnv) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), e.ExtraEnv)
+	}
 	out, err := cmd.CombinedOutput()
 	durMS := time.Since(started).Milliseconds()
 	if err != nil {
@@ -134,4 +138,24 @@ func setStatus(s *job.Store, id string, st job.Status, stage, errMsg string) {
 			j.Error = errMsg
 		}
 	})
+}
+
+func mergeEnv(base, overrides []string) []string {
+	idx := make(map[string]int, len(base))
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		k, _, _ := strings.Cut(kv, "=")
+		idx[k] = len(out)
+		out = append(out, kv)
+	}
+	for _, kv := range overrides {
+		k, _, _ := strings.Cut(kv, "=")
+		if pos, ok := idx[k]; ok {
+			out[pos] = kv
+		} else {
+			idx[k] = len(out)
+			out = append(out, kv)
+		}
+	}
+	return out
 }

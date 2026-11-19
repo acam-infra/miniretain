@@ -4,13 +4,18 @@ from __future__ import annotations
 import os
 import time
 
+from ocr.base import OCRProvider
 from ocr.normalize import normalize_pages
 
 
-class PaddleOCRProvider:
+class PaddleOCRProvider(OCRProvider):
     name = "paddle-cpu"
 
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None) -> None:
+        super().__init__(config=config)
+        sub = self.config.get("paddle_cpu") if isinstance(self.config.get("paddle_cpu"), dict) else {}
+        self.dpi = float(sub.get("dpi") if "dpi" in sub else self.config.get("dpi", 150.0))
+        self.lang = str(sub.get("lang") or self.config.get("lang") or "en")
         os.environ.setdefault("FLAGS_use_mkldnn", "0")
         from paddleocr import PaddleOCR  # heavy import, lazy
 
@@ -18,7 +23,7 @@ class PaddleOCRProvider:
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
-            lang="en",
+            lang=self.lang,
             enable_mkldnn=False,
         )
         import fitz
@@ -30,7 +35,7 @@ class PaddleOCRProvider:
         doc = self._fitz.open(source)
         pages: list[dict] = []
         for page in doc:
-            pix = page.get_pixmap(dpi=150)
+            pix = page.get_pixmap(dpi=int(self.dpi))
             png = f"{source}.p{page.number}.png"
             pix.save(png)
             result = self._ocr.predict(png)
@@ -49,7 +54,9 @@ class PaddleOCRProvider:
                 "page_index": page.number,
                 "width": pix.width,
                 "height": pix.height,
+                "is_scanned": True,
+                "ocr_reliable": True,
                 "blocks": blocks,
             })
         self.parse_seconds = round(time.time() - t0, 2)
-        return normalize_pages(pages, coord_space="pixel", dpi=150.0)
+        return normalize_pages(pages, coord_space="pixel", dpi=self.dpi)

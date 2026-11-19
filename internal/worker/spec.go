@@ -23,7 +23,8 @@ type Spec struct {
 	Source     string `json:"source"`
 	TargetLang string `json:"target_lang"`
 	OCR        struct {
-		Provider string `json:"provider"`
+		Provider string         `json:"provider"`
+		Config   map[string]any `json:"config,omitempty"`
 	} `json:"ocr"`
 	LLM struct {
 		Provider     string `json:"provider"`
@@ -165,8 +166,14 @@ func validate(node map[string]any, p Prop, path string) error {
 				return fmt.Errorf("%s.%s: expected string, got %T", path, name, v)
 			}
 		case "integer":
-			n, ok := v.(float64)
-			if !ok || n != math.Trunc(n) {
+			switch n := v.(type) {
+			case float64:
+				if n != math.Trunc(n) {
+					return fmt.Errorf("%s.%s: expected integer, got %v", path, name, v)
+				}
+			case int, int64, int32:
+				// valid integer
+			default:
 				return fmt.Errorf("%s.%s: expected integer, got %v", path, name, v)
 			}
 		case "boolean":

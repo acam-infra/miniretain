@@ -22,7 +22,15 @@ _ASCII_RUN_RE = re.compile(r"[A-Za-z0-9_.,:;!?@#$%^&*()+=\-/<>\\\[\]{}|~`'\"]+")
 
 
 def find_typst() -> str:
-    """Find a usable typst binary."""
+    """Find a usable typst binary (respecting TYPST_BIN override first)."""
+    env_bin = os.environ.get("TYPST_BIN", "").strip()
+    if env_bin:
+        resolved = shutil.which(env_bin)
+        if resolved:
+            return resolved
+        if os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+            return env_bin
+        raise RuntimeError(f"TYPST_BIN={env_bin!r} not found or not executable.")
     candidate = shutil.which("typst")
     if candidate:
         return candidate

@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from contract import load_schema, normalize  # noqa: E402
 from llm.formula_protect import protect_formulas, restore_formulas  # noqa: E402
 from llm.scheduler import Scheduler, get_client  # noqa: E402
-from ocr.adapter import get_provider  # noqa: E402
+from ocr.adapter import get_provider, validate_document_pages  # noqa: E402
 from render.layout import find_cjk_font, group_lines, render_pdf  # noqa: E402
 from render.typst_renderer import render_typst  # noqa: E402
 
@@ -31,8 +31,9 @@ def _dump(path: Path, payload: dict) -> None:
 
 def run_ocr(spec: dict, wd: Path) -> dict:
     t0 = time.perf_counter()
-    provider = get_provider(spec["ocr"]["provider"])
-    pages = provider.parse(spec["source"])
+    ocr_cfg = spec["ocr"].get("config")
+    provider = get_provider(spec["ocr"]["provider"], config=ocr_cfg)
+    pages = validate_document_pages(provider.parse(spec["source"]))
     elapsed_s = round(time.perf_counter() - t0, 3)
     unreliable_pages = [p["page_index"] for p in pages if not p.get("ocr_reliable", True)]
     limitations = []
@@ -68,6 +69,8 @@ def run_ocr(spec: dict, wd: Path) -> dict:
         out["paddle_service"] = provider.service_info
     if getattr(provider, "paddle_pages", None):
         out["paddle_pages"] = provider.paddle_pages
+    if getattr(provider, "routed_providers", None):
+        out["routed_providers"] = provider.routed_providers
     return out
 
 
