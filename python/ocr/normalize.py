@@ -514,6 +514,19 @@ def normalize_pages(
                         merged_txt = child["text"].strip() + " " + best_parent["text"].lstrip()
                     best_parent["text"] = merged_txt
                     best_parent["content"]["text"] = merged_txt
+                child_lbs = child.get("line_bboxes") or [cb]
+                parent_lbs = list(best_parent.get("line_bboxes") or [best_parent["bbox"]])
+                for lb in child_lbs:
+                    if lb not in parent_lbs:
+                        parent_lbs.append(lb)
+                best_parent["line_bboxes"] = parent_lbs
+                pb = best_parent["bbox"]
+                best_parent["bbox"] = [
+                    min(pb[0], cb[0]),
+                    min(pb[1], cb[1]),
+                    max(pb[2], cb[2]),
+                    max(pb[3], cb[3]),
+                ]
                 child["policy"] = {
                     "translate": False,
                     "preserve_reason": "contained_in_parent",

@@ -268,7 +268,7 @@ def test_mitex_rich_text_currency_and_unbreakable_segments():
     assert r"#mitex(`\text{Attention}(Q,K,V)=\text{softmax}(QK^T)`)" in disp
 
     bt = typst_rich_text_expr("包含反引号：$a`b$", use_mitex=True)
-    assert "#mi(``a`b``)" in bt
+    assert "#mi(```a`b```)" in bt
 
     currency = typst_rich_text_expr(r"价格从 $50 到 $100，或 \$200。", use_mitex=True)
     assert "#mi(" not in currency
@@ -369,6 +369,7 @@ def test_contained_child_block_merged_and_suppressed():
     by_id = {b["block_id"]: b for b in norm[0]["blocks"]}
     assert by_id["p3b0016"]["policy"]["translate"] is True
     assert "i=1 qiki, has mean 0 and variance dk." in by_id["p3b0016"]["text"]
+    assert [368.58, 712.99, 503.88, 724.70] in by_id["p3b0016"]["line_bboxes"]
     assert by_id["p3b0017"]["policy"]["translate"] is False
     assert by_id["p3b0017"]["policy"]["preserve_reason"] == "contained_in_parent"
 
@@ -391,6 +392,15 @@ def test_python_signature_and_docstring_preserved():
     assert b["policy"]["translate"] is False
     assert b["policy"]["preserve_reason"] == "code_listing"
     assert _is_verbatim_untranslated_echo({"block_id": "p4b0004", "layout_role": "body"}, sig_text, "zh") is False
+
+
+def test_typst_raw_literal_backtick_fence():
+    from render.typst_renderer import _typst_raw_literal
+
+    assert _typst_raw_literal(r"\frac{1}{\sqrt{d_k}}") == r"`\frac{1}{\sqrt{d_k}}`"
+    # Single backtick inside expression must use >=3 backticks (`` is empty raw literal in Typst)
+    assert _typst_raw_literal("a`b") == "```a`b```"
+
 
 
 

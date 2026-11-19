@@ -118,7 +118,7 @@ def _breakable_url_display(url: str) -> str:
 def _typst_raw_literal(expr: str) -> str:
     """Wrap raw LaTeX in Typst backtick raw string without backslash/quote escaping."""
     max_bt = max((len(m.group(0)) for m in re.finditer(r"`+", expr)), default=0)
-    fence = "`" * max(1, max_bt + 1)
+    fence = "`" if max_bt == 0 else "`" * max(3, max_bt + 1)
     if max_bt > 0 and (expr.startswith("`") or expr.endswith("`")):
         return f"{fence} {expr} {fence}"
     return f"{fence}{expr}{fence}"
