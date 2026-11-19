@@ -88,15 +88,25 @@ def register_provider(
     *,
     replace: bool = False,
 ) -> None:
-    """Register an OCR backend by name for lookup via ``get_provider``."""
+    """Register an OCR backend lazily by name for lookup via ``get_provider``.
+
+    Provider classes and factory callables are stored without calling
+    ``factory(None)`` at registration time, so backends that require runtime
+    configuration (such as ``ocr.options.endpoint``) in ``__init__`` can be
+    registered at import time without failing or affecting other backends.
+    """
     if not isinstance(name, str) or not name.strip():
         raise OCRConfigError("provider name must be a non-empty string")
     key = name.strip()
-    if key in _FACTORIES and not replace:
+    if (key in _FACTORIES or key in REGISTRY) and not replace:
         raise OCRConfigError(f"OCR provider {key!r} is already registered (pass replace=True to override)")
-    factory = _to_factory(provider_or_factory)
-    _FACTORIES[key] = factory
-    REGISTRY[key] = factory(None)
+    if isinstance(provider_or_factory, OCRProvider):
+        inst = provider_or_factory
+        _FACTORIES[key] = lambda _cfg, _inst=inst: _inst
+        REGISTRY[key] = inst
+    else:
+        _FACTORIES[key] = _to_factory(provider_or_factory)
+        REGISTRY.pop(key, None)
 
 
 def unregister_provider(name: str) -> None:
@@ -123,7 +133,10 @@ def get_provider(name: str, config: dict[str, Any] | None = None) -> OCRProvider
         if name in REGISTRY:
             return REGISTRY[name]
         if name in _FACTORIES:
-            return _FACTORIES[name](None)
+            inst = _FACTORIES[name](None)
+            if name == _LazyPaddle.name:
+                REGISTRY[name] = inst
+            return inst
     raise OCRConfigError(f"unknown OCR provider {name!r}; available: {list_providers()}")
 
 

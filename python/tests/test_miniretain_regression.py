@@ -846,3 +846,124 @@ def test_typst_bin_env_override(monkeypatch):
         find_typst()
 
 
+def test_register_provider_is_lazy_for_required_options_endpoint(tmp_path: Path):
+    """Registering a provider that requires ocr.options.endpoint in __init__ must not fail at registration time."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from ocr.adapter import (
+        OCRConfigError,
+        OCRProvider,
+        get_provider,
+        list_providers,
+        register_provider,
+        unregister_provider,
+        validate_document_pages,
+    )
+    from ocr.normalize import normalize_pages
+
+    received: list[dict] = []
+
+    class _MockCustomHTTP(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or "0")
+            payload = self.rfile.read(n)
+            received.append({"path": self.path, "bytes": len(payload)})
+            body = json.dumps({
+                "blocks": [
+                    {"text": "Custom backend paragraph.", "bbox": [80.0, 120.0, 500.0, 160.0]},
+                ],
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    class _StrictCustomHTTPOCRProvider(OCRProvider):
+        name = "strict-custom-http"
+
+        def __init__(self, config: dict | None = None) -> None:
+            super().__init__(config=config)
+            opts = self.config.get("options") or {}
+            self.endpoint = str(opts.get("endpoint") or "").rstrip("/")
+            self.dpi = float(opts.get("dpi", 150.0))
+            if not self.endpoint.startswith(("http://", "https://")):
+                raise OCRConfigError("strict-custom-http requires ocr.options.endpoint (http/https URL)")
+
+        def parse(self, source: str) -> list[dict]:
+            import urllib.request
+
+            doc = pymupdf.open(source)
+            raw_pages: list[dict] = []
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            try:
+                for page in doc:
+                    pix = page.get_pixmap(dpi=int(self.dpi))
+                    req = urllib.request.Request(
+                        f"{self.endpoint}/ocr?dpi={self.dpi:.1f}&page_index={page.number}",
+                        data=pix.tobytes("png"),
+                        headers={"Content-Type": "image/png"},
+                        method="POST",
+                    )
+                    with opener.open(req, timeout=15) as resp:
+                        data = json.loads(resp.read().decode("utf-8"))
+                    blocks = [
+                        {
+                            "block_id": f"p{page.number}b{i:04d}",
+                            "text": item["text"],
+                            "bbox": [float(v) for v in item["bbox"]],
+                        }
+                        for i, item in enumerate(data.get("blocks", []))
+                    ]
+                    raw_pages.append({
+                        "page_index": page.number,
+                        "width": float(pix.width),
+                        "height": float(pix.height),
+                        "is_scanned": True,
+                        "ocr_reliable": True,
+                        "blocks": blocks,
+                    })
+            finally:
+                doc.close()
+            return normalize_pages(raw_pages, coord_space="pixel", dpi=self.dpi)
+
+    srv = HTTPServer(("127.0.0.1", 0), _MockCustomHTTP)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        # 1. Registration must NOT instantiate with None or raise OCRConfigError
+        register_provider(_StrictCustomHTTPOCRProvider.name, _StrictCustomHTTPOCRProvider)
+        assert "strict-custom-http" in list_providers()
+
+        # 2. Built-in backends remain completely unaffected
+        assert get_provider("stub").name == "stub"
+        assert get_provider("pymupdf").name == "pymupdf"
+
+        # 3. Instantiating without required options.endpoint fails clearly
+        with pytest.raises(OCRConfigError, match="ocr.options.endpoint"):
+            get_provider("strict-custom-http")
+
+        # 4. Instantiating with YAML-style ocr.options.endpoint succeeds and calls local HTTP server
+        pdf_path = _make_pdf(tmp_path / "custom_http_in.pdf")
+        prov = get_provider(
+            "strict-custom-http",
+            config={"options": {"endpoint": f"http://127.0.0.1:{port}", "dpi": 120}},
+        )
+        pages = validate_document_pages(prov.parse(str(pdf_path)))
+        assert len(pages) == 1
+        assert pages[0]["coord_space"] == "pixel"
+        assert pages[0]["dpi"] == 120.0
+        assert pages[0]["blocks"][0]["text"] == "Custom backend paragraph."
+        assert len(received) == 1
+        assert "dpi=120.0" in received[0]["path"]
+        assert received[0]["bytes"] > 100
+    finally:
+        unregister_provider(_StrictCustomHTTPOCRProvider.name)
+        srv.shutdown()
+        srv.server_close()
+
+

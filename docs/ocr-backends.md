@@ -40,6 +40,8 @@ provider = get_provider(
 
 在单 YAML 启动模式下，Go 服务端会将 YAML 的 `ocr.paddle_http`、`ocr.paddle_cpu`、`ocr.auto` 与 `ocr.options` 序列化进 `spec.ocr.config`（遵循 `contracts/task.spec.schema.json`），`python/worker.py:run_ocr()` 自动将其传给 `get_provider(spec["ocr"]["provider"], config=spec["ocr"].get("config"))`。
 
+> **延迟实例化约定**：`register_provider(name, MyProviderClass)` 仅保存工厂引用，**不会在模块导入/注册阶段调用 `MyProviderClass(None)`**。因此自定义后端可以安全地在 `__init__(self, config=None)` 中校验必填参数（如 `ocr.options.endpoint`），只有该后端被实际选中并调用 `get_provider(name, config=...)` 时才会实例化，不会影响 worker 导入或其他内置后端。
+
 ---
 
 ## 2. `document.v1` 输出契约
@@ -142,13 +144,14 @@ class CustomHTTPOCRProvider(OCRProvider):
             for page in doc:
                 pix = page.get_pixmap(dpi=int(self.dpi))
                 req = urllib.request.Request(
-                    f"{self.endpoint}/ocr",
+                    f"{self.endpoint}/ocr?dpi={self.dpi:.1f}&page_index={page.number}",
                     data=pix.tobytes("png"),
                     headers={"Content-Type": "image/png"},
                     method="POST",
                 )
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
                 try:
-                    with urllib.request.urlopen(req, timeout=60) as resp:
+                    with opener.open(req, timeout=60) as resp:
                         data = json.loads(resp.read().decode("utf-8"))
                 except Exception as exc:
                     raise OCRBackendUnavailableError(f"custom-http failed on page {page.number}: {exc}") from exc
