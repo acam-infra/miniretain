@@ -1,5 +1,6 @@
 """Typst renderer for Miniretain: supports layout-preserving per-page overlay
-(RetainPDF-aligned) with Typst-native measure() fit verification and A4 streaming fallback.
+(RetainPDF-aligned) with Typst-native measure() + compiled-span fit verification
+and A4 streaming fallback.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from render.layout import find_cjk_font, pdf_rect
 from render.side_by_side import build_side_by_side_pdf, merge_interleaved
 
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
+_ASCII_RUN_RE = re.compile(r"[A-Za-z0-9_.,:;!?@#$%^&*()+=\-/<>\\\[\]{}|~`'\"]+")
 
 
 def find_typst() -> str:
@@ -55,8 +57,27 @@ def typst_str_literal(text: str) -> str:
     return f'"{s}"'
 
 
+def _breakable_url_display(url: str) -> str:
+    """Insert zero-width spaces after URL separators so Typst can wrap long URLs."""
+    chunks = re.split(r"([/?&=])", url)
+    out: list[str] = []
+    i = 0
+    while i < len(chunks):
+        part = chunks[i]
+        if i + 1 < len(chunks) and chunks[i + 1] in "/?&= ":
+            part += chunks[i + 1]
+            i += 2
+        else:
+            i += 1
+        if part:
+            out.append(part)
+    if len(out) <= 1:
+        return f"#{typst_str_literal(url)}"
+    return "#sym.zws ".join(f"#{typst_str_literal(p)}" for p in out)
+
+
 def typst_rich_text_expr(text: str) -> str:
-    """Render text with clickable #link(url)[url] for URLs and literal strings elsewhere."""
+    """Render text with clickable #link(url)[breakable_url] for URLs and literals elsewhere."""
     parts: list[str] = []
     pos = 0
     for m in _URL_RE.finditer(text):
@@ -65,13 +86,36 @@ def typst_rich_text_expr(text: str) -> str:
         url = m.group(0).rstrip(".,;:")
         trail = m.group(0)[len(url):]
         ul = typst_str_literal(url)
-        parts.append(f"#link({ul})[#{ul}]")
+        parts.append(f"#link({ul})[{_breakable_url_display(url)}]")
         if trail:
             parts.append(f"#{typst_str_literal(trail)}")
         pos = m.end()
     if pos < len(text):
         parts.append(f"#{typst_str_literal(text[pos:])}")
     return "".join(parts) if parts else '""'
+
+
+def _unbreakable_segments(text: str) -> list[str]:
+    """Extract unbreakable horizontal segments (ASCII runs, split at URL break points)."""
+    segs: list[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(text):
+        before = text[pos : m.start()]
+        for am in _ASCII_RUN_RE.finditer(before):
+            segs.append(am.group(0))
+        url = m.group(0).rstrip(".,;:")
+        for part in re.findall(r"[^/?&=]+[/?&=]?", url):
+            segs.append(part)
+        pos = m.end()
+    tail = text[pos:]
+    for am in _ASCII_RUN_RE.finditer(tail):
+        segs.append(am.group(0))
+    # Also keep longest single CJK char as minimum width check
+    if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+        segs.append("汉")
+    # Deduplicate preserving longest segments first
+    uniq = sorted(set(s for s in segs if s), key=len, reverse=True)
+    return uniq[:12]
 
 
 def _typst_version(typst_bin: str) -> str:
@@ -99,7 +143,7 @@ def measure_blocks_with_typst(
     workdir: Path,
     candidates: list[dict],
 ) -> dict[tuple[int, float], tuple[float, float]]:
-    """Measure exact Typst (width_pt, height_pt) for all candidate (idx, size_pt) in one query."""
+    """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates."""
     if not candidates:
         return {}
     lines = [
@@ -111,13 +155,23 @@ def measure_blocks_with_typst(
         w = max(4.0, c["width"])
         weight = c["weight"]
         rich = c["rich_expr"]
+        segs = c["segments"]
         for sz in c["sizes"]:
             leading = "0.35em" if sz < 8.5 else "0.45em"
+            if segs:
+                seg_exprs = ", ".join(
+                    f"measure([#set text(size: {sz:.2f}pt, weight: \"{weight}\"); #{typst_str_literal(s)}]).width / 1pt"
+                    for s in segs
+                )
+                max_w_expr = f"calc.max({seg_exprs})"
+            else:
+                max_w_expr = "0.0"
             lines.append(
                 f'#context {{ let m = measure(block(width: {w:.2f}pt)'
                 f'[#set text(size: {sz:.2f}pt, weight: "{weight}"); '
                 f'#set par(leading: {leading}, justify: true); {rich}]); '
-                f'[#metadata((idx: {idx}, sz: {sz:.2f}, w: m.width / 1pt, h: m.height / 1pt)) <fit>] }}'
+                f'let tw = {max_w_expr}; '
+                f'[#metadata((idx: {idx}, sz: {sz:.2f}, tw: tw, h: m.height / 1pt)) <fit>] }}'
             )
     probe_typ = workdir / "fit_probe.typ"
     probe_typ.write_text("\n".join(lines), encoding="utf-8")
@@ -133,16 +187,8 @@ def measure_blocks_with_typst(
     out: dict[tuple[int, float], tuple[float, float]] = {}
     for row in rows:
         val = row.get("value") or {}
-        out[(int(val["idx"]), round(float(val["sz"]), 2))] = (float(val["w"]), float(val["h"]))
+        out[(int(val["idx"]), round(float(val["sz"]), 2))] = (float(val["tw"]), float(val["h"]))
     return out
-
-
-def _rect_overlap_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
-    x0 = max(a[0], b[0])
-    y0 = max(a[1], b[1])
-    x1 = min(a[2], b[2])
-    y1 = min(a[3], b[3])
-    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
 
 
 def _overlaps_neighbor(
@@ -161,6 +207,91 @@ def _overlaps_neighbor(
         if (x1 - x0) > tol_pt and (y1 - y0) > tol_pt:
             return True
     return False
+
+
+def _emit_overlay_typ(
+    page_meta: list[dict],
+    to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]],
+    font_families: str,
+) -> str:
+    lines: list[str] = [
+        '#set page(margin: 0pt, fill: none)',
+        f'#set text(font: {font_families}, lang: "zh", fill: black)',
+        '#set par(justify: true, leading: 0.45em)',
+        '',
+    ]
+    for pm in page_meta:
+        page_index = pm["page_index"]
+        pw, ph = pm["pw"], pm["ph"]
+        if page_index > 0:
+            lines.append("#pagebreak()")
+        lines.append(
+            f"#set page(width: {pw:.2f}pt, height: {ph:.2f}pt, margin: 0pt, fill: none)"
+        )
+        for it, rect, chosen_sz, _local_i in to_place_by_page.get(page_index, []):
+            is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
+            role = it.get("layout_role", "body")
+            weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
+            w = max(4.0, float(rect.width))
+            h = max(2.0, float(rect.height))
+            leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
+            rich = typst_rich_text_expr(it["translation"].strip())
+            lines.append(
+                f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
+                f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
+                f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"); '
+                f'#set par(leading: {leading}, justify: true); {rich}])'
+            )
+    return "\n".join(lines)
+
+
+def _find_compiled_overflow_blocks(
+    overlay_doc: pymupdf.Document,
+    page_meta: list[dict],
+    to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]],
+    tol_pt: float = 0.9,
+) -> dict[str, str]:
+    """Verify actual rendered glyph spans in compiled overlay.pdf stay inside their block rects."""
+    bad: dict[str, str] = {}
+    for pm in page_meta:
+        page_index = pm["page_index"]
+        pw, ph = pm["pw"], pm["ph"]
+        placed_list = to_place_by_page.get(page_index, [])
+        if not placed_list or page_index >= len(overlay_doc):
+            continue
+        opage = overlay_doc[page_index]
+        # Build spatial index of placed blocks on this page
+        for blk in opage.get_text("dict").get("blocks", []):
+            for line in blk.get("lines", []):
+                for span in line.get("spans", []):
+                    sx0, sy0, sx1, sy1 = span["bbox"]
+                    cx = (sx0 + sx1) / 2.0
+                    cy = (sy0 + sy1) / 2.0
+                    # Match span to the block whose origin/rect contains its start
+                    best = None
+                    best_dist = 1e9
+                    for it, rect, _sz, local_i in placed_list:
+                        # Span starts near or inside rect
+                        if sx0 >= rect.x0 - 2.0 and sy0 >= rect.y0 - 4.0 and sy0 <= rect.y1 + 2.0:
+                            d = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
+                            if rect.x0 - 2.0 <= cx <= rect.x1 + 2.0 and rect.y0 - 4.0 <= cy <= rect.y1 + 4.0:
+                                d *= 0.1
+                            if d < best_dist:
+                                best_dist = d
+                                best = (it, rect, local_i)
+                    if best is None:
+                        continue
+                    it, rect, local_i = best
+                    bid = it.get("block_id", "unknown")
+                    if sx1 > rect.x1 + tol_pt:
+                        bad[bid] = "compiled_horizontal_overflow"
+                    elif sy1 > rect.y1 + tol_pt:
+                        bad[bid] = "compiled_vertical_overflow"
+                    elif sx1 > pw + 0.5 or sy1 > ph + 0.5 or sx0 < -0.5 or sy0 < -0.5:
+                        bad[bid] = "compiled_out_of_bounds"
+                    elif _overlaps_neighbor((sx0, sy0, sx1, sy1), local_i, pm["neighbor_boxes"]):
+                        bad[bid] = "compiled_neighbor_overlap"
+    return bad
 
 
 def _render_typst_preserve(
@@ -193,7 +324,6 @@ def _render_typst_preserve(
     unplaced_reasons: dict[str, str] = {}
     failed_block_ids: list[str] = []
 
-    # Step 1: Collect all translatable candidates & page neighbor bboxes
     probe_candidates: list[dict] = []
     page_meta: list[dict] = []
     saved_links_by_page: dict[int, list[dict]] = {}
@@ -258,6 +388,7 @@ def _render_typst_preserve(
                     "height": max(2.0, float(rect.height)),
                     "weight": weight,
                     "rich_expr": typst_rich_text_expr(trans),
+                    "segments": _unbreakable_segments(trans),
                     "sizes": _candidate_sizes(start_sz, min_size),
                 }
                 probe_candidates.append(cand)
@@ -276,27 +407,17 @@ def _render_typst_preserve(
                 "candidates": p_candidates,
             })
 
-        # Step 2: Measure ALL candidates using actual Typst layout engine in one query
+        # Step 2: Measure ALL candidates (unbreakable token width + wrapped height) via Typst
         measured = measure_blocks_with_typst(
             typst_bin, font_dir, font_families, workdir, probe_candidates
         )
 
-        # Step 3: Select largest size >= min_size that fits box, page bounds, and doesn't overlap neighbors
-        overlay_pages_typ: list[str] = [
-            '#set page(margin: 0pt, fill: none)',
-            f'#set text(font: {font_families}, lang: "zh", fill: black)',
-            '#set par(justify: true, leading: 0.45em)',
-            '',
-        ]
-        per_page: list[dict] = []
-        to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float]]] = {}
-
+        # Step 3: Select largest size >= min_size passing token width, height, bounds, non-overlap
+        to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]] = {}
         for pm in page_meta:
             page_index = pm["page_index"]
-            page = doc[page_index]
-            pw, ph, scale = pm["pw"], pm["ph"], pm["scale"]
-            p_unplaced = 0
-            to_render: list[tuple[dict, pymupdf.Rect, float]] = []
+            pw, ph = pm["pw"], pm["ph"]
+            to_render: list[tuple[dict, pymupdf.Rect, float, int]] = []
 
             for cand in pm["candidates"]:
                 it = cand["item"]
@@ -306,11 +427,14 @@ def _render_typst_preserve(
                 fail_reason = "overflow"
 
                 for step_i, sz in enumerate(cand["sizes"]):
-                    mw, mh = measured.get((cand["idx"], round(sz, 2)), (1e9, 1e9))
-                    if mh > rect.height + 0.5 or mw > rect.width + 0.5:
-                        fail_reason = "overflow"
+                    tw, mh = measured.get((cand["idx"], round(sz, 2)), (1e9, 1e9))
+                    if tw > rect.width + 0.5:
+                        fail_reason = "horizontal_overflow"
                         continue
-                    placed_box = (rect.x0, rect.y0, rect.x0 + mw, rect.y0 + mh)
+                    if mh > rect.height + 0.5:
+                        fail_reason = "vertical_overflow"
+                        continue
+                    placed_box = (rect.x0, rect.y0, rect.x0 + rect.width, rect.y0 + mh)
                     if (
                         placed_box[0] < -0.5
                         or placed_box[1] < -0.5
@@ -328,64 +452,21 @@ def _render_typst_preserve(
 
                 if chosen_sz is None:
                     unplaced += 1
-                    p_unplaced += 1
                     unplaced_block_ids.append(bid)
                     unplaced_reasons[bid] = fail_reason
                     continue
 
-                to_render.append((it, rect, chosen_sz))
+                to_render.append((it, rect, chosen_sz, cand["local_i"]))
 
             to_place_by_page[page_index] = to_render
 
-            # Redact ONLY fitted blocks
-            redact_fill = (1, 1, 1) if pm["is_scanned"] else None
-            for it, _rect, _sz in to_render:
-                for lb in it.get("line_bboxes") or [it["bbox"]]:
-                    page.add_redact_annot(pdf_rect(lb, scale), fill=redact_fill)
-            if to_render:
-                page.apply_redactions(images=0, graphics=0, text=0)
-
-            if page_index > 0:
-                overlay_pages_typ.append("#pagebreak()")
-            overlay_pages_typ.append(
-                f"#set page(width: {pw:.2f}pt, height: {ph:.2f}pt, margin: 0pt, fill: none)"
-            )
-            for it, rect, chosen_sz in to_render:
-                is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
-                role = it.get("layout_role", "body")
-                weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
-                w = max(4.0, float(rect.width))
-                h = max(4.0, float(rect.height))
-                leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
-                rich = typst_rich_text_expr(it["translation"].strip())
-                overlay_pages_typ.append(
-                    f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
-                    f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
-                    f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"); '
-                    f'#set par(leading: {leading}, justify: true); {rich}])'
-                )
-
-            per_page.append({
-                "page_index": page_index,
-                "total_blocks": pm["total_blocks"],
-                "placed": len(to_render),
-                "preserved": pm["p_preserved"],
-                "unplaced": p_unplaced,
-                "failed": pm["p_failed"],
-                "width_pt": round(pw, 2),
-                "height_pt": round(ph, 2),
-            })
-
-        if strict and (unplaced_block_ids or failed_block_ids):
-            raise RuntimeError(
-                f"render strict mode failed: unplaced={unplaced_block_ids} "
-                f"(reasons={unplaced_reasons}), failed={failed_block_ids}"
-            )
-
-        # Step 4: Compile Typst overlay & composite; count `placed` ONLY after compile+composite succeed
+        # Step 4: Compile overlay.pdf BEFORE redacting source PDF and verify actual rendered glyph spans!
         overlay_typ = workdir / "overlay.typ"
         overlay_pdf = workdir / "overlay.pdf"
-        overlay_typ.write_text("\n".join(overlay_pages_typ), encoding="utf-8")
+        overlay_typ.write_text(
+            _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+            encoding="utf-8",
+        )
         proc = subprocess.run(
             [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
             capture_output=True,
@@ -395,16 +476,62 @@ def _render_typst_preserve(
         if proc.returncode != 0:
             raise RuntimeError(f"typst overlay compile failed: {proc.stderr.strip()}")
 
+        with pymupdf.open(overlay_pdf) as check_doc:
+            compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
+
+        if compiled_bad:
+            for page_index, plist in list(to_place_by_page.items()):
+                kept = []
+                for tup in plist:
+                    bid = tup[0].get("block_id", "unknown")
+                    if bid in compiled_bad:
+                        unplaced += 1
+                        unplaced_block_ids.append(bid)
+                        unplaced_reasons[bid] = compiled_bad[bid]
+                    else:
+                        kept.append(tup)
+                to_place_by_page[page_index] = kept
+            # Recompile clean overlay.pdf without overflowing blocks
+            overlay_typ.write_text(
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+                encoding="utf-8",
+            )
+            proc2 = subprocess.run(
+                [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if proc2.returncode != 0:
+                raise RuntimeError(f"typst overlay recompile failed: {proc2.stderr.strip()}")
+
+        if strict and (unplaced_block_ids or failed_block_ids):
+            raise RuntimeError(
+                f"render strict mode failed: unplaced={unplaced_block_ids} "
+                f"(reasons={unplaced_reasons}), failed={failed_block_ids}"
+            )
+
+        # Step 5: Now redact ONLY verified fitted blocks on source PDF, composite overlay, and count `placed`
         placed = 0
+        per_page: list[dict] = []
         with pymupdf.open(overlay_pdf) as overlay_doc:
             if len(overlay_doc) != len(doc):
                 raise RuntimeError(
                     f"overlay page count mismatch: source={len(doc)}, overlay={len(overlay_doc)}"
                 )
-            for page_index in range(len(doc)):
+            for pm in page_meta:
+                page_index = pm["page_index"]
                 page = doc[page_index]
-                page.show_pdf_page(page.rect, overlay_doc, page_index, overlay=True)
-                placed += len(to_place_by_page.get(page_index, []))
+                scale = pm["scale"]
+                to_render = to_place_by_page.get(page_index, [])
+                redact_fill = (1, 1, 1) if pm["is_scanned"] else None
+                for it, _rect, _sz, _li in to_render:
+                    for lb in it.get("line_bboxes") or [it["bbox"]]:
+                        page.add_redact_annot(pdf_rect(lb, scale), fill=redact_fill)
+                if to_render:
+                    page.apply_redactions(images=0, graphics=0, text=0)
+                    page.show_pdf_page(page.rect, overlay_doc, page_index, overlay=True)
+                    placed += len(to_render)
 
                 # Restore clickable URI links on rendered page (handling wrapped URLs)
                 existing_uris = {
@@ -417,20 +544,37 @@ def _render_typst_preserve(
                     uri = orig_lk["uri"]
                     found_rects = page.search_for(uri)
                     if not found_rects:
-                        # Match wrapped URL parts via domain/path prefix in words
                         domain = uri.split("://", 1)[-1].split("/", 1)[0]
-                        cand_words = [
+                        found_rects = [
                             pymupdf.Rect(w[0], w[1], w[2], w[3])
                             for w in words
-                            if domain in w[4] or (len(w[4]) >= 6 and w[4] in uri and ("/" in w[4] or "=" in w[4] or "?" in w[4]))
+                            if domain in w[4].replace("\u200b", "")
+                            or (
+                                len(w[4].replace("\u200b", "")) >= 6
+                                and w[4].replace("\u200b", "") in uri
+                                and ("/" in w[4] or "=" in w[4] or "?" in w[4])
+                            )
                         ]
-                        found_rects = cand_words
                     target_rects = found_rects if found_rects else [orig_lk["from"]]
                     for tr in target_rects:
                         sig = (round(tr.x0, 1), round(tr.y0, 1), uri)
                         if sig not in existing_uris:
                             page.insert_link({"kind": pymupdf.LINK_URI, "from": tr, "uri": uri})
                             existing_uris.add(sig)
+
+                p_unplaced = sum(
+                    1 for c in pm["candidates"] if c["item"].get("block_id") in unplaced_reasons
+                )
+                per_page.append({
+                    "page_index": page_index,
+                    "total_blocks": pm["total_blocks"],
+                    "placed": len(to_render),
+                    "preserved": pm["p_preserved"],
+                    "unplaced": p_unplaced,
+                    "failed": pm["p_failed"],
+                    "width_pt": round(pm["pw"], 2),
+                    "height_pt": round(pm["ph"], 2),
+                })
 
         output_cn.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_cn, garbage=4, deflate=True)

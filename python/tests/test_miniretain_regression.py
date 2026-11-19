@@ -439,3 +439,63 @@ def test_p1_typst_preserve_rejects_out_of_bounds_and_neighbor_overlap(tmp_path: 
             page_coord_spaces={0: "pdf_pt"},
             strict=True,
         )
+
+
+def test_p1_typst_unbreakable_bold_word_and_wrapped_url_fit(tmp_path: Path):
+    src = tmp_path / "horiz.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((12, 20), "OrigWide", fontsize=8)
+    page.insert_text((12, 80), "OrigURL", fontsize=8)
+    doc.save(src)
+    doc.close()
+
+    items = [
+        {
+            "block_id": "b_unbreakable",
+            "page_index": 0,
+            "bbox": [10.0, 10.0, 55.0, 25.0],  # 45x15 pt
+            "line_bboxes": [[10.0, 10.0, 55.0, 25.0]],
+            "layout_role": "heading",
+            "font_size_pt": 12.0,
+            "text": "OrigWide",
+            "translation": "WWWGGGGGGWWWW",
+            "translation_status": "ok",
+            "policy": {"translate": True, "redact_source": True},
+        },
+        {
+            "block_id": "b_url",
+            "page_index": 0,
+            "bbox": [10.0, 70.0, 210.0, 110.0],  # 200x40 pt
+            "line_bboxes": [[10.0, 70.0, 210.0, 110.0]],
+            "layout_role": "reference",
+            "font_size_pt": 8.0,
+            "text": "OrigURL",
+            "translation": "论文地址：https://www.sciencedirect.com/science/article/pii/S2542435126003624",
+            "translation_status": "ok",
+            "policy": {"translate": True, "redact_source": True},
+        },
+    ]
+    out_cn = tmp_path / "h_cn.pdf"
+    res = render_typst(
+        items=items,
+        workdir=tmp_path,
+        output_cn=out_cn,
+        output_merged=tmp_path / "h_sbs.pdf",
+        source=str(src),
+        layout_mode="preserve",
+        page_widths={0: 612.0},
+        page_coord_spaces={0: "pdf_pt"},
+        strict=False,
+    )
+    assert res["unplaced_block_ids"] == ["b_unbreakable"]
+    assert res["placed"] == 1
+    with pymupdf.open(out_cn) as cdoc:
+        txt = cdoc[0].get_text()
+        assert "OrigWide" in txt
+        assert "WWWGGGGGGWWWW" not in txt
+        for blk in cdoc[0].get_text("dict")["blocks"]:
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    if "sciencedirect" in sp["text"]:
+                        assert sp["bbox"][2] <= 211.0
