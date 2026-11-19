@@ -1,4 +1,6 @@
 __pycache__/
 *.pyc
+bin/
 data/
+miniretain.yaml
 *.log

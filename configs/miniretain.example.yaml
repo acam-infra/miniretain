@@ -1,0 +1,100 @@
+# Miniretain single-YAML declarative configuration example.
+#
+# Copy to ./miniretain.yaml (repo root) and start with:
+#   ./bin/miniretain --config ./miniretain.yaml
+#
+# Path resolution:
+# - Relative paths in this file are resolved relative to THIS YAML file's directory.
+# - Executable names without path separators (e.g. "python3", "typst") are looked up on PATH.
+# - If you keep this file under configs/, set paths.root to "..".
+#
+# Precedence (highest -> lowest):
+#   1. Per-request HTTP JSON body (POST /v1/jobs) for allowed task fields
+#   2. Explicit CLI flags (-addr, -root, -python, -max-workers)
+#   3. This YAML file (--config / MINIRETAIN_CONFIG)
+#   4. Process environment variables (OPENAI_BASE_URL, OPENAI_API_KEY, PADDLE_OCR_URL, TYPST_BIN, ...)
+#   5. contracts/task.spec.schema.json defaults
+
+server:
+  addr: ":18080"
+  read_header_timeout_ms: 5000
+
+paths:
+  # Project root containing contracts/ and python/.
+  # When copied to repo root as ./miniretain.yaml, use ".".
+  root: "."
+  # Directory where per-job workdirs (<data_dir>/<job_id>/) and PDF artifacts are written.
+  data_dir: "./data/jobs"
+  # Optional override; defaults to <paths.root>/contracts/task.spec.schema.json.
+  # schema: "./contracts/task.spec.schema.json"
+
+runtime:
+  # Python interpreter with PyMuPDF (pymupdf) installed (can be a venv path).
+  python: "python3"
+  # Typst 0.15.1 binary path or executable name (passed via TYPST_BIN to worker).
+  typst: "typst"
+  # Max concurrent Python worker processes across all jobs.
+  max_workers: 2
+
+# Default target language when POST /v1/jobs omits target_lang.
+target_lang: "zh"
+
+ocr:
+  # Available built-in backends: auto | pymupdf | paddle-http | paddle-cpu | stub
+  # - "auto": uses PyMuPDF on digital PDF pages and routes scanned pages to paddle-http (or paddle-cpu).
+  # - "pymupdf": native PDF extraction only (fast, pdf_pt @ 72 DPI).
+  # - "paddle-http": calls local/tailnet PaddleOCR HTTP service (pixel @ dpi).
+  provider: "auto"
+
+  paddle_http:
+    base_url: "http://127.0.0.1:18085"
+    dpi: 150
+    timeout_s: 180
+    health_timeout_s: 5
+
+  paddle_cpu:
+    dpi: 150
+    lang: "en"
+
+  auto:
+    # Pages with fewer than this many extracted chars and >= 1 image are treated as scanned.
+    scanned_char_threshold: 20
+    # Backend used for scanned pages under provider="auto": paddle-http | paddle-cpu | none
+    fallback_provider: "paddle-http"
+
+  # Free-form extra options forwarded to custom/future OCR providers via spec.ocr.config.options.
+  options: {}
+
+llm:
+  # Available built-in backends: openai-compat | stub
+  provider: "openai-compat"
+  # OpenAI-compatible gateway URL (e.g. geminiweb2api Go at http://<host>:8083/v1).
+  base_url: "http://127.0.0.1:8083/v1"
+  # Credentials MUST be referenced via env var name or secret file path (never plaintext in YAML).
+  api_key_env: "OPENAI_API_KEY"
+  # api_key_file: "/etc/miniretain/gw2a.key"
+  model: "gemini-3.6-flash"
+  batch_size: 18
+  concurrency: 8
+  max_retries: 2
+  timeout_ms: 120000
+  allow_partial: false
+
+render:
+  # When true, POST /v1/jobs runs the render stage automatically even if request omits "render".
+  # Callers can still pass "render": null to skip rendering for a specific job.
+  enabled: true
+  # Available engines: typst | pymupdf
+  engine: "typst"
+  # Font family name (for Typst, e.g. "Noto Serif CJK SC") or TTF/OTF path (for PyMuPDF).
+  # Empty string uses automatic CJK font discovery.
+  font: ""
+  # auto | preserve | flow
+  layout_mode: "auto"
+  # auto | side_by_side | interleaved | table
+  bilingual_mode: "auto"
+  output: "translated.pdf"
+  output_cn: "translated_cn.pdf"
+  output_merged: "translated_merged.pdf"
+  # If true, any unplaced/overflowed block fails the render stage instead of falling back.
+  strict: true

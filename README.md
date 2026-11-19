@@ -1,128 +1,101 @@
 # miniretain
 
-一个最小可跑的「Go 服务端 + Python worker」PDF 翻译服务骨架，从 `wxyhgk/retain-pdf`
-抽象而来，只保留服务端核心：对外任务接入、OCR 接入边界、LLM 任务调度。
-目标是把跨语言契约做到**单一真源**，并显式管理并发边界。
+一个面向论文与技术文档的保版式 PDF 翻译服务（「Go 服务端 + Python worker」架构），沿 `wxyhgk/retain-pdf` 抽象并强化了**跨语言单一真源契约**、**单 YAML 声明式启动**、**可扩展 OCR 后端接口**以及基于 **Typst `0.15.1`** 的原页 overlay 渲染与左右双语对照输出。
 
-> 边界：验证的是服务链路与契约，不是翻译质量。OCR/LLM 真实 provider 已接入
-> （Paddle CPU + OpenAI-compatible 网关），但排版重组/公式保护/段落续接未实现。
+- 详细安装、部署、配置表与排障见：[docs/deployment.md](docs/deployment.md)
+- OCR 后端注册、输出契约与扩展开发手册见：[docs/ocr-backends.md](docs/ocr-backends.md)
+- 单 YAML 启动示例配置见：[configs/miniretain.example.yaml](configs/miniretain.example.yaml)
 
-## 目录
+---
 
-- `cmd/server/main.go` — 服务入口，`-max-workers` 控制进程级并发。
-- `internal/api/handler.go` — 6 个 HTTP 接口（对外任务接入）。
-- `internal/worker/executor.go` — 用外部进程驱动 Python worker，信号量限流。
-- `internal/worker/spec.go` — 从 schema 加载并生成 spec（不硬编码默认值）。
-- `internal/job/job.go` — 内存任务存储（生产换 SQLite，API 不变）。
-- `python/worker.py` — 单 worker 入口，按 `spec.stage` 分派 ocr / llm。
-- `python/ocr/adapter.py` — `OCRProvider` 抽象；`paddle_adapter.py` 是 CPU 实现。
-- `python/llm/scheduler.py` — `LLMClient` 抽象 + `Scheduler`（分批/并发/重试/保序）。
-- `python/llm/openai_client.py` — OpenAI-compatible HTTP client（stdlib urllib）。
-- `python/render/layout.py` — 版式保持渲染：OCR 行按栏合并成段，翻译后回填原 bbox。
-- `contracts/task.spec.schema.json` — Go/Python 共用单一真源的契约。
-- `tools/smoke.sh` / `tools/smoke_real.sh` — stub / 真实 provider 端到端冒烟。
+## 核心特性
+
+1. **单 YAML 声明式启动（`--config <file.yaml>`）**
+   - 一份 YAML 集中声明监听地址、项目/任务目录、Python/Typst 可执行文件、worker 并发数、OCR 后端与连接参数、OpenAI-compatible 翻译网关与模型默认值、渲染默认值。
+   - 凭据仅支持环境变量名（`llm.api_key_env`）或密钥文件（`llm.api_key_file`），禁止明文落盘；未知字段、类型错误和无效后端在启动阶段立即报错退出。
+   - 完整保留旧版 CLI 参数与环境变量启动方式；优先级为：`HTTP 请求体 > 显式 CLI 参数 > YAML 配置 > 环境变量 > schema 默认值`。
+2. **可扩展 OCR 后端与 `document.v1` 契约**
+   - 内置 `auto`、`pymupdf`、`paddle-http`、`paddle-cpu`、`stub`，可由 YAML 或单次请求按需选用。
+   - `auto` 对数字 PDF 页走 PyMuPDF（`pdf_pt` @ 72 DPI，保留矢量图、字号、数学字体与超链接），对扫描页自动路由至 `paddle-http`（`pixel` @ 150 DPI）。
+   - 提供 `register_provider()` / `get_provider(name, config)` / `validate_document_pages()` 与结构化错误类型，便于接入新 OCR 后端。
+3. **保版式 Typst `0.15.1` 渲染与双产物输出**
+   - 支持原页坐标 overlay（`layout_mode: preserve`）与流式排版（`flow`），单次任务同时输出纯中文版（`translated_cn.pdf`）与左原右译双语对照版（`translated_merged.pdf`）。
+   - 支持图内标签与公式保护、双栏阅读顺序与跨页续接、严格落版校验（`render.strict: true`）以及字符均衡 LPT 并发翻译调度。
+
+---
+
+## 快速启动（单 YAML）
+
+```bash
+# 1. 复制配置模板并按需修改 python/typst/paddle/llm 地址与密钥引用
+cp configs/miniretain.example.yaml ./miniretain.yaml
+
+# 2. 编译并启动服务
+go build -o ./bin/miniretain ./cmd/server
+./bin/miniretain --config ./miniretain.yaml
+
+# 3. 健康检查
+curl --noproxy '*' -sS http://127.0.0.1:18080/health | jq .
+
+# 4. 提交 PDF 任务并轮询结果
+JOB_ID=$(curl --noproxy '*' -sS -X POST http://127.0.0.1:18080/v1/jobs \
+  -H "Content-Type: application/json" \
+  -d '{"source_path": "/abs/path/to/paper.pdf"}' | jq -r '.id')
+curl --noproxy '*' -sS "http://127.0.0.1:18080/v1/jobs/${JOB_ID}" | jq .
+curl --noproxy '*' -sS "http://127.0.0.1:18080/v1/jobs/${JOB_ID}/result" | jq .
+```
+
+产物默认落在 `./data/jobs/<job_id>/` 下的 `translated_cn.pdf` 与 `translated_merged.pdf`。完整步骤（含 Typst `0.15.1`、字体、Paddle HTTP、geminiweb2api Go）见 [docs/deployment.md](docs/deployment.md)。
+
+---
+
+## 目录结构
+
+- `cmd/server/main.go` — 服务入口，支持 `--config <file.yaml>` 及兼容旧 CLI 参数。
+- `internal/config/` — 单 YAML 严格解析、路径解析、启动校验与 worker 环境装配。
+- `internal/api/handler.go` — 6 个 HTTP 接口与请求级参数合并。
+- `internal/worker/` — 跨语言契约校验（`spec.go`）与子进程信号量执行器（`executor.go`）。
+- `internal/job/job.go` — 内存任务状态存储。
+- `contracts/task.spec.schema.json` — Go / Python 共享的唯一契约真源。
+- `configs/miniretain.example.yaml` — 可直接复制的单 YAML 配置模板。
+- `python/worker.py` — 单 worker 入口，按 `spec.stage` 分派 `ocr` / `llm` / `render`。
+- `python/ocr/` — `OCRProvider` 基类与契约校验（`base.py`）、注册表（`adapter.py`）、规范化器（`normalize.py`）、PyMuPDF/Auto（`pymupdf_adapter.py`）、Paddle HTTP 客户端/服务端（`paddle_http_adapter.py` / `paddle_server.py`）与本地 Paddle CPU（`paddle_adapter.py`）。
+- `python/llm/` — 公式占位保护（`formula_protect.py`）、字符均衡并发调度器（`scheduler.py`）与 OpenAI-compatible 客户端（`openai_client.py`）。
+- `python/render/` — Typst `0.15.1` 原页 overlay 渲染器（`typst_renderer.py`）、左右双语合成（`side_by_side.py`）与 PyMuPDF 渲染器（`layout.py`）。
+- `docs/deployment.md` / `docs/ocr-backends.md` — 部署运维指南与 OCR 后端接入文档。
+
+---
 
 ## HTTP 接口
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 健康检查 |
-| POST | `/v1/jobs` | 建任务，立即返回 202 + id，后台执行 |
-| GET | `/v1/jobs` | 列出任务 |
-| GET | `/v1/jobs/{id}` | 查单个任务状态 |
-| GET | `/v1/jobs/{id}/result` | 取结果（仅 succeeded） |
-| POST | `/v1/jobs/{id}/retry` | 重新入队 |
+| `GET` | `/health` | 健康检查（返回运行状态及脱敏配置摘要） |
+| `POST` | `/v1/jobs` | 创建任务，立即返回 `202` 与 `id`，后台异步执行 |
+| `GET` | `/v1/jobs` | 列出所有任务 |
+| `GET` | `/v1/jobs/{id}` | 查询单个任务状态、当前阶段与归一化参数 |
+| `GET` | `/v1/jobs/{id}/result` | 获取已完成任务的各阶段统计与产物路径（未完成返回 `409`） |
+| `POST` | `/v1/jobs/{id}/retry` | 重新入队执行 |
 
-建任务请求体示例：
+---
 
-```json
-{
-  "source_path": "/abs/path/to/doc.pdf",
-  "target_lang": "zh",
-  "ocr": {"provider": "paddle-cpu"},
-  "llm": {"provider": "openai-compat", "batch_size": 40, "concurrency": 4,
-          "max_retries": 1, "timeout_ms": 120000, "model": "gemini-3.6-flash"}
-}
+## 测试与回归
+
+```bash
+# Go 单元与配置校验回归
+go test -count=1 ./...
+
+# Python OCR / LLM / Typst 0.15.1 回归
+pytest -q python/tests/test_miniretain_regression.py
+
+# 离线冒烟脚本（无需外部密钥）
+sh tools/smoke.sh
+sh tools/smoke_typst.sh
 ```
 
-## 并发模型（concurrency）
-
-并发分两层，彼此独立：
-
-**1. Go 进程级：`-max-workers`（默认 2）**
-`cmd/server/main.go:19` 的 `-max-workers` 传入 `worker.New`，在
-`internal/worker/executor.go:26,36` 用一个带缓冲 channel `sem` 作信号量，
-限制**全服务同时运行的 Python worker 进程数**。每个 stage 进入前获取信号量，
-退出时释放（`executor.go:81-86`）。进程用 `exec.CommandContext` 启动
-（`executor.go:90`），请求/上下文取消会连带杀掉子进程，避免孤儿进程。
-这一层控制的是整机的进程/CPU 压力；单个 job 的 ocr→llm 仍是串行 stage。
-
-**2. Python 请求级：`llm.concurrency`（schema 默认 2）**
-`python/llm/scheduler.py:82` 用 `ThreadPoolExecutor(max_workers=concurrency)`
-并发发送分批 LLM 请求，`as_completed`（`:87`）收集结果，并按
-`results[start+offset] = value`（`:95-96`）**按原始下标回填**，所以完成顺序
-不影响输出顺序。每批失败按指数退避重试（`:63-72`，`min(0.05*2^attempt, 0.5)`）。
-`concurrency` 来自单一真源 `contracts/task.spec.schema.json:53-58`，
-`python/worker.py:54` 读取，Go/Python 两侧都不硬编码兜底值。
-
-**实测口径（诚实说明）**：真实端到端跑（`tools/smoke_real.sh:30`）里
-`llm.concurrency` 被显式设为 **1**，即 LLM 请求是**串行**的——所以之前
-「1412 块约 35 分钟」的数字**并未使用并发**。代码支持把 `llm.concurrency`
-调到 4~8 来并行请求，也支持 `-max-workers > 1` 并行多个 job，但那次验证
-两者都没打开。另外**未实现客户端限流**：提高并发会直接压到单一网关上，
-生产环境应先加 limiter 再放大并发。
-
-## 版式保持渲染（layout-preserving）
-
-retain-pdf 的核心特点是「翻译后仍保持原排版」。本仓库把这条链路补齐为三段，并支持两种渲染引擎与双版本交付：
-
-1. **ocr**：`paddle-cpu` provider 把 PDF 每页按 150dpi 渲染后做 PaddleOCR，产出
-   `document.v1.json`，每个文本行带像素坐标 `bbox` 与页面 `width/height`。
-2. **llm**：`run_llm` 用 `render.layout.group_lines()` 把同一栏、行距小于 1.2 倍行高的
-   相邻 OCR 行合并成段落（跨栏/居中标题按 x 中心分栏），整段送翻以保语义；
-   payload 保留合并后的 `bbox`、逐行 `line_bboxes` 与原始英文 `text`。
-3. **render**（可选 stage）：提供两大渲染引擎，均支持**同时输出纯中文版（CN）与双语合并对照版（Merged）**：
-   - **Typst 引擎（`engine: "typst"`，默认推荐）**：自动调用本地 Typst（如 0.12.0），利用结构化排版与网格/表格分别编译输出纯中文排版 PDF（`translated_cn.pdf`）与双语左右分栏对照 PDF（`translated_merged.pdf`）。排版工整，无溢出与字符断字风险。
-   - **PyMuPDF 引擎（`engine: "pymupdf"`）**：用 PyMuPDF redaction 抹掉原英文文本矩形（`apply_redactions(images=0, graphics=0)`，不动图表），再用 CJK 字体把译文写回原 bbox（输出 `translated_cn.pdf`）；同时自动将原 PDF 页面与翻译 PDF 页面交替穿插，生成逐页双语合并 PDF（`translated_merged.pdf`）。
-
-开启方式：建任务时带 `render` 对象（Go 执行器据此决定是否追加 render 阶段）：
-
-```json
-"render": {
-  "engine": "typst",
-  "output_cn": "translated_cn.pdf",
-  "output_merged": "translated_merged.pdf"
-}
-```
-
-实测：
-- `tools/smoke_typst.sh`：端到端跑通 Go server + Typst，同时输出纯中文与双语合并对照两份 PDF。
-- `tools/smoke_layout.sh`：PyMuPDF 原位擦除回填测试。
-
-**当前边界**：未做公式深度保护与跨页段落续接；PyMuPDF 模式下按字符断行，字号上限 14pt；Typst 模式依赖环境已安装 `typst`。
-
-## 跨语言契约
-
-`contracts/task.spec.schema.json` 是 Go 与 Python 之间唯一的字段/默认值来源。
-Go 侧 `internal/worker/spec.go` 与 Python 侧 `python/contract.py` 都加载同一文件
-做校验与默认值填充。新增字段只改 schema，避免 retain-pdf 那种「两边各写一份
-兜底值、某天静默分叉且无报错」的问题。
-
-## 跑法
-
-```sh
-go test ./...
-sh tools/smoke.sh          # stub provider，无需密钥，测试基础管线
-sh tools/smoke_typst.sh    # 端到端 Typst 渲染，同时产出 cn 与 merged 译文 PDF
-# 真实 provider：先建隧道 ssh -N -L 18083:127.0.0.1:8083 ccds@100.99.0.3
-OPENAI_API_KEY_FILE=... OPENAI_BASE_URL=http://127.0.0.1:18083/v1 \
-  MINIRETAIN_PYTHON=... sh tools/smoke_real.sh <pdf>
-```
-
-密钥只从环境变量/文件读取，不写入源码或产物。
+---
 
 ## 已知边界
 
-- 任务存储在内存，进程重启即丢失；生产换 SQLite。
-- OCR/LLM 为逐块平铺翻译，无版面重组/公式保护/段落续接。
-- 无限流、无持久化 checkpoint、无原子 rename、无权限体系。
+- 任务元数据存储在内存中，进程重启后内存索引清空（磁盘产物保留在 `paths.data_dir/<job_id>/`）；生产环境可替换 `internal/job` 为 SQLite。
+- 未内置客户端侧全局限流与鉴权体系，面向公网暴露前应加反向代理与限流策略。

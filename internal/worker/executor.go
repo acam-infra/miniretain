@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"miniretain/internal/job"
 )
@@ -22,6 +23,7 @@ type Executor struct {
 	DataRoot   string // absolute path to data/jobs
 	MaxWorkers int
 	Store      *job.Store
+	ExtraEnv   []string // optional KEY=VAL overrides passed to Python worker processes
 
 	sem chan struct{}
 }
@@ -92,10 +94,15 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 
 	// The worker reads BOTH the spec and the schema; no defaults are hardcoded
 	// in Python either.
+	started := time.Now()
 	cmd := exec.CommandContext(ctx, e.Python, e.WorkerPath,
 		"--spec", specPath, "--schema", e.SchemaPath)
 	cmd.Dir = wd
+	if len(e.ExtraEnv) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), e.ExtraEnv)
+	}
 	out, err := cmd.CombinedOutput()
+	durMS := time.Since(started).Milliseconds()
 	if err != nil {
 		tail := string(out)
 		if len(tail) > 800 {
@@ -113,6 +120,7 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	if err := json.Unmarshal(b, &result); err != nil {
 		return fmt.Errorf("decode %s result: %w", stage, err)
 	}
+	result["stage_wall_ms"] = durMS
 	e.Store.Update(j.ID, func(jj *job.Job) {
 		if jj.Result == nil {
 			jj.Result = map[string]any{}
@@ -130,4 +138,24 @@ func setStatus(s *job.Store, id string, st job.Status, stage, errMsg string) {
 			j.Error = errMsg
 		}
 	})
+}
+
+func mergeEnv(base, overrides []string) []string {
+	idx := make(map[string]int, len(base))
+	out := make([]string, 0, len(base)+len(overrides))
+	for _, kv := range base {
+		k, _, _ := strings.Cut(kv, "=")
+		idx[k] = len(out)
+		out = append(out, kv)
+	}
+	for _, kv := range overrides {
+		k, _, _ := strings.Cut(kv, "=")
+		if pos, ok := idx[k]; ok {
+			out[pos] = kv
+		} else {
+			idx[k] = len(out)
+			out = append(out, kv)
+		}
+	}
+	return out
 }

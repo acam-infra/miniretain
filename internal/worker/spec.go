@@ -23,22 +23,27 @@ type Spec struct {
 	Source     string `json:"source"`
 	TargetLang string `json:"target_lang"`
 	OCR        struct {
-		Provider string `json:"provider"`
+		Provider string         `json:"provider"`
+		Config   map[string]any `json:"config,omitempty"`
 	} `json:"ocr"`
 	LLM struct {
-		Provider    string `json:"provider"`
-		Concurrency int    `json:"concurrency"`
-		BatchSize   int    `json:"batch_size"`
-		MaxRetries  int    `json:"max_retries"`
-		TimeoutMS   int    `json:"timeout_ms"`
-		Model       string `json:"model"`
+		Provider     string `json:"provider"`
+		Concurrency  int    `json:"concurrency"`
+		BatchSize    int    `json:"batch_size"`
+		MaxRetries   int    `json:"max_retries"`
+		TimeoutMS    int    `json:"timeout_ms"`
+		Model        string `json:"model"`
+		AllowPartial bool   `json:"allow_partial"`
 	} `json:"llm"`
 	Render *struct {
-		Engine       string `json:"engine"`
-		Font         string `json:"font"`
-		Output       string `json:"output"`
-		OutputCN     string `json:"output_cn"`
-		OutputMerged string `json:"output_merged"`
+		Engine        string `json:"engine"`
+		Font          string `json:"font"`
+		Output        string `json:"output"`
+		OutputCN      string `json:"output_cn"`
+		OutputMerged  string `json:"output_merged"`
+		LayoutMode    string `json:"layout_mode"`
+		BilingualMode string `json:"bilingual_mode"`
+		Strict        bool   `json:"strict"`
 	} `json:"render,omitempty"`
 }
 
@@ -161,9 +166,19 @@ func validate(node map[string]any, p Prop, path string) error {
 				return fmt.Errorf("%s.%s: expected string, got %T", path, name, v)
 			}
 		case "integer":
-			n, ok := v.(float64)
-			if !ok || n != math.Trunc(n) {
+			switch n := v.(type) {
+			case float64:
+				if n != math.Trunc(n) {
+					return fmt.Errorf("%s.%s: expected integer, got %v", path, name, v)
+				}
+			case int, int64, int32:
+				// valid integer
+			default:
 				return fmt.Errorf("%s.%s: expected integer, got %v", path, name, v)
+			}
+		case "boolean":
+			if _, ok := v.(bool); !ok {
+				return fmt.Errorf("%s.%s: expected boolean, got %T", path, name, v)
 			}
 		}
 		if len(child.Enum) > 0 {
