@@ -52,29 +52,39 @@ class OpenAICompatLLMClient:
 
     name = "openai-compat"
 
+    def _resolve_key(self) -> str:
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        if key:
+            return key
+        key_file = os.environ.get("OPENAI_API_KEY_FILE", "").strip()
+        if key_file:
+            with open(key_file, encoding="utf-8") as fh:
+                return fh.read().strip()
+        return ""
+
     def translate(self, items, target_lang, model, timeout_ms):
         base = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:18083/v1").rstrip("/")
-        key_file = os.environ.get("OPENAI_API_KEY_FILE", "")
-        key = os.environ.get("OPENAI_API_KEY", "")
-        if key_file and not key:
-            with open(key_file, encoding="utf-8") as fh:
-                key = fh.read().strip()
+        key = self._resolve_key()
         lines = "\n".join(f"{i['block_id']}\t{i['text']}" for i in items)
         prompt = (
-            f"Translate each line to {target_lang}. Keep inline formula tokens, "
-            f"placeholders like ⟪F0⟫, and technical acronyms (e.g., KV Cache, MoE, FFN, Prefill, Decode) "
-            f"accurate and unchanged where appropriate. Reply with ONLY a valid JSON object mapping "
-            f"block_id -> translation, with the exact same keys as the input.\n\n{lines}"
+            f"Translate each numbered academic paper block to {target_lang}. "
+            f"Rules: (1) Keep placeholders like ⟪F0⟫, citations like [1], URLs, and standard technical "
+            f"acronyms (e.g., LLM, KV Cache, MoE, FFN, Prefill, Decode, LEO, ISL, TFLOPS, Gbps, DRAM, HBM) "
+            f"accurate; (2) Use natural, concise academic {target_lang}; "
+            f"(3) Reply with ONLY a valid JSON object mapping exact block_id -> translation.\n\n{lines}"
         )
         body = json.dumps({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.2,
         }).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
         req = urllib.request.Request(
             f"{base}/chat/completions",
             data=body,
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {key}"},
+            headers=headers,
         )
         opener = (
             urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -85,7 +95,8 @@ class OpenAICompatLLMClient:
             with opener.open(req, timeout=timeout_ms / 1000) as resp:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
-            raise RuntimeError(f"LLM HTTP {exc.code}: {exc.read()[:200]}") from exc
+            detail = exc.read()[:240].decode("utf-8", errors="replace")
+            raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
         content = data["choices"][0]["message"]["content"]
         mapping = _extract_json_object(content)
         out = []

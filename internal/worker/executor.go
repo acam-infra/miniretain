@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"miniretain/internal/job"
 )
@@ -92,10 +93,12 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 
 	// The worker reads BOTH the spec and the schema; no defaults are hardcoded
 	// in Python either.
+	started := time.Now()
 	cmd := exec.CommandContext(ctx, e.Python, e.WorkerPath,
 		"--spec", specPath, "--schema", e.SchemaPath)
 	cmd.Dir = wd
 	out, err := cmd.CombinedOutput()
+	durMS := time.Since(started).Milliseconds()
 	if err != nil {
 		tail := string(out)
 		if len(tail) > 800 {
@@ -113,6 +116,7 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	if err := json.Unmarshal(b, &result); err != nil {
 		return fmt.Errorf("decode %s result: %w", stage, err)
 	}
+	result["stage_wall_ms"] = durMS
 	e.Store.Update(j.ID, func(jj *job.Job) {
 		if jj.Result == nil {
 			jj.Result = map[string]any{}

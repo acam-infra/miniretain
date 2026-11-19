@@ -111,15 +111,28 @@ Go 侧 `internal/worker/spec.go` 与 Python 侧 `python/contract.py` 都加载�
 ## 跑法
 
 ```sh
-go test ./...
+go test -count=1 ./...
+pytest -q python/tests/test_miniretain_regression.py
 sh tools/smoke.sh          # stub provider，无需密钥，测试基础管线
 sh tools/smoke_typst.sh    # 端到端 Typst 渲染，同时产出 cn 与 merged 译文 PDF
-# 真实 provider：先建隧道 ssh -N -L 18083:127.0.0.1:8083 ccds@100.99.0.3
-OPENAI_API_KEY_FILE=... OPENAI_BASE_URL=http://127.0.0.1:18083/v1 \
-  MINIRETAIN_PYTHON=... sh tools/smoke_real.sh <pdf>
+
+# 1) 本地 PaddleOCR HTTP 服务（如在已有 paddleocr venv 的节点启动，避免每次冷加载模型）
+python3 python/ocr/paddle_server.py --host 0.0.0.0 --port 18085 --lang en
+
+# 2) 真实端到端 + 基准测试（Typst 0.15.1 + geminiweb2api Go + 本地 Paddle HTTP）
+OPENAI_BASE_URL=http://<gw2a-host>:8083/v1 \
+OPENAI_API_KEY_FILE=/path/to/gw2a.key \
+PADDLE_OCR_URL=http://<paddle-host>:18085 \
+  python3 tools/run_e2e_bench.py \
+    --root . --python /path/to/python --pdf /path/to/doc.pdf \
+    --ocr-provider auto --model gemini-3.6-flash \
+    --batch-size 18 --concurrency 8 --runs 5 --verify-arxiv \
+    --out-json bench.json
 ```
 
-密钥只从环境变量/文件读取，不写入源码或产物。
+环境要求：
+- Typst 官方稳定版 `0.15.1`（`typst --version` → `typst 0.15.1 (9dfd3a08)`），已安装 `Noto Serif CJK SC` / `Noto Sans CJK SC` 字体。
+- 密钥只从环境变量/文件读取，不写入源码或产物。
 
 ## 已知边界
 

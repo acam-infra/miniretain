@@ -35,11 +35,13 @@ class StubOCRProvider(OCRProvider):
 
 
 from ocr.paddle_adapter import PaddleOCRProvider  # noqa: E402,F401
+from ocr.paddle_http_adapter import PaddleHTTPOCRProvider  # noqa: E402,F401
 from ocr.pymupdf_adapter import AutoOCRProvider, PyMuPDFOCRProvider  # noqa: E402,F401
 
 REGISTRY: dict[str, OCRProvider] = {
     StubOCRProvider.name: StubOCRProvider(),
     PyMuPDFOCRProvider.name: PyMuPDFOCRProvider(),
+    PaddleHTTPOCRProvider.name: PaddleHTTPOCRProvider(),
     AutoOCRProvider.name: AutoOCRProvider(),
 }
 

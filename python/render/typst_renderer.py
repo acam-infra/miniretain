@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pymupdf
@@ -142,39 +143,50 @@ def measure_blocks_with_typst(
     font_families: str,
     workdir: Path,
     candidates: list[dict],
+    probe_name: str = "fit_probe.typ",
 ) -> dict[tuple[int, float], tuple[float, float]]:
-    """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates."""
+    """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates.
+
+    Unbreakable token widths scale linearly with font size, so each candidate's
+    segments are measured once at its reference size and scaled for other sizes.
+    """
     if not candidates:
         return {}
     lines = [
-        f'#set text(font: {font_families}, lang: "zh", fill: black)',
+        f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
         "",
     ]
+    ref_sizes: dict[int, float] = {}
     for c in candidates:
         idx = c["idx"]
+        sizes = c["sizes"]
+        if not sizes:
+            continue
         raw_w = max(4.0, c["width"])
         w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
         weight = c["weight"]
         rich = c["rich_expr"]
         segs = c["segments"]
-        for sz in c["sizes"]:
+        ref_sz = sizes[0]
+        ref_sizes[idx] = ref_sz
+        if segs:
+            seg_exprs = ", ".join(
+                f'measure([#set text(size: {ref_sz:.2f}pt, weight: "{weight}"); #{typst_str_literal(s)}]).width / 1pt'
+                for s in segs
+            )
+            lines.append(
+                f'#context {{ let tw = calc.max({seg_exprs}); '
+                f'[#metadata((kind: "tw", idx: {idx}, sz: {ref_sz:.2f}, tw: tw)) <fit>] }}'
+            )
+        for sz in sizes:
             leading = "0.35em" if sz < 8.5 else "0.45em"
-            if segs:
-                seg_exprs = ", ".join(
-                    f"measure([#set text(size: {sz:.2f}pt, weight: \"{weight}\"); #{typst_str_literal(s)}]).width / 1pt"
-                    for s in segs
-                )
-                max_w_expr = f"calc.max({seg_exprs})"
-            else:
-                max_w_expr = "0.0"
             lines.append(
                 f'#context {{ let m = measure(block(width: {w:.2f}pt)'
                 f'[#set text(size: {sz:.2f}pt, weight: "{weight}"); '
                 f'#set par(leading: {leading}, justify: true); {rich}]); '
-                f'let tw = {max_w_expr}; '
-                f'[#metadata((idx: {idx}, sz: {sz:.2f}, tw: tw, h: m.height / 1pt)) <fit>] }}'
+                f'[#metadata((kind: "h", idx: {idx}, sz: {sz:.2f}, h: m.height / 1pt)) <fit>] }}'
             )
-    probe_typ = workdir / "fit_probe.typ"
+    probe_typ = workdir / probe_name
     probe_typ.write_text("\n".join(lines), encoding="utf-8")
     proc = subprocess.run(
         [typst_bin, "query", "--font-path", font_dir, str(probe_typ), "<fit>"],
@@ -185,10 +197,25 @@ def measure_blocks_with_typst(
     if proc.returncode != 0:
         raise RuntimeError(f"typst measure query failed: {proc.stderr.strip()}")
     rows = json.loads(proc.stdout)
-    out: dict[tuple[int, float], tuple[float, float]] = {}
+    ref_tw: dict[int, tuple[float, float]] = {}
+    heights: dict[tuple[int, float], float] = {}
     for row in rows:
         val = row.get("value") or {}
-        out[(int(val["idx"]), round(float(val["sz"]), 2))] = (float(val["tw"]), float(val["h"]))
+        kind = val.get("kind")
+        idx = int(val["idx"])
+        sz = round(float(val["sz"]), 2)
+        if kind == "tw":
+            ref_tw[idx] = (sz, float(val["tw"]))
+        elif kind == "h":
+            heights[(idx, sz)] = float(val["h"])
+    out: dict[tuple[int, float], tuple[float, float]] = {}
+    for (idx, sz), h in heights.items():
+        if idx in ref_tw and ref_tw[idx][0] > 0:
+            r_sz, r_tw = ref_tw[idx]
+            tw = r_tw * (sz / r_sz)
+        else:
+            tw = 0.0
+        out[(idx, sz)] = (tw, h)
     return out
 
 
@@ -226,7 +253,7 @@ def _emit_overlay_typ(
 ) -> str:
     lines: list[str] = [
         '#set page(margin: 0pt, fill: none)',
-        f'#set text(font: {font_families}, lang: "zh", fill: black)',
+        f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
         '#set par(justify: true, leading: 0.45em)',
         '',
     ]
@@ -276,20 +303,38 @@ def _find_compiled_overflow_blocks(
             for line in blk.get("lines", []):
                 for span in line.get("spans", []):
                     sx0, sy0, sx1, sy1 = span["bbox"]
-                    cx = (sx0 + sx1) / 2.0
-                    cy = (sy0 + sy1) / 2.0
-                    # Match span to the block whose origin/rect contains its start
+                    span_w = max(0.5, sx1 - sx0)
+                    span_h = max(0.5, sy1 - sy0)
+                    span_area = span_w * span_h
+                    # Primary match: pick placed block with highest horizontal/2D overlap.
+                    # This avoids cross-column misattribution when CJK opening punctuation
+                    # (e.g. "（") slightly overhangs left of its own column's rect.x0.
                     best = None
-                    best_dist = 1e9
+                    best_score: tuple[float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
-                        # Span starts near or inside rect
-                        if sx0 >= rect.x0 - 2.0 and sy0 >= rect.y0 - 4.0 and sy0 <= rect.y1 + 2.0:
-                            d = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
-                            if rect.x0 - 2.0 <= cx <= rect.x1 + 2.0 and rect.y0 - 4.0 <= cy <= rect.y1 + 4.0:
-                                d *= 0.1
-                            if d < best_dist:
-                                best_dist = d
+                        ix = min(sx1, rect.x1) - max(sx0, rect.x0)
+                        iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
+                        if ix > 0.0 and iy > 0.0:
+                            x_cov = ix / span_w
+                            area_cov = (ix * iy) / span_area
+                            dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
+                            score = (round(x_cov, 4), round(area_cov, 4), -dist)
+                            if best_score is None or score > best_score:
+                                best_score = score
                                 best = (it, rect, local_i)
+                    if best is None:
+                        # Fallback for spans that escaped all rects: match nearest in same vertical/column band
+                        best_dist = 1e9
+                        left_pad = max(8.0, span_h)
+                        for it, rect, _sz, local_i in placed_list:
+                            if (
+                                rect.x0 - left_pad <= sx0 <= rect.x1 + 8.0
+                                and rect.y0 - 4.0 <= sy0 <= rect.y1 + 4.0
+                            ):
+                                d = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
+                                if d < best_dist:
+                                    best_dist = d
+                                    best = (it, rect, local_i)
                     if best is None:
                         continue
                     it, rect, local_i = best
@@ -321,6 +366,7 @@ def _render_typst_preserve(
     strict: bool = False,
 ) -> dict:
     """RetainPDF-style per-page Typst overlay onto redacted source PDF."""
+    t_total_0 = time.perf_counter()
     typst_bin = find_typst()
     cjk_font_file = find_cjk_font(font)
     font_dir = str(Path(cjk_font_file).parent)
@@ -418,10 +464,53 @@ def _render_typst_preserve(
                 "candidates": p_candidates,
             })
 
-        # Step 2: Measure ALL candidates (unbreakable token width + wrapped height) via Typst
+        # Step 2: Two-tier Typst fit measurement.
+        # Pass 1 probes only the top size (and one fallback size) per block; Pass 2
+        # probes remaining sizes ONLY for blocks that did not fit in Pass 1.
+        t_probe_0 = time.perf_counter()
+        pass1_candidates: list[dict] = []
+        for c in probe_candidates:
+            szs = c["sizes"]
+            p1_szs = [szs[0]] if len(szs) <= 1 else [szs[0], szs[min(2, len(szs) - 1)]]
+            pass1_candidates.append({**c, "sizes": p1_szs})
         measured = measure_blocks_with_typst(
-            typst_bin, font_dir, font_families, workdir, probe_candidates
+            typst_bin, font_dir, font_families, workdir, pass1_candidates, probe_name="fit_probe.typ"
         )
+
+        # Check which candidates need Pass 2 (remaining sizes)
+        pass2_candidates: list[dict] = []
+        for pm in page_meta:
+            pw, ph = pm["pw"], pm["ph"]
+            for cand in pm["candidates"]:
+                rect = cand["rect"]
+                szs = cand["sizes"]
+                if len(szs) <= 1:
+                    continue
+                p1_top = szs[0]
+                tw0, mh0 = measured.get((cand["idx"], round(p1_top, 2)), (1e9, 1e9))
+                fits_top = (
+                    tw0 <= rect.width + 0.5
+                    and mh0 <= rect.height + 0.5
+                    and rect.x0 >= -0.5
+                    and rect.y0 >= -0.5
+                    and rect.x0 + rect.width <= pw + 0.5
+                    and rect.y0 + mh0 <= ph + 0.5
+                    and not _overlaps_neighbor(
+                        (rect.x0, rect.y0, rect.x0 + rect.width, rect.y0 + mh0),
+                        cand["local_i"],
+                        pm["neighbor_boxes"],
+                    )
+                )
+                if not fits_top:
+                    rem_szs = [s for s in szs if (cand["idx"], round(s, 2)) not in measured]
+                    if rem_szs:
+                        pass2_candidates.append({**cand, "sizes": rem_szs})
+        if pass2_candidates:
+            measured2 = measure_blocks_with_typst(
+                typst_bin, font_dir, font_families, workdir, pass2_candidates, probe_name="fit_probe_p2.typ"
+            )
+            measured.update(measured2)
+        fit_probe_s = round(time.perf_counter() - t_probe_0, 3)
 
         # Step 3: Select largest size >= min_size passing token width, height, bounds, non-overlap
         to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]] = {}
@@ -472,6 +561,7 @@ def _render_typst_preserve(
             to_place_by_page[page_index] = to_render
 
         # Step 4: Compile overlay.pdf BEFORE redacting source PDF and verify actual rendered glyph spans!
+        t_overlay_0 = time.perf_counter()
         overlay_typ = workdir / "overlay.typ"
         overlay_pdf = workdir / "overlay.pdf"
         overlay_typ.write_text(
@@ -556,7 +646,10 @@ def _render_typst_preserve(
                 f"(reasons={unplaced_reasons}), failed={failed_block_ids}"
             )
 
+        overlay_compile_s = round(time.perf_counter() - t_overlay_0, 3)
+
         # Step 5: Now redact ONLY verified fitted blocks on source PDF, composite overlay, and count `placed`
+        t_comp_0 = time.perf_counter()
         placed = 0
         per_page: list[dict] = []
         with pymupdf.open(overlay_pdf) as overlay_doc:
@@ -622,7 +715,8 @@ def _render_typst_preserve(
                 })
 
         output_cn.parent.mkdir(parents=True, exist_ok=True)
-        doc.save(output_cn, garbage=4, deflate=True)
+        doc.save(output_cn, garbage=2, deflate=True)
+        redact_composite_s = round(time.perf_counter() - t_comp_0, 3)
     finally:
         doc.close()
 
@@ -632,10 +726,13 @@ def _render_typst_preserve(
     if legacy_output and str(legacy_output) != str(output_cn):
         shutil.copyfile(output_cn, legacy_output)
 
+    t_bi_0 = time.perf_counter()
     if bilingual_mode == "interleaved":
         bilingual_info = merge_interleaved(source_pdf, output_cn, output_merged)
     else:
         bilingual_info = build_side_by_side_pdf(source_pdf, output_cn, output_merged)
+    bilingual_s = round(time.perf_counter() - t_bi_0, 3)
+    total_s = round(time.perf_counter() - t_total_0, 3)
 
     return {
         "engine": "typst",
@@ -655,6 +752,13 @@ def _render_typst_preserve(
         "output_merged": str(output_merged),
         "output": str(legacy_output or output_cn),
         "bilingual": bilingual_info,
+        "timings_s": {
+            "fit_probe_s": fit_probe_s,
+            "overlay_compile_s": overlay_compile_s,
+            "redact_composite_s": redact_composite_s,
+            "bilingual_s": bilingual_s,
+            "total_s": total_s,
+        },
     }
 
 

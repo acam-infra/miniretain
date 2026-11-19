@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -29,8 +30,10 @@ def _dump(path: Path, payload: dict) -> None:
 
 
 def run_ocr(spec: dict, wd: Path) -> dict:
+    t0 = time.perf_counter()
     provider = get_provider(spec["ocr"]["provider"])
     pages = provider.parse(spec["source"])
+    elapsed_s = round(time.perf_counter() - t0, 3)
     unreliable_pages = [p["page_index"] for p in pages if not p.get("ocr_reliable", True)]
     limitations = []
     if unreliable_pages:
@@ -50,7 +53,7 @@ def run_ocr(spec: dict, wd: Path) -> dict:
         for b in p["blocks"]:
             r = b.get("layout_role", "body")
             role_counts[r] = role_counts.get(r, 0) + 1
-    return {
+    out = {
         "stage": "ocr",
         "provider": spec["ocr"]["provider"],
         "pages": len(pages),
@@ -59,7 +62,13 @@ def run_ocr(spec: dict, wd: Path) -> dict:
         "ocr_reliable": len(unreliable_pages) == 0,
         "limitations": limitations,
         "document": "document.v1.json",
+        "elapsed_s": elapsed_s,
     }
+    if getattr(provider, "service_info", None):
+        out["paddle_service"] = provider.service_info
+    if getattr(provider, "paddle_pages", None):
+        out["paddle_pages"] = provider.paddle_pages
+    return out
 
 
 def run_llm(spec: dict, wd: Path) -> dict:

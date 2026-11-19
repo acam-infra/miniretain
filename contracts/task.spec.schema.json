@@ -34,7 +34,7 @@
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["stub", "paddle-cpu", "pymupdf", "auto"],
+          "enum": ["stub", "paddle-cpu", "paddle-http", "pymupdf", "auto"],
           "default": "stub",
           "description": "OCR adapter name. Register real providers in python/ocr/adapter.py."
         }

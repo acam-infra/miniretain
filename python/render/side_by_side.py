@@ -96,7 +96,7 @@ def build_side_by_side_pdf(
                     )
                     _copy_uri_links(translated_doc[page_index], out_page, right_target)
                 page_sizes.append((round(left_w + right_w, 2), round(page_h, 2)))
-            out_doc.save(out_path, garbage=4, deflate=True)
+            out_doc.save(out_path, garbage=2, deflate=True)
 
     if not out_path.is_file() or out_path.stat().st_size == 0:
         raise RuntimeError(f"side-by-side output missing or empty: {out_path}")

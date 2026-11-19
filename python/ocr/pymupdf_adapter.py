@@ -222,22 +222,64 @@ class PyMuPDFOCRProvider:
 
 
 class AutoOCRProvider:
-    """Uses native PyMuPDF on digital PDFs; falls back or marks unreliable on scanned PDFs."""
+    """Uses native PyMuPDF on digital pages and routes scanned pages to local Paddle OCR."""
 
     name = "auto"
 
+    def __init__(self) -> None:
+        self.service_info: dict = {}
+        self.paddle_pages: list[int] = []
+        self.parse_seconds: float = 0.0
+
     def parse(self, source: str) -> list[dict]:
+        import os
+
+        t0 = time.perf_counter()
+        self.service_info = {}
+        self.paddle_pages = []
         if not source.lower().endswith(".pdf"):
             from ocr.adapter import StubOCRProvider
             return StubOCRProvider().parse(source)
+
         pymupdf_prov = PyMuPDFOCRProvider()
         pages = pymupdf_prov.parse(source)
-        scanned_pages = [p["page_index"] for p in pages if p.get("is_scanned")]
-        if scanned_pages and all(p.get("is_scanned") for p in pages):
+        scanned_indices = {p["page_index"] for p in pages if p.get("is_scanned")}
+        paddle_url = os.environ.get("PADDLE_OCR_URL", "").strip()
+
+        if paddle_url:
+            from ocr.paddle_http_adapter import PaddleHTTPOCRProvider
+
+            paddle_http = PaddleHTTPOCRProvider(base_url=paddle_url)
+            try:
+                self.service_info = paddle_http.health(timeout_s=3.0)
+            except Exception as exc:  # noqa: BLE001
+                self.service_info = {"status": "unreachable", "error": str(exc)}
+                if scanned_indices:
+                    raise
+
+            if scanned_indices:
+                doc = pymupdf.open(source)
+                try:
+                    scanned_raw: list[dict] = []
+                    for idx in sorted(scanned_indices):
+                        scanned_raw.append(paddle_http.parse_page(doc[idx]))
+                    scanned_norm = {
+                        p["page_index"]: p
+                        for p in normalize_pages(scanned_raw, coord_space="pixel", dpi=paddle_http.dpi)
+                    }
+                    pages = [scanned_norm.get(p["page_index"], p) for p in pages]
+                    self.paddle_pages = sorted(scanned_indices)
+                finally:
+                    doc.close()
+        elif scanned_indices and len(scanned_indices) == len(pages):
             try:
                 from ocr.paddle_adapter import PaddleOCRProvider
+
                 paddle = PaddleOCRProvider()
-                return paddle.parse(source)
+                pages = paddle.parse(source)
+                self.paddle_pages = sorted(scanned_indices)
             except Exception:
-                return pages
+                pass
+
+        self.parse_seconds = round(time.perf_counter() - t0, 3)
         return pages

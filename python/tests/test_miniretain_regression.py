@@ -499,3 +499,171 @@ def test_p1_typst_unbreakable_bold_word_and_wrapped_url_fit(tmp_path: Path):
                 for sp in ln.get("spans", []):
                     if "sciencedirect" in sp["text"]:
                         assert sp["bbox"][2] <= 211.0
+
+
+def test_p0_two_column_cjk_opening_punct_no_cross_column_misattribution(tmp_path: Path):
+    """Regression for LAB-2112 / job e77489d8524bc45e p0b0014 compiled_horizontal_overflow.
+
+    Right-column block p0b0021 wraps a line starting with full-width CJK '（', which
+    previously hung left of p0b0021.x0 and got misattributed to left-column p0b0014.
+    """
+    src = tmp_path / "twocol.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612.0, height=792.0)
+    page.insert_textbox(pymupdf.Rect(48.96, 721.91, 300.02, 747.81), "This work was funded.", fontsize=8)
+    page.insert_textbox(pymupdf.Rect(311.98, 702.46, 563.04, 748.29), "LLMs process tokens.", fontsize=9)
+    doc.save(src)
+    doc.close()
+
+    items = [
+        {
+            "block_id": "p0b0014",
+            "page_index": 0,
+            "bbox": [48.964, 721.906, 300.022, 747.809],
+            "line_bboxes": [[48.964, 721.906, 300.022, 747.809]],
+            "layout_role": "body",
+            "font_size_pt": 7.97,
+            "text": "This work was funded by the European Union.",
+            "translation": "本研究部分由欧盟“地平线欧洲”研究与创新计划根据 Marie Skłodowska-Curie 资助协议 No. 101282240 资助。",
+            "translation_status": "ok",
+            "policy": {"translate": True, "redact_source": True},
+        },
+        {
+            "block_id": "p0b0021",
+            "page_index": 0,
+            "bbox": [311.978, 702.462, 563.036, 748.290],
+            "line_bboxes": [[311.978, 702.462, 563.036, 748.290]],
+            "layout_role": "body",
+            "font_size_pt": 9.96,
+            "text": "LLMs represent text as tokens and process them through Transformer layers.",
+            "translation": "LLM 将文本表示为 token，并通过一系列 Transformer 层处理这些 token。每一层通常包括一个注意力块和一个前馈网络（FFN）块；注意力块将 token 彼此关联，",
+            "translation_status": "ok",
+            "policy": {"translate": True, "redact_source": True},
+        },
+    ]
+
+    res = render_typst(
+        items=items,
+        workdir=tmp_path,
+        output_cn=tmp_path / "twocol_cn.pdf",
+        output_merged=tmp_path / "twocol_sbs.pdf",
+        source=str(src),
+        layout_mode="preserve",
+        bilingual_mode="side_by_side",
+        page_widths={0: 612.0},
+        page_coord_spaces={0: "pdf_pt"},
+        strict=True,
+    )
+    assert res["placed"] == 2
+    assert res["unplaced"] == 0
+    assert res["failed"] == 0
+    assert "0.15." in res["typst_version"] or res["typst_version"].startswith("typst ")
+    assert "timings_s" in res and res["timings_s"]["total_s"] >= 0
+
+
+def test_paddle_http_adapter_and_auto_scanned_routing(tmp_path: Path, monkeypatch):
+    """Verify paddle-http coordinate contract and auto routing on a scanned image-only PDF."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from ocr.adapter import get_provider
+
+    class _MockPaddle(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def do_GET(self):
+            body = json.dumps({
+                "status": "ok",
+                "paddle_version": "3.3.1",
+                "paddleocr_version": "3.7.0",
+                "device": "cpu",
+                "models": ["PP-OCRv6_medium_det", "PP-OCRv6_medium_rec"],
+                "coord_space": "pixel",
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or "0")
+            _ = self.rfile.read(n)
+            body = json.dumps({
+                "dpi": 150.0,
+                "coord_space": "pixel",
+                "bbox_format": "xyxy",
+                "elapsed_s": 0.01,
+                "blocks": [
+                    {"text": "Fig. 1: Scanned architecture.", "bbox": [100.0, 480.0, 700.0, 520.0], "score": 0.99},
+                    {"text": "Disaggregated inference runs on orbital nodes.", "bbox": [100.0, 560.0, 900.0, 620.0], "score": 0.98},
+                ],
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    srv = HTTPServer(("127.0.0.1", 0), _MockPaddle)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        # Create a 1-page rasterized (scanned) PDF with no embedded text layer
+        vec = _make_pdf(tmp_path / "vec.pdf")
+        scanned = tmp_path / "scanned.pdf"
+        with pymupdf.open(vec) as vdoc:
+            pix = vdoc[0].get_pixmap(dpi=150)
+            sdoc = pymupdf.open()
+            spage = sdoc.new_page(width=vdoc[0].rect.width, height=vdoc[0].rect.height)
+            spage.insert_image(spage.rect, stream=pix.tobytes("png"))
+            sdoc.save(scanned)
+            sdoc.close()
+
+        monkeypatch.setenv("PADDLE_OCR_URL", f"http://127.0.0.1:{port}")
+        auto = get_provider("auto")
+        pages = auto.parse(str(scanned))
+        assert len(pages) == 1
+        assert pages[0]["coord_space"] == "pixel"
+        assert pages[0]["is_scanned"] is True
+        assert pages[0]["ocr_reliable"] is True
+        assert auto.paddle_pages == [0]
+        assert auto.service_info["paddleocr_version"] == "3.7.0"
+        assert len(pages[0]["blocks"]) == 2
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_scheduler_balanced_batching_preserves_order_and_parallel_retry():
+    """Verify character-balanced LPT batching preserves exact item ordering and retries missing items."""
+    calls: list[list[str]] = []
+
+    class _FlakyOrderClient(LLMClient):
+        name = "flaky-order"
+
+        def translate(self, items, target_lang, model, timeout_ms):
+            ids = [it["block_id"] for it in items]
+            calls.append(ids)
+            out = []
+            for it in items:
+                if it["block_id"] == "b2" and len(items) > 1:
+                    out.append({"block_id": "b2", "status": "missing", "translation": None, "error": "omitted"})
+                else:
+                    out.append(f"[{target_lang}] {it['text']}")
+            return out
+
+    items = [
+        {"block_id": f"b{i}", "text": ("long paragraph " * 40) if i % 2 == 0 else f"short {i}"}
+        for i in range(6)
+    ]
+    records, stats = Scheduler(
+        _FlakyOrderClient(), concurrency=3, batch_size=3, max_retries=1, timeout_ms=5000
+    ).run(items, "zh", "m")
+    assert [r["block_id"] for r in records] == [f"b{i}" for i in range(6)]
+    assert all(r["status"] == "ok" for r in records)
+    assert stats["succeeded_items"] == 6
+    assert stats["retries"] >= 1
+    assert stats["elapsed_s"] >= 0
+

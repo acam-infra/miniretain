@@ -109,9 +109,14 @@ class Scheduler:
             "failed_block_ids": [],
             "missing_block_ids": [],
             "empty_block_ids": [],
+            "elapsed_s": 0.0,
+            "batch_latencies_s": [],
+            "max_batch_s": 0.0,
+            "retry_s": 0.0,
         }
 
     def _run_batch(self, batch, target_lang, model):
+        t0 = time.perf_counter()
         last = None
         for attempt in range(self.max_retries + 1):
             try:
@@ -120,31 +125,64 @@ class Scheduler:
                     raise RuntimeError(
                         f"batch length mismatch: expected {len(batch)}, got {len(out)}"
                     )
-                return out, attempt
+                return out, attempt, round(time.perf_counter() - t0, 3)
             except Exception as exc:  # noqa: BLE001 - retry any client error
                 last = exc
                 if attempt < self.max_retries:
-                    time.sleep(min(0.05 * (2**attempt), 0.5))
+                    msg = str(exc)
+                    if any(code in msg for code in ("HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504")):
+                        time.sleep(min(0.4 * (2**attempt), 3.0))
+                    else:
+                        time.sleep(min(0.05 * (2**attempt), 0.5))
         raise last
 
+    def _build_batches(self, items: list[dict]) -> list[list[tuple[int, dict]]]:
+        """Pack items into character-balanced batches (<= batch_size items each)
+        and schedule longest batches first (LPT) to minimize parallel tail latency."""
+        if not items:
+            return []
+        max_chars = max(3600, self.batch_size * 280)
+        batches: list[list[tuple[int, dict]]] = []
+        cur: list[tuple[int, dict]] = []
+        cur_chars = 0
+        for idx, item in enumerate(items):
+            ilen = len(item.get("text") or "")
+            if cur and (len(cur) >= self.batch_size or (cur_chars + ilen > max_chars and len(cur) >= 3)):
+                batches.append(cur)
+                cur = []
+                cur_chars = 0
+            cur.append((idx, item))
+            cur_chars += ilen
+        if cur:
+            batches.append(cur)
+        # Longest-processing-time first so heavy batches start immediately
+        batches.sort(key=lambda b: sum(len(it.get("text") or "") for _, it in b), reverse=True)
+        return batches
+
     def run(self, items: list[dict], target_lang: str, model: str):
-        batches = [
-            (start, items[start : start + self.batch_size])
-            for start in range(0, len(items), self.batch_size)
-        ]
-        self.stats["batches"] = len(batches)
+        t_run_0 = time.perf_counter()
+        packed_batches = self._build_batches(items)
+        self.stats["batches"] = len(packed_batches)
         self.stats["total_items"] = len(items)
         results: list[dict | None] = [None] * len(items)
+        batch_latencies: list[float] = []
 
         with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
             futures = {
-                pool.submit(self._run_batch, batch, target_lang, model): (start, batch)
-                for start, batch in batches
+                pool.submit(
+                    self._run_batch,
+                    [it for _, it in b],
+                    target_lang,
+                    model,
+                ): b
+                for b in packed_batches
             }
             for fut in as_completed(futures):
-                start, batch = futures[fut]
+                indexed_batch = futures[fut]
+                batch = [it for _, it in indexed_batch]
                 try:
-                    raw_out, retries = fut.result()
+                    raw_out, retries, lat_s = fut.result()
+                    batch_latencies.append(lat_s)
                     self.stats["retries"] += retries
                     norm = [_normalize_item_result(item, val) for item, val in zip(batch, raw_out)]
                 except Exception as exc:  # noqa: BLE001 - record explicit failure per item
@@ -159,29 +197,40 @@ class Scheduler:
                         }
                         for item in batch
                     ]
-                for offset, rec in enumerate(norm):
-                    results[start + offset] = rec
+                for (orig_idx, _), rec in zip(indexed_batch, norm):
+                    results[orig_idx] = rec
 
-        # Targeted single-item retry for any missing/empty items when max_retries > 0
+        # Targeted parallel single-item retry for any missing/empty items when max_retries > 0
+        t_retry_0 = time.perf_counter()
         if self.max_retries > 0:
             retry_indices = [
                 i for i, rec in enumerate(results)
                 if rec is not None and rec["status"] in ("missing", "empty")
             ]
-            for idx in retry_indices:
-                item = items[idx]
-                try:
-                    raw_out, retries = self._run_batch([item], target_lang, model)
-                    self.stats["retries"] += 1 + retries
-                    rec = _normalize_item_result(item, raw_out[0])
-                    results[idx] = rec
-                except Exception as exc:  # noqa: BLE001
-                    results[idx] = {
-                        "block_id": item["block_id"],
-                        "status": "failed",
-                        "translation": None,
-                        "error": str(exc),
+            if retry_indices:
+                with ThreadPoolExecutor(max_workers=min(self.concurrency, len(retry_indices))) as rpool:
+                    rfuts = {
+                        rpool.submit(self._run_batch, [items[idx]], target_lang, model): idx
+                        for idx in retry_indices
                     }
+                    for fut in as_completed(rfuts):
+                        idx = rfuts[fut]
+                        item = items[idx]
+                        try:
+                            raw_out, retries, _lat = fut.result()
+                            self.stats["retries"] += 1 + retries
+                            results[idx] = _normalize_item_result(item, raw_out[0])
+                        except Exception as exc:  # noqa: BLE001
+                            results[idx] = {
+                                "block_id": item["block_id"],
+                                "status": "failed",
+                                "translation": None,
+                                "error": str(exc),
+                            }
+        self.stats["retry_s"] = round(time.perf_counter() - t_retry_0, 3)
+        self.stats["batch_latencies_s"] = sorted(batch_latencies)
+        self.stats["max_batch_s"] = max(batch_latencies) if batch_latencies else 0.0
+        self.stats["elapsed_s"] = round(time.perf_counter() - t_run_0, 3)
 
         for rec in results:
             assert rec is not None
