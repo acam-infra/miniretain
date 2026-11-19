@@ -35,6 +35,9 @@ runtime:
   typst: "typst"
   # Max concurrent Python worker processes across all jobs.
   max_workers: 2
+  # Optional global in-flight LLM request budget shared across all concurrent jobs.
+  # Prevents max_workers * llm.concurrency amplification against a single gateway.
+  max_llm_concurrency: 8
 
 # Default target language when POST /v1/jobs omits target_lang.
 target_lang: "zh"

@@ -20,10 +20,11 @@ type Executor struct {
 	Python     string // python3
 	WorkerPath string // absolute path to python/worker.py
 	SchemaPath string // absolute path to contracts/task.spec.schema.json
-	DataRoot   string // absolute path to data/jobs
-	MaxWorkers int
-	Store      *job.Store
-	ExtraEnv   []string // optional KEY=VAL overrides passed to Python worker processes
+	DataRoot          string // absolute path to data/jobs
+	MaxWorkers        int
+	MaxLLMConcurrency int // optional global in-flight LLM request budget across all concurrent jobs (0 = per-job only)
+	Store             *job.Store
+	ExtraEnv          []string // optional KEY=VAL overrides passed to Python worker processes
 
 	sem chan struct{}
 }
@@ -98,8 +99,19 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	cmd := exec.CommandContext(ctx, e.Python, e.WorkerPath,
 		"--spec", specPath, "--schema", e.SchemaPath)
 	cmd.Dir = wd
-	if len(e.ExtraEnv) > 0 {
-		cmd.Env = mergeEnv(os.Environ(), e.ExtraEnv)
+	extraEnv := append([]string(nil), e.ExtraEnv...)
+	if stage == "llm" && e.MaxLLMConcurrency > 0 {
+		slotDir := filepath.Join(e.DataRoot, ".llm_slots")
+		if err := os.MkdirAll(slotDir, 0o755); err != nil {
+			return fmt.Errorf("mkdir llm slot dir: %w", err)
+		}
+		extraEnv = append(extraEnv,
+			fmt.Sprintf("MINIRETAIN_LLM_GLOBAL_CONCURRENCY=%d", e.MaxLLMConcurrency),
+			"MINIRETAIN_LLM_SLOT_DIR="+slotDir,
+		)
+	}
+	if len(extraEnv) > 0 {
+		cmd.Env = mergeEnv(os.Environ(), extraEnv)
 	}
 	out, err := cmd.CombinedOutput()
 	durMS := time.Since(started).Milliseconds()

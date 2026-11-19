@@ -84,6 +84,7 @@ func main() {
 		store,
 	)
 	exec.ExtraEnv = cfg.WorkerEnv()
+	exec.MaxLLMConcurrency = cfg.EffectiveMaxLLMConcurrency()
 
 	handler := api.NewWithOptions(store, exec, schema, api.Options{
 		Defaults: api.JobDefaults{

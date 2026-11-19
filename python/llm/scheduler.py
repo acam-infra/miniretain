@@ -1,15 +1,28 @@
 """LLM task scheduling boundary.
 
-LLMClient is the only thing that talks to a model provider. Scheduler owns
-batching, bounded concurrency, retry/backoff, result ordering, and explicit
-per-item status accounting (no silent placeholder-as-success).
+LLMClient is the only thing that talks to a model provider.
+Responsibilities are cleanly separated into testable collaborators:
+- BatchPlanner (`llm.planner`): character-budget packing & LPT ordering.
+- ConcurrencyLimiter (`llm.limiter`): bounded in-process + optional cross-process
+  global concurrency budget (prevents Go max_workers * llm.concurrency amplification).
+- RetryPolicy (`llm.retry`): error classification, jittered backoff, Retry-After,
+  and shared 429 cooldown across sibling workers.
+- Document context (`llm.context`): zero-cost terminology & style anchor.
+- Scheduler (this module): orchestrates execution, immediate streaming item retry
+  (no barrier wait), deterministic block_id backfill, and explicit status metrics.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+import threading
 import time
+
+from llm.context import build_document_context
+from llm.limiter import ConcurrencyLimiter, build_limiter_from_env
+from llm.planner import BatchPlanner, CharBudgetLPTPlanner
+from llm.retry import RetryPolicy
 
 _SENTINEL_PREFIXES = ("<translation failed:", "<missing translation")
 
@@ -91,16 +104,31 @@ class Scheduler:
         batch_size: int,
         max_retries: int,
         timeout_ms: int,
+        *,
+        planner: BatchPlanner | None = None,
+        limiter: ConcurrencyLimiter | None = None,
+        retry_policy: RetryPolicy | None = None,
+        enable_doc_context: bool = True,
     ) -> None:
         self.client = client
         self.concurrency = max(1, concurrency)
         self.batch_size = max(1, batch_size)
         self.max_retries = max(0, max_retries)
         self.timeout_ms = timeout_ms
+        self.planner = planner or CharBudgetLPTPlanner(batch_size=self.batch_size)
+        self.limiter = limiter or build_limiter_from_env(self.concurrency)
+        self.retry_policy = retry_policy or RetryPolicy(max_retries=self.max_retries)
+        self.enable_doc_context = bool(enable_doc_context)
+        self._metrics_lock = threading.Lock()
         self.stats = {
             "batches": 0,
+            "requests": 0,
             "retries": 0,
+            "rate_limit_429": 0,
+            "timeouts": 0,
             "failed_batches": 0,
+            "peak_inflight": 0,
+            "limiter_wait_s": 0.0,
             "total_items": 0,
             "succeeded_items": 0,
             "failed_items": 0,
@@ -115,122 +143,153 @@ class Scheduler:
             "retry_s": 0.0,
         }
 
-    def _run_batch(self, batch, target_lang, model):
+    def _run_batch(self, batch: list[dict], target_lang: str, model: str, doc_context: str = ""):
         t0 = time.perf_counter()
-        last = None
-        for attempt in range(self.max_retries + 1):
+        last: Exception | None = None
+        payload_batch = (
+            [{**batch[0], "_doc_context": doc_context}, *batch[1:]]
+            if (doc_context and batch)
+            else batch
+        )
+        for attempt in range(self.retry_policy.max_retries + 1):
+            self.retry_policy.wait_if_cooling_down()
             try:
-                out = self.client.translate(batch, target_lang, model, self.timeout_ms)
+                with self.limiter.acquire():
+                    with self._metrics_lock:
+                        self.stats["requests"] += 1
+                    out = self.client.translate(payload_batch, target_lang, model, self.timeout_ms)
                 if len(out) != len(batch):
                     raise RuntimeError(
                         f"batch length mismatch: expected {len(batch)}, got {len(out)}"
                     )
                 return out, attempt, round(time.perf_counter() - t0, 3)
-            except Exception as exc:  # noqa: BLE001 - retry any client error
+            except Exception as exc:  # noqa: BLE001 - classify and retry via policy
                 last = exc
-                if attempt < self.max_retries:
-                    msg = str(exc)
-                    if any(code in msg for code in ("HTTP 429", "HTTP 502", "HTTP 503", "HTTP 504")):
-                        time.sleep(min(0.4 * (2**attempt), 3.0))
-                    else:
-                        time.sleep(min(0.05 * (2**attempt), 0.5))
+                decision = self.retry_policy.decide(exc, attempt)
+                with self._metrics_lock:
+                    if decision.category == "rate_limit":
+                        self.stats["rate_limit_429"] += 1
+                    elif decision.category == "timeout":
+                        self.stats["timeouts"] += 1
+                if decision.cooldown_s > 0:
+                    self.retry_policy.note_cooldown(decision.cooldown_s)
+                if decision.retryable:
+                    if decision.delay_s > 0:
+                        time.sleep(decision.delay_s)
+                    continue
+                raise
+        assert last is not None
         raise last
 
     def _build_batches(self, items: list[dict]) -> list[list[tuple[int, dict]]]:
-        """Pack items into character-balanced batches (<= batch_size items each)
-        and schedule longest batches first (LPT) to minimize parallel tail latency."""
-        if not items:
-            return []
-        max_chars = max(3600, self.batch_size * 280)
-        batches: list[list[tuple[int, dict]]] = []
-        cur: list[tuple[int, dict]] = []
-        cur_chars = 0
-        for idx, item in enumerate(items):
-            ilen = len(item.get("text") or "")
-            if cur and (len(cur) >= self.batch_size or (cur_chars + ilen > max_chars and len(cur) >= 3)):
-                batches.append(cur)
-                cur = []
-                cur_chars = 0
-            cur.append((idx, item))
-            cur_chars += ilen
-        if cur:
-            batches.append(cur)
-        # Longest-processing-time first so heavy batches start immediately
-        batches.sort(key=lambda b: sum(len(it.get("text") or "") for _, it in b), reverse=True)
-        return batches
+        """Compatibility helper delegating to the configured BatchPlanner."""
+        return [pb.indexed_items for pb in self.planner.plan(items)]
 
     def run(self, items: list[dict], target_lang: str, model: str):
         t_run_0 = time.perf_counter()
-        packed_batches = self._build_batches(items)
-        self.stats["batches"] = len(packed_batches)
+        planned_batches = self.planner.plan(items)
+        self.stats["batches"] = len(planned_batches)
         self.stats["total_items"] = len(items)
         results: list[dict | None] = [None] * len(items)
         batch_latencies: list[float] = []
+        doc_context = build_document_context(items) if self.enable_doc_context else ""
 
-        with ThreadPoolExecutor(max_workers=self.concurrency) as pool:
-            futures = {
-                pool.submit(
-                    self._run_batch,
-                    [it for _, it in b],
-                    target_lang,
-                    model,
-                ): b
-                for b in packed_batches
-            }
-            for fut in as_completed(futures):
-                indexed_batch = futures[fut]
-                batch = [it for _, it in indexed_batch]
-                try:
-                    raw_out, retries, lat_s = fut.result()
-                    batch_latencies.append(lat_s)
-                    self.stats["retries"] += retries
-                    norm = [_normalize_item_result(item, val) for item, val in zip(batch, raw_out)]
-                except Exception as exc:  # noqa: BLE001 - record explicit failure per item
-                    self.stats["failed_batches"] += 1
-                    err_msg = str(exc)
-                    norm = [
-                        {
-                            "block_id": item["block_id"],
-                            "status": "failed",
-                            "translation": None,
-                            "error": err_msg,
-                        }
-                        for item in batch
-                    ]
-                for (orig_idx, _), rec in zip(indexed_batch, norm):
-                    results[orig_idx] = rec
+        if not planned_batches:
+            self.stats["elapsed_s"] = round(time.perf_counter() - t_run_0, 3)
+            return [], self.stats
 
-        # Targeted parallel single-item retry for any missing/empty items when max_retries > 0
-        t_retry_0 = time.perf_counter()
-        if self.max_retries > 0:
-            retry_indices = [
-                i for i, rec in enumerate(results)
-                if rec is not None and rec["status"] in ("missing", "empty")
-            ]
-            if retry_indices:
-                with ThreadPoolExecutor(max_workers=min(self.concurrency, len(retry_indices))) as rpool:
-                    rfuts = {
-                        rpool.submit(self._run_batch, [items[idx]], target_lang, model): idx
-                        for idx in retry_indices
-                    }
-                    for fut in as_completed(rfuts):
-                        idx = rfuts[fut]
-                        item = items[idx]
+        pool_workers = max(1, min(self.concurrency, self.limiter.limit))
+        main_done_at: float | None = None
+        main_remaining = len(planned_batches)
+        retried_indices: set[int] = set()
+
+        with ThreadPoolExecutor(max_workers=pool_workers) as pool:
+            # Map future -> (kind, payload_meta)
+            # kind == "batch": meta = indexed_items
+            # kind == "item_retry": meta = orig_idx
+            pending: dict[Future, tuple[str, object]] = {}
+            for pb in planned_batches:
+                fut = pool.submit(self._run_batch, pb.items, target_lang, model, doc_context)
+                pending[fut] = ("batch", pb.indexed_items)
+
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    kind, meta = pending.pop(fut)
+                    if kind == "batch":
+                        indexed_batch = meta
+                        assert isinstance(indexed_batch, list)
+                        batch = [it for _, it in indexed_batch]
+                        try:
+                            raw_out, retries, lat_s = fut.result()
+                            batch_latencies.append(lat_s)
+                            self.stats["retries"] += retries
+                            norm = [
+                                _normalize_item_result(item, val)
+                                for item, val in zip(batch, raw_out)
+                            ]
+                        except Exception as exc:  # noqa: BLE001 - record explicit failure per item
+                            self.stats["failed_batches"] += 1
+                            err_msg = str(exc)
+                            norm = [
+                                {
+                                    "block_id": item["block_id"],
+                                    "status": "failed",
+                                    "translation": None,
+                                    "error": err_msg,
+                                }
+                                for item in batch
+                            ]
+
+                        for (orig_idx, item), rec in zip(indexed_batch, norm):
+                            results[orig_idx] = rec
+                            # Immediate streaming single-item retry without waiting for all batches!
+                            if (
+                                self.max_retries > 0
+                                and rec["status"] in ("missing", "empty")
+                                and orig_idx not in retried_indices
+                            ):
+                                retried_indices.add(orig_idx)
+                                rf = pool.submit(
+                                    self._run_batch, [item], target_lang, model, doc_context
+                                )
+                                pending[rf] = ("item_retry", orig_idx)
+
+                        main_remaining -= 1
+                        if main_remaining == 0:
+                            main_done_at = time.perf_counter()
+                    else:
+                        orig_idx = meta
+                        assert isinstance(orig_idx, int)
+                        item = items[orig_idx]
                         try:
                             raw_out, retries, _lat = fut.result()
                             self.stats["retries"] += 1 + retries
-                            results[idx] = _normalize_item_result(item, raw_out[0])
+                            results[orig_idx] = _normalize_item_result(item, raw_out[0])
                         except Exception as exc:  # noqa: BLE001
-                            results[idx] = {
+                            self.stats["retries"] += 1
+                            results[orig_idx] = {
                                 "block_id": item["block_id"],
                                 "status": "failed",
                                 "translation": None,
                                 "error": str(exc),
                             }
-        self.stats["retry_s"] = round(time.perf_counter() - t_retry_0, 3)
+
+        t_end = time.perf_counter()
+        self.stats["retry_s"] = (
+            round(max(0.0, t_end - main_done_at), 3)
+            if (main_done_at is not None and retried_indices)
+            else 0.0
+        )
         self.stats["batch_latencies_s"] = sorted(batch_latencies)
         self.stats["max_batch_s"] = max(batch_latencies) if batch_latencies else 0.0
-        self.stats["elapsed_s"] = round(time.perf_counter() - t_run_0, 3)
+        self.stats["elapsed_s"] = round(t_end - t_run_0, 3)
+
+        lim_snap = self.limiter.snapshot()
+        self.stats["peak_inflight"] = lim_snap["peak_inflight"]
+        self.stats["limiter_wait_s"] = lim_snap["wait_s"]
+        if "global_limit" in lim_snap:
+            self.stats["global_concurrency_limit"] = lim_snap["global_limit"]
 
         for rec in results:
             assert rec is not None
