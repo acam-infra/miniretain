@@ -29,6 +29,46 @@ _NUMERIC_TICK_RE = re.compile(
 )
 _MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεθλμσφψωΔΣΠΩ")
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_AFFIL_KW_RE = re.compile(
+    r"\b(?:University|Institute|Research|Google|Microsoft|Berkeley|Stanford|MIT|CMU|Department|Laboratory|Labs)\b"
+)
+_CODE_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
+_CODE_CALL_RE = re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(")
+_CODE_ASSIGN_RE = re.compile(r"^\s*(?:\d+\s+)?[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\(")
+_CODE_IMPORT_RE = re.compile(r"(?:^|\s)(?:from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+|import\s+[A-Za-z_]\w*\s+as\s+)")
+_APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\b|Supplementary\b|[A-Z]\.\s+[A-Z]\S*)", re.IGNORECASE)
+
+
+def _is_code_listing(text: str) -> bool:
+    s = text.strip()
+    if not s or len(s) > 800:
+        return False
+    if "←" in s and re.search(r"\b\d+:", s):
+        return True
+    if _CODE_IMPORT_RE.search(s) and len(s) < 220:
+        return True
+    if len(s) <= 160 and (_CODE_SNAKE_RE.search(s) or _CODE_CALL_RE.search(s) or _CODE_ASSIGN_RE.search(s)):
+        return True
+    return False
+
+
+def _is_author_affiliation(text: str, page_idx: int, seen_abstract: bool) -> bool:
+    if page_idx != 0 or seen_abstract:
+        return False
+    s = text.strip()
+    if not s or len(s) > 220:
+        return False
+    if _EMAIL_RE.search(s):
+        return True
+    if any(ch in s for ch in "∗†‡§"):
+        return True
+    if _AFFIL_KW_RE.search(s) and not s.endswith("."):
+        return True
+    # Multiple "First Last<digit>" author entries on one line (with or without space before marker)
+    if len(re.findall(r"\b[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]+[\d∗†‡§,\s]*\d", s)) >= 2:
+        return True
+    return False
 
 
 def _rect_intersects(a: list[float], b: list[float], pad: float = 2.0) -> bool:
@@ -137,6 +177,10 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
         return True
     math_count = sum(1 for ch in s if ch in _MATH_CHARS)
     alpha_words = re.findall(r"[A-Za-z]{3,}", s)
+    if len(s) <= 8 and not alpha_words and re.search(r"[A-Za-z]", s) and not re.match(r"^(?:yes|no|on|off|ok|id|or|in|to|of|by|at|as|is|if|an|we|it|do|so|up)$", s, re.I):
+        return True
+    if len(s) <= 30 and math_count >= 1 and len(alpha_words) <= 2:
+        return True
     if _EQ_NUM_RE.search(s) and math_count >= 1 and len(alpha_words) <= 6:
         return True
     if len(s) <= 80 and math_count >= 2 and math_count / max(1, len(s)) >= 0.08 and len(alpha_words) <= 5:
@@ -206,6 +250,7 @@ def normalize_pages(
 ) -> list[dict]:
     """Normalize raw pages into RetainPDF-aligned document.v1 structure."""
     in_references = False
+    seen_abstract = False
     norm_pages: list[dict] = []
     prev_translatable_body: dict | None = None
 
@@ -271,6 +316,17 @@ def normalize_pages(
                     translate = False
                     preserve_reason = "figure_label"
                     redact_source = False
+            elif (
+                bbox
+                and (len(text) <= 45 or (bbox[2] - bbox[0]) < 80.0)
+                and (not font_size or font_size <= max(8.5, median_font * 0.92))
+                and any(_overlap_ratio(bbox, fr, pad=14.0) >= 0.5 for fr in figure_regions)
+            ):
+                # Axis / tick / legend label sitting just outside a figure frame
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "figure_label"
+                redact_source = False
             elif _is_formula_text(text, is_math_font=is_math_font):
                 layout_role = "formula"
                 translate = False
@@ -290,11 +346,30 @@ def normalize_pages(
                 layout_role = "heading"
                 in_references = True
                 translate = True
+            elif in_references and not re.match(r"^\[\d+\]", text) and len(text) < 120 and not text.rstrip().endswith((".", ",")) and (
+                _APPENDIX_HEADING_RE.match(text)
+                or (is_bold and font_size and font_size >= median_font * 1.15 and re.match(r"^(?:[A-Z](?:\.\s+|\s+[A-Z])|Appendix|Supplementary)", text))
+            ):
+                layout_role = "heading"
+                in_references = False
+                translate = True
+            elif _is_code_listing(text):
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "code_listing"
+                redact_source = False
+            elif _is_author_affiliation(text, page_idx, seen_abstract):
+                layout_role = "header_footer"
+                translate = False
+                preserve_reason = "author_affiliation"
+                redact_source = False
             elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
                 layout_role = "title"
                 translate = True
             elif _HEADING_RE.match(text) and len(text) < 120:
                 layout_role = "heading"
+                if re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", text, re.IGNORECASE):
+                    seen_abstract = True
                 translate = True
             elif in_references:
                 layout_role = "reference"

@@ -350,15 +350,28 @@ def _find_compiled_overflow_blocks(
                     best_score: tuple[float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
                         ix = min(sx1, rect.x1) - max(sx0, rect.x0)
-                        iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
-                        if ix > 0.0 and iy > 0.0:
+                        iy_exact = min(sy1, rect.y1) - max(sy0, rect.y0)
+                        if ix > 0.0 and iy_exact > 0.0:
                             x_cov = ix / span_w
-                            area_cov = (ix * iy) / span_area
+                            y_cov = iy_exact / span_h
+                            area_cov = (ix * iy_exact) / span_area
                             dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
-                            score = (round(x_cov, 4), round(area_cov, 4), -dist)
+                            score = (round(area_cov, 4), round(y_cov, 4), round(x_cov, 4), -dist)
                             if best_score is None or score > best_score:
                                 best_score = score
                                 best = (it, rect, local_i)
+                    if best is None:
+                        for it, rect, _sz, local_i in placed_list:
+                            ix = min(sx1, rect.x1) - max(sx0, rect.x0)
+                            iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
+                            if ix > 0.0 and iy > 0.0:
+                                x_cov = ix / span_w
+                                area_cov = (ix * iy) / span_area
+                                dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
+                                score = (round(x_cov, 4), round(area_cov, 4), -dist)
+                                if best_score is None or score > best_score:
+                                    best_score = score
+                                    best = (it, rect, local_i)
                     if best is None:
                         # Fallback for spans that escaped all rects: match nearest in same vertical/column band
                         best_dist = 1e9
@@ -532,6 +545,7 @@ def _render_typst_preserve(
                         (rect.x0, rect.y0, rect.x0 + rect.width, rect.y0 + mh0),
                         cand["local_i"],
                         pm["neighbor_boxes"],
+                        self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
                     )
                 )
                 if not fits_top:
@@ -576,7 +590,12 @@ def _render_typst_preserve(
                     ):
                         fail_reason = "out_of_bounds"
                         continue
-                    if _overlaps_neighbor(placed_box, cand["local_i"], pm["neighbor_boxes"]):
+                    if _overlaps_neighbor(
+                        placed_box,
+                        cand["local_i"],
+                        pm["neighbor_boxes"],
+                        self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
+                    ):
                         fail_reason = "neighbor_overlap"
                         continue
                     chosen_sz = sz
@@ -613,8 +632,8 @@ def _render_typst_preserve(
         with pymupdf.open(overlay_pdf) as check_doc:
             compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
 
-        # Retry any compiled-overflow blocks up to 6 steps down (>= min_size)
-        for _retry_step in range(6):
+        # Retry any compiled-overflow blocks step-by-step down to min_size
+        for _retry_step in range(24):
             if not compiled_bad:
                 break
             changed = False
