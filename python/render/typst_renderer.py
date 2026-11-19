@@ -346,9 +346,13 @@ def _find_compiled_overflow_blocks(
                     # Primary match: pick placed block with highest horizontal/2D overlap.
                     # This avoids cross-column misattribution when CJK opening punctuation
                     # (e.g. "（") slightly overhangs left of its own column's rect.x0.
+                    sp_compact = "".join((span.get("text") or "").split())
+                    sp_probe = sp_compact[:12]
                     best = None
-                    best_score: tuple[float, float, float] | None = None
+                    best_score: tuple[int, float, float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
+                        tr_compact = "".join((it.get("translation") or "").split())
+                        t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                         ix = min(sx1, rect.x1) - max(sx0, rect.x0)
                         iy_exact = min(sy1, rect.y1) - max(sy0, rect.y0)
                         if ix > 0.0 and iy_exact > 0.0:
@@ -356,19 +360,21 @@ def _find_compiled_overflow_blocks(
                             y_cov = iy_exact / span_h
                             area_cov = (ix * iy_exact) / span_area
                             dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
-                            score = (round(area_cov, 4), round(y_cov, 4), round(x_cov, 4), -dist)
+                            score = (t_match, round(area_cov, 4), round(y_cov, 4), round(x_cov, 4), -dist)
                             if best_score is None or score > best_score:
                                 best_score = score
                                 best = (it, rect, local_i)
                     if best is None:
                         for it, rect, _sz, local_i in placed_list:
+                            tr_compact = "".join((it.get("translation") or "").split())
+                            t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                             ix = min(sx1, rect.x1) - max(sx0, rect.x0)
                             iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
                             if ix > 0.0 and iy > 0.0:
                                 x_cov = ix / span_w
                                 area_cov = (ix * iy) / span_area
                                 dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
-                                score = (round(x_cov, 4), round(area_cov, 4), -dist)
+                                score = (t_match, round(x_cov, 4), round(area_cov, 4), 0.0, -dist)
                                 if best_score is None or score > best_score:
                                     best_score = score
                                     best = (it, rect, local_i)

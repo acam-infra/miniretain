@@ -196,3 +196,60 @@ def test_scheduler_splits_timed_out_large_batch():
     assert stats["failed_batches"] == 0
     assert all(n <= 4 for n in SplitTimeoutClient.calls if n != 8)
 
+
+def test_typst_overlapping_blocks_span_text_match_attribution():
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        src_pdf = td_path / "src.pdf"
+        doc = pymupdf.open()
+        page = doc.new_page(width=612.0, height=792.0)
+        page.insert_text((311.7, 138.0), "Therefore, DoD is 1 - Bs,t/Bs", fontsize=9.5)
+        page.insert_text((312.0, 148.0), "SBEO problem formulation.", fontsize=9.5)
+        doc.save(src_pdf)
+        doc.close()
+
+        items = [
+            {
+                "block_id": "p4b0056",
+                "page_index": 0,
+                "layout_role": "body",
+                "policy": {"translate": True, "redact_source": True},
+                "bbox": [311.67, 126.91, 563.04, 149.67],
+                "line_bboxes": [[311.67, 126.91, 563.04, 149.67]],
+                "font_size_pt": 9.44,
+                "text": "Therefore, DoD is 1 - Bs,t/Bs",
+                "translation": "因此，放电深度为 1 - Bs,t/Bs",
+                "translation_status": "ok",
+            },
+            {
+                "block_id": "p4b0057",
+                "page_index": 0,
+                "layout_role": "body",
+                "policy": {"translate": True, "redact_source": True},
+                "bbox": [311.98, 139.10, 564.69, 185.00],
+                "line_bboxes": [[311.98, 139.10, 564.69, 185.00]],
+                "font_size_pt": 9.44,
+                "text": "SBEO problem formulation.",
+                "translation": "SEC 电池能量优化（SBEO）问题建模。给定以下输入：",
+                "translation_status": "ok",
+            },
+        ]
+        res = render_typst(
+            items=items,
+            workdir=td_path,
+            output_cn=td_path / "cn.pdf",
+            output_merged=td_path / "merged.pdf",
+            legacy_output=None,
+            font="",
+            source=str(src_pdf),
+            layout_mode="preserve",
+            bilingual_mode="side_by_side",
+            page_widths={0: 612.0},
+            page_coord_spaces={0: "pdf_pt"},
+            page_scanned={0: False},
+            strict=True,
+        )
+        assert res["placed"] == 2
+        assert res["unplaced"] == 0
+
+
