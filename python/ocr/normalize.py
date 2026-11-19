@@ -50,6 +50,8 @@ def _is_code_listing(text: str) -> bool:
         return True
     if len(s) <= 160 and (_CODE_SNAKE_RE.search(s) or _CODE_CALL_RE.search(s) or _CODE_ASSIGN_RE.search(s)):
         return True
+    if re.search(r"\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", s) or '"""' in s or "'''" in s:
+        return True
     return False
 
 
@@ -184,6 +186,8 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
     if _EQ_NUM_RE.search(s) and math_count >= 1 and len(alpha_words) <= 6:
         return True
     if len(s) <= 80 and math_count >= 2 and math_count / max(1, len(s)) >= 0.08 and len(alpha_words) <= 5:
+        return True
+    if len(s) <= 100 and not s.endswith((".", "!", "?")) and re.search(r"[A-Za-z][A-Za-z0-9_]*\([^()\n]{1,40}\)\s*[=≈≤≥≠]", s):
         return True
     return False
 
@@ -441,6 +445,80 @@ def normalize_pages(
                 prev_translatable_body = None
 
             norm_blocks.append(nb)
+
+        # Horizontal-band formula propagation: protect equation fragments sharing a y-band with formula blocks
+        formula_boxes = [
+            (nb["bbox"], nb["text"])
+            for nb in norm_blocks
+            if nb["layout_role"] == "formula" and nb.get("bbox")
+        ]
+        if formula_boxes:
+            for nb in norm_blocks:
+                if not nb["policy"]["translate"] or nb["layout_role"] != "body" or not nb.get("bbox"):
+                    continue
+                bx0, by0, bx1, by1 = nb["bbox"]
+                txt = nb["text"].strip()
+                if not txt or len(txt) > 80 or txt.endswith("."):
+                    continue
+                b_mid_y = (by0 + by1) * 0.5
+                for fbox, ftxt in formula_boxes:
+                    fx0, fy0, fx1, fy1 = fbox
+                    y_ov = min(by1, fy1) - max(by0, fy0)
+                    f_mid_y = (fy0 + fy1) * 0.5
+                    if y_ov <= 0 and abs(b_mid_y - f_mid_y) > 10.0:
+                        continue
+                    h_gap = max(0.0, max(bx0 - fx1, fx0 - bx1))
+                    if h_gap > 45.0:
+                        continue
+                    long_words = re.findall(r"[a-z]{4,}", txt)
+                    if "=" in txt or _EQ_NUM_RE.search(ftxt) or len(txt) <= 35 or len(long_words) <= 3:
+                        nb["kind"] = "formula"
+                        nb["layout_role"] = "formula"
+                        nb["policy"] = {
+                            "translate": False,
+                            "preserve_reason": "formula_band",
+                            "redact_source": False,
+                        }
+                        break
+
+        # Deduplicate/merge geometrically contained translatable child blocks (e.g. split footnotes)
+        def _box_area(box: list[float]) -> float:
+            return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+        for child in norm_blocks:
+            if not child["policy"]["translate"] or not child.get("bbox"):
+                continue
+            cb = child["bbox"]
+            c_area = _box_area(cb)
+            if c_area <= 0:
+                continue
+            best_parent = None
+            best_p_area = float("inf")
+            for parent in norm_blocks:
+                if parent is child or not parent["policy"]["translate"] or not parent.get("bbox"):
+                    continue
+                pb = parent["bbox"]
+                p_area = _box_area(pb)
+                if p_area <= c_area * 1.05:
+                    continue
+                if _overlap_ratio(cb, pb, pad=1.0) >= 0.85 and p_area < best_p_area:
+                    best_parent = parent
+                    best_p_area = p_area
+            if best_parent is not None:
+                c_txt = " ".join(child["text"].split())
+                p_txt = " ".join(best_parent["text"].split())
+                if c_txt and c_txt not in p_txt:
+                    if child["reading_order"] >= best_parent["reading_order"]:
+                        merged_txt = best_parent["text"].rstrip() + " " + child["text"].strip()
+                    else:
+                        merged_txt = child["text"].strip() + " " + best_parent["text"].lstrip()
+                    best_parent["text"] = merged_txt
+                    best_parent["content"]["text"] = merged_txt
+                child["policy"] = {
+                    "translate": False,
+                    "preserve_reason": "contained_in_parent",
+                    "redact_source": False,
+                }
 
         norm_pages.append({
             "page_index": page_idx,

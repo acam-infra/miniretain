@@ -32,7 +32,7 @@ def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: st
         return False
     if len(re.findall(r"\b[A-Z]\.", src)) >= 3:
         return False
-    if re.search(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(|(?:^|\s)(?:from\s+\S+\s+)?import\s+\S+", src):
+    if re.search(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(|(?:^|\s)(?:from\s+\S+\s+)?import\s+\S+|\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\"\"\"|'''", src):
         return False
     if "←" in src and re.search(r"\b\d+:", src):
         return False
@@ -153,7 +153,8 @@ class OpenAICompatLLMClient:
                 continue
             cleaned = value.strip()
             src_raw = (item.get("text") or "").strip()
-            if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and len(cleaned) > max(32, int(len(src_raw) * 1.25)):
+            effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned))
+            if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and effective_len > max(32, int(len(src_raw) * 1.25)):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"suspiciously long translation for {bid}"})
                 continue
             if _is_verbatim_untranslated_echo(item, cleaned, target_lang):
