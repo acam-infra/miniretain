@@ -152,7 +152,8 @@ def measure_blocks_with_typst(
     ]
     for c in candidates:
         idx = c["idx"]
-        w = max(4.0, c["width"])
+        raw_w = max(4.0, c["width"])
+        w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
         weight = c["weight"]
         rich = c["rich_expr"]
         segs = c["segments"]
@@ -232,7 +233,8 @@ def _emit_overlay_typ(
             is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
             role = it.get("layout_role", "body")
             weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
-            w = max(4.0, float(rect.width))
+            raw_w = max(4.0, float(rect.width))
+            w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
             leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
             rich = typst_rich_text_expr(it["translation"].strip())
@@ -249,7 +251,7 @@ def _find_compiled_overflow_blocks(
     overlay_doc: pymupdf.Document,
     page_meta: list[dict],
     to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]],
-    tol_pt: float = 0.9,
+    tol_pt: float = 1.0,
 ) -> dict[str, str]:
     """Verify actual rendered glyph spans in compiled overlay.pdf stay inside their block rects."""
     bad: dict[str, str] = {}
@@ -478,6 +480,40 @@ def _render_typst_preserve(
 
         with pymupdf.open(overlay_pdf) as check_doc:
             compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
+
+        # Retry any compiled-overflow blocks up to 3 steps down (>= min_size)
+        for _retry_step in range(3):
+            if not compiled_bad:
+                break
+            changed = False
+            for page_index, plist in list(to_place_by_page.items()):
+                updated = []
+                for it, rect, csz, li in plist:
+                    bid = it.get("block_id", "unknown")
+                    if bid in compiled_bad and csz > min_size + 1e-6:
+                        new_sz = max(min_size, round(csz - 0.5, 2))
+                        shrunk += 1
+                        changed = True
+                        updated.append((it, rect, new_sz, li))
+                    else:
+                        updated.append((it, rect, csz, li))
+                to_place_by_page[page_index] = updated
+            if not changed:
+                break
+            overlay_typ.write_text(
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+                encoding="utf-8",
+            )
+            proc_retry = subprocess.run(
+                [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if proc_retry.returncode != 0:
+                raise RuntimeError(f"typst overlay retry compile failed: {proc_retry.stderr.strip()}")
+            with pymupdf.open(overlay_pdf) as check_doc2:
+                compiled_bad = _find_compiled_overflow_blocks(check_doc2, page_meta, to_place_by_page)
 
         if compiled_bad:
             for page_index, plist in list(to_place_by_page.items()):

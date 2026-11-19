@@ -274,7 +274,17 @@ def normalize_pages(
                 translate = True
             elif in_references:
                 layout_role = "reference"
-                translate = True
+                # Pure [N] + author-list lines (no title/venue/URL) are preserved as fixed identifiers
+                if (
+                    re.match(r"^\[\d+\]\s+[A-Z]\.", text)
+                    and not any(q in text for q in ('“', '”', '"', "http", "doi:"))
+                    and text.rstrip().endswith(",")
+                ):
+                    translate = False
+                    preserve_reason = "reference_authors"
+                    redact_source = False
+                else:
+                    translate = True
 
             # Respect explicit pre-set policy if provided
             if isinstance(b.get("policy"), dict) and "translate" in b["policy"]:
