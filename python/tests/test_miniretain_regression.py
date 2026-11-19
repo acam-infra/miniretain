@@ -381,6 +381,11 @@ def test_p1_reference_field_protection_and_clickable_link(tmp_path: Path):
     with pymupdf.open(out_cn) as cdoc:
         uris = [lk.get("uri") for lk in cdoc[0].get_links() if lk.get("uri")]
         assert "https://openreview.net/forum?id=B1ckMDqlg" in uris
+    with pymupdf.open(out_sbs) as sdoc:
+        left_uris = [lk.get("uri") for lk in sdoc[0].get_links() if lk.get("uri") and lk["from"].x0 < 612.0]
+        right_uris = [lk.get("uri") for lk in sdoc[0].get_links() if lk.get("uri") and lk["from"].x0 >= 612.0]
+        assert "https://openreview.net/forum?id=B1ckMDqlg" in left_uris
+        assert "https://openreview.net/forum?id=B1ckMDqlg" in right_uris
 
 
 def test_p1_typst_preserve_rejects_out_of_bounds_and_neighbor_overlap(tmp_path: Path):

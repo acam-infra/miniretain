@@ -406,15 +406,25 @@ def _render_typst_preserve(
                 page.show_pdf_page(page.rect, overlay_doc, page_index, overlay=True)
                 placed += len(to_place_by_page.get(page_index, []))
 
-                # Restore clickable URI links on rendered page
+                # Restore clickable URI links on rendered page (handling wrapped URLs)
                 existing_uris = {
                     (round(lk["from"].x0, 1), round(lk["from"].y0, 1), lk.get("uri"))
                     for lk in page.get_links()
                     if lk.get("uri")
                 }
+                words = page.get_text("words")
                 for orig_lk in saved_links_by_page.get(page_index, []):
                     uri = orig_lk["uri"]
                     found_rects = page.search_for(uri)
+                    if not found_rects:
+                        # Match wrapped URL parts via domain/path prefix in words
+                        domain = uri.split("://", 1)[-1].split("/", 1)[0]
+                        cand_words = [
+                            pymupdf.Rect(w[0], w[1], w[2], w[3])
+                            for w in words
+                            if domain in w[4] or (len(w[4]) >= 6 and w[4] in uri and ("/" in w[4] or "=" in w[4] or "?" in w[4]))
+                        ]
+                        found_rects = cand_words
                     target_rects = found_rects if found_rects else [orig_lk["from"]]
                     for tr in target_rects:
                         sig = (round(tr.x0, 1), round(tr.y0, 1), uri)

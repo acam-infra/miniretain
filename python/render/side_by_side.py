@@ -12,6 +12,35 @@ def _normalize_page_rotations(doc: pymupdf.Document) -> None:
             page.remove_rotation()
 
 
+def _copy_uri_links(
+    src_page: pymupdf.Page,
+    out_page: pymupdf.Page,
+    target_rect: pymupdf.Rect,
+) -> int:
+    """Copy URI link annotations from src_page into out_page mapped to target_rect."""
+    s_rect = src_page.rect
+    if s_rect.width <= 0 or s_rect.height <= 0:
+        return 0
+    scale = min(target_rect.width / s_rect.width, target_rect.height / s_rect.height)
+    dx = target_rect.x0 + (target_rect.width - s_rect.width * scale) / 2.0 - s_rect.x0 * scale
+    dy = target_rect.y0 + (target_rect.height - s_rect.height * scale) / 2.0 - s_rect.y0 * scale
+    count = 0
+    for lk in src_page.get_links():
+        uri = lk.get("uri")
+        if lk.get("kind") != pymupdf.LINK_URI or not uri:
+            continue
+        r = pymupdf.Rect(lk["from"])
+        mapped = pymupdf.Rect(
+            r.x0 * scale + dx,
+            r.y0 * scale + dy,
+            r.x1 * scale + dx,
+            r.y1 * scale + dy,
+        )
+        out_page.insert_link({"kind": pymupdf.LINK_URI, "from": mapped, "uri": uri})
+        count += 1
+    return count
+
+
 def build_side_by_side_pdf(
     source_pdf: str | Path,
     translated_pdf: str | Path,
@@ -49,19 +78,23 @@ def build_side_by_side_pdf(
                 )
                 out_page = out_doc.new_page(width=left_w + right_w, height=page_h)
                 if s_rect is not None:
+                    left_target = pymupdf.Rect(0, 0, left_w, page_h)
                     out_page.show_pdf_page(
-                        pymupdf.Rect(0, 0, left_w, page_h),
+                        left_target,
                         source_doc,
                         page_index,
                         keep_proportion=True,
                     )
+                    _copy_uri_links(source_doc[page_index], out_page, left_target)
                 if t_rect is not None:
+                    right_target = pymupdf.Rect(left_w, 0, left_w + right_w, page_h)
                     out_page.show_pdf_page(
-                        pymupdf.Rect(left_w, 0, left_w + right_w, page_h),
+                        right_target,
                         translated_doc,
                         page_index,
                         keep_proportion=True,
                     )
+                    _copy_uri_links(translated_doc[page_index], out_page, right_target)
                 page_sizes.append((round(left_w + right_w, 2), round(page_h, 2)))
             out_doc.save(out_path, garbage=4, deflate=True)
 
