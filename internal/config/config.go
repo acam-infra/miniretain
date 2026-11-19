@@ -58,9 +58,10 @@ type PathsConfig struct {
 }
 
 type RuntimeConfig struct {
-	Python     string `yaml:"python"`
-	Typst      string `yaml:"typst"`
-	MaxWorkers *int   `yaml:"max_workers"`
+	Python            string `yaml:"python"`
+	Typst             string `yaml:"typst"`
+	MaxWorkers        *int   `yaml:"max_workers"`
+	MaxLLMConcurrency *int   `yaml:"max_llm_concurrency"`
 }
 
 type OCRConfig struct {
@@ -289,6 +290,14 @@ func (c *Config) EffectiveMaxWorkers() int {
 	return *c.Runtime.MaxWorkers
 }
 
+// EffectiveMaxLLMConcurrency returns the optional global in-flight LLM request budget (0 = unset).
+func (c *Config) EffectiveMaxLLMConcurrency() int {
+	if c.Runtime.MaxLLMConcurrency == nil {
+		return 0
+	}
+	return *c.Runtime.MaxLLMConcurrency
+}
+
 // EffectiveReadHeaderTimeoutMS returns the configured HTTP read header timeout in ms.
 func (c *Config) EffectiveReadHeaderTimeoutMS() int {
 	if c.Server.ReadHeaderTimeoutMS == nil {
@@ -307,6 +316,9 @@ func (c *Config) Validate(schema *worker.Schema) error {
 	}
 	if c.EffectiveMaxWorkers() < 1 {
 		return fmt.Errorf("config validation: runtime.max_workers must be >= 1, got %d", c.EffectiveMaxWorkers())
+	}
+	if c.Runtime.MaxLLMConcurrency != nil && *c.Runtime.MaxLLMConcurrency < 1 {
+		return fmt.Errorf("config validation: runtime.max_llm_concurrency must be >= 1, got %d", *c.Runtime.MaxLLMConcurrency)
 	}
 
 	workerPy := filepath.Join(c.Paths.Root, "python", "worker.py")
@@ -592,7 +604,7 @@ func (c *Config) HealthSummary() map[string]any {
 	if c.ConfigFile != "" {
 		mode = "yaml"
 	}
-	return map[string]any{
+	out := map[string]any{
 		"config_mode":    mode,
 		"max_workers":    c.EffectiveMaxWorkers(),
 		"ocr_provider":   c.OCR.Provider,
@@ -601,4 +613,8 @@ func (c *Config) HealthSummary() map[string]any {
 		"render_enabled": c.RenderEnabledByDefault(),
 		"render_engine":  c.Render.Engine,
 	}
+	if g := c.EffectiveMaxLLMConcurrency(); g > 0 {
+		out["max_llm_concurrency"] = g
+	}
+	return out
 }

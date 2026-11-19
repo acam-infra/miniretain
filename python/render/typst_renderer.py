@@ -136,13 +136,42 @@ def _typst_version(typst_bin: str) -> str:
 
 
 def _candidate_sizes(start_sz: float, min_size: float) -> list[float]:
+    """Generate descending candidate font sizes (0.25pt step above 7.0pt, 0.5pt below, inclusive of min_size)."""
     sizes: list[float] = []
-    sz = max(min_size, round(start_sz * 2) / 2)
+    sz = max(min_size, round(start_sz * 4) / 4)
     while sz > min_size + 1e-6:
-        sizes.append(round(sz, 2))
-        sz -= 0.5
-    sizes.append(round(min_size, 2))
+        r = round(sz, 2)
+        if not sizes or abs(sizes[-1] - r) > 1e-6:
+            sizes.append(r)
+        step = 0.25 if sz > 7.0 + 1e-6 else 0.5
+        sz = max(min_size, round((sz - step) * 4) / 4)
+    floor = round(min_size, 2)
+    if not sizes or abs(sizes[-1] - floor) > 1e-6:
+        sizes.append(floor)
     return sizes
+
+
+def _compute_start_size(
+    hint: float | None,
+    rect: pymupdf.Rect,
+    min_size: float,
+    role: str = "body",
+) -> float:
+    """Line-aware initial font size.
+
+    Multi-line blocks (paragraphs, captions, references) start closer to the source
+    font size (0.98x) so CJK body text retains full readability; single-line boxes
+    are capped by box height (0.85x) because CJK em-boxes are taller than Latin glyphs.
+    """
+    max_cap = 16.0 if role == "title" else 14.0
+    if hint and isinstance(hint, (int, float)) and hint > 0:
+        h_val = float(hint)
+        if rect.height <= h_val * 1.45:
+            raw = min(h_val * 0.92, rect.height * 0.85)
+        else:
+            raw = h_val * 0.98
+        return min(max_cap, max(min_size, raw))
+    return min(max_cap, max(min_size, rect.height * 0.78))
 
 
 def measure_blocks_with_typst(
@@ -436,13 +465,9 @@ def _render_typst_preserve(
 
                 rect = pdf_rect(bbox, scale)
                 hint = it.get("font_size_pt") or (it.get("content") or {}).get("font_size_pt")
-                start_sz = (
-                    min(14.0, max(min_size, float(hint) * 0.92))
-                    if hint and isinstance(hint, (int, float)) and hint > 0
-                    else min(14.0, max(min_size, rect.height * 0.78))
-                )
                 is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
                 role = it.get("layout_role", "body")
+                start_sz = _compute_start_size(hint, rect, min_size, role=role)
                 weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
                 cand = {
                     "idx": len(probe_candidates),
@@ -588,8 +613,8 @@ def _render_typst_preserve(
         with pymupdf.open(overlay_pdf) as check_doc:
             compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
 
-        # Retry any compiled-overflow blocks up to 3 steps down (>= min_size)
-        for _retry_step in range(3):
+        # Retry any compiled-overflow blocks up to 6 steps down (>= min_size)
+        for _retry_step in range(6):
             if not compiled_bad:
                 break
             changed = False
@@ -598,7 +623,8 @@ def _render_typst_preserve(
                 for it, rect, csz, li in plist:
                     bid = it.get("block_id", "unknown")
                     if bid in compiled_bad and csz > min_size + 1e-6:
-                        new_sz = max(min_size, round(csz - 0.5, 2))
+                        step = 0.25 if csz > 7.0 + 1e-6 else 0.5
+                        new_sz = max(min_size, round(csz - step, 2))
                         shrunk += 1
                         changed = True
                         updated.append((it, rect, new_sz, li))
@@ -742,6 +768,47 @@ def _render_typst_preserve(
     bilingual_s = round(time.perf_counter() - t_bi_0, 3)
     total_s = round(time.perf_counter() - t_total_0, 3)
 
+    chosen_sizes = [
+        round(csz, 2)
+        for plist in to_place_by_page.values()
+        for _it, _rect, csz, _li in plist
+    ]
+    start_by_id = {
+        c["item"].get("block_id", "unknown"): c["sizes"][0]
+        for c in probe_candidates
+        if c["sizes"]
+    }
+    shrunk_blocks = sum(
+        1
+        for plist in to_place_by_page.values()
+        for it, _rect, csz, _li in plist
+        if csz < start_by_id.get(it.get("block_id", "unknown"), csz) - 1e-6
+    )
+    size_hist: dict[str, int] = {}
+    for s in sorted(chosen_sizes):
+        k = f"{s:.2f}".rstrip("0").rstrip(".")
+        size_hist[k] = size_hist.get(k, 0) + 1
+    if chosen_sizes:
+        s_sorted = sorted(chosen_sizes)
+        font_size_stats = {
+            "min_size_floor_pt": round(min_size, 2),
+            "min_pt": s_sorted[0],
+            "p10_pt": s_sorted[int(len(s_sorted) * 0.1)],
+            "median_pt": round(s_sorted[len(s_sorted) // 2], 2),
+            "mean_pt": round(sum(s_sorted) / len(s_sorted), 2),
+            "max_pt": s_sorted[-1],
+            "shrunk_blocks": shrunk_blocks,
+            "shrunk_steps": shrunk,
+            "histogram": size_hist,
+        }
+    else:
+        font_size_stats = {
+            "min_size_floor_pt": round(min_size, 2),
+            "shrunk_blocks": 0,
+            "shrunk_steps": shrunk,
+            "histogram": {},
+        }
+
     return {
         "engine": "typst",
         "layout_mode": "preserve",
@@ -755,6 +822,7 @@ def _render_typst_preserve(
         "unplaced_reasons": unplaced_reasons,
         "failed_block_ids": failed_block_ids,
         "shrunk_steps": shrunk,
+        "font_size_stats": font_size_stats,
         "per_page": per_page,
         "output_cn": str(output_cn),
         "output_merged": str(output_merged),

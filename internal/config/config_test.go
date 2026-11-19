@@ -243,3 +243,41 @@ llm:
 		t.Fatal("LLMDefaultsMap must not expose api_key")
 	}
 }
+
+func TestMaxLLMConcurrencyYAMLAndValidation(t *testing.T) {
+	root := repoRoot(t)
+	tmp := t.TempDir()
+	schema := loadTestSchema(t)
+
+	okPath := filepath.Join(tmp, "ok.yaml")
+	okYAML := "paths:\n  root: " + root + "\nruntime:\n  max_workers: 3\n  max_llm_concurrency: 6\n"
+	if err := os.WriteFile(okPath, []byte(okYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(okPath)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if err := cfg.Validate(schema); err != nil {
+		t.Fatalf("Validate failed: %v", err)
+	}
+	if got := cfg.EffectiveMaxLLMConcurrency(); got != 6 {
+		t.Fatalf("EffectiveMaxLLMConcurrency = %d, want 6", got)
+	}
+	if h := cfg.HealthSummary(); h["max_llm_concurrency"] != 6 {
+		t.Fatalf("HealthSummary max_llm_concurrency = %v, want 6", h["max_llm_concurrency"])
+	}
+
+	badPath := filepath.Join(tmp, "bad.yaml")
+	badYAML := "paths:\n  root: " + root + "\nruntime:\n  max_llm_concurrency: 0\n"
+	if err := os.WriteFile(badPath, []byte(badYAML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	badCfg, err := Load(badPath)
+	if err != nil {
+		t.Fatalf("Load bad config failed: %v", err)
+	}
+	if err := badCfg.Validate(schema); err == nil || !strings.Contains(err.Error(), "max_llm_concurrency") {
+		t.Fatalf("expected max_llm_concurrency validation error, got %v", err)
+	}
+}

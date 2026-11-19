@@ -4,9 +4,28 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
+
+_CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
+_LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
+
+def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: str) -> bool:
+    """Detect when an LLM silently echoes a long English prose block unchanged for a CJK target."""
+    tl = (target_lang or "").lower()
+    if not tl.startswith(("zh", "ja", "ko")):
+        return False
+    if item.get("layout_role") == "reference":
+        return False
+    src = (item.get("text") or "").strip()
+    if len(src) < 40 or _CJK_CHAR_RE.search(translation):
+        return False
+    if len(_LATIN_WORD_RE.findall(src)) < 6:
+        return False
+    return translation.strip() == src
 
 
 def _is_tailnet_or_local(url: str) -> bool:
@@ -65,13 +84,18 @@ class OpenAICompatLLMClient:
     def translate(self, items, target_lang, model, timeout_ms):
         base = os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:18083/v1").rstrip("/")
         key = self._resolve_key()
+        doc_context = ""
+        if items and isinstance(items[0], dict):
+            doc_context = (items[0].get("_doc_context") or "").strip()
         lines = "\n".join(f"{i['block_id']}\t{i['text']}" for i in items)
+        ctx_section = f"\nDocument terminology & style context:\n{doc_context}\n" if doc_context else ""
         prompt = (
             f"Translate each numbered academic paper block to {target_lang}. "
-            f"Rules: (1) Keep placeholders like ⟪F0⟫, citations like [1], URLs, and standard technical "
+            f"Rules: (1) Keep placeholders like ⟪F0⟫, citations like [1], URLs, numbers/units, and standard technical "
             f"acronyms (e.g., LLM, KV Cache, MoE, FFN, Prefill, Decode, LEO, ISL, TFLOPS, Gbps, DRAM, HBM) "
             f"accurate; (2) Use natural, concise academic {target_lang}; "
-            f"(3) Reply with ONLY a valid JSON object mapping exact block_id -> translation.\n\n{lines}"
+            f"(3) Reply with ONLY a valid JSON object mapping every exact block_id -> translation (do not omit any block_id)."
+            f"{ctx_section}\n{lines}"
         )
         body = json.dumps({
             "model": model,
@@ -96,7 +120,9 @@ class OpenAICompatLLMClient:
                 data = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:240].decode("utf-8", errors="replace")
-            raise RuntimeError(f"LLM HTTP {exc.code}: {detail}") from exc
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            ra_note = f" retry_after={retry_after}" if retry_after else ""
+            raise RuntimeError(f"LLM HTTP {exc.code}{ra_note}: {detail}") from exc
         content = data["choices"][0]["message"]["content"]
         mapping = _extract_json_object(content)
         out = []
@@ -109,5 +135,9 @@ class OpenAICompatLLMClient:
             if not isinstance(value, str) or not value.strip():
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"empty translation for {bid}"})
                 continue
-            out.append({"block_id": bid, "status": "ok", "translation": value.strip(), "error": None})
+            cleaned = value.strip()
+            if _is_verbatim_untranslated_echo(item, cleaned, target_lang):
+                out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"untranslated verbatim echo for {bid}"})
+                continue
+            out.append({"block_id": bid, "status": "ok", "translation": cleaned, "error": None})
         return out

@@ -4,6 +4,7 @@
 
 - 详细安装、部署、配置表与排障见：[docs/deployment.md](docs/deployment.md)
 - OCR 后端注册、输出契约与扩展开发手册见：[docs/ocr-backends.md](docs/ocr-backends.md)
+- 流水线架构、并发调度、翻译质量与 Typst 字号优化实测见：[docs/architecture-and-optimization.md](docs/architecture-and-optimization.md)
 - 单 YAML 启动示例配置见：[configs/miniretain.example.yaml](configs/miniretain.example.yaml)
 
 ---
@@ -60,7 +61,7 @@ curl --noproxy '*' -sS "http://127.0.0.1:18080/v1/jobs/${JOB_ID}/result" | jq .
 - `configs/miniretain.example.yaml` — 可直接复制的单 YAML 配置模板。
 - `python/worker.py` — 单 worker 入口，按 `spec.stage` 分派 `ocr` / `llm` / `render`。
 - `python/ocr/` — `OCRProvider` 基类与契约校验（`base.py`）、注册表（`adapter.py`）、规范化器（`normalize.py`）、PyMuPDF/Auto（`pymupdf_adapter.py`）、Paddle HTTP 客户端/服务端（`paddle_http_adapter.py` / `paddle_server.py`）与本地 Paddle CPU（`paddle_adapter.py`）。
-- `python/llm/` — 公式占位保护（`formula_protect.py`）、字符均衡并发调度器（`scheduler.py`）与 OpenAI-compatible 客户端（`openai_client.py`）。
+- `python/llm/` — 公式占位保护（`formula_protect.py`）、文档术语上下文锚点（`context.py`）、字符预算与 LPT 批次规划（`planner.py`）、进程内/跨进程全局并发预算（`limiter.py`）、错误分类与抖动重试（`retry.py`）、流式并发调度器（`scheduler.py`）与 OpenAI-compatible 客户端（`openai_client.py`）。
 - `python/render/` — Typst `0.15.1` 原页 overlay 渲染器（`typst_renderer.py`）、左右双语合成（`side_by_side.py`）与 PyMuPDF 渲染器（`layout.py`）。
 - `docs/deployment.md` / `docs/ocr-backends.md` — 部署运维指南与 OCR 后端接入文档。
 
