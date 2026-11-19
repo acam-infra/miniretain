@@ -213,6 +213,12 @@ def normalize_pages(
             font_size = float(b["font_size_pt"]) if b.get("font_size_pt") else None
             is_bold = bool(b.get("is_bold", False))
             is_math_font = bool(b.get("is_math_font", False))
+            is_vertical = bool(b.get("is_vertical", False))
+            if not is_vertical and bbox and len(text) < 80:
+                bw = max(1.0, bbox[2] - bbox[0])
+                bh = max(1.0, bbox[3] - bbox[1])
+                if bh > bw * 2.5:
+                    is_vertical = True
             col_idx = int(b.get("column_index", 0))
 
             # Role & Policy classification
@@ -230,6 +236,11 @@ def normalize_pages(
                 layout_role = "unreliable"
                 translate = False
                 preserve_reason = "unreliable_ocr"
+                redact_source = False
+            elif is_vertical and len(text) < 120:
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "vertical_figure_label"
                 redact_source = False
             elif _CAPTION_RE.match(text):
                 layout_role = "caption"

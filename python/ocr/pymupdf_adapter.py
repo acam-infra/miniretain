@@ -1,12 +1,128 @@
 """PyMuPDF native PDF layout extractor and Auto OCR provider."""
 from __future__ import annotations
 
+import re
 import time
 import pymupdf
 
 from ocr.normalize import cluster_figure_regions, normalize_pages
 
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
+_REF_START_RE = re.compile(r"^\[\d+\]\s+")
+
+
+def _join_lines_smart(lines_text: list[str]) -> str:
+    """Join lines within a block, repairing hyphenation and wrapped URLs."""
+    if not lines_text:
+        return ""
+    out = lines_text[0]
+    for nxt in lines_text[1:]:
+        prev_tail = out.rstrip()
+        nxt_head = nxt.lstrip()
+        # Repair hyphenated word breaks like "disag-" + "gregation"
+        if prev_tail.endswith("-") and nxt_head and nxt_head[0].islower():
+            out = prev_tail[:-1] + nxt_head
+            continue
+        # Repair wrapped URLs: "https:" + "//..." or "https://arxiv.org/ab" + "s/2507..."
+        last_tok = prev_tail.rsplit(None, 1)[-1] if prev_tail else ""
+        first_tok = nxt_head.split(None, 1)[0] if nxt_head else ""
+        if (
+            last_tok.startswith(("http://", "https://", "http:", "https:", "doi:"))
+            and first_tok
+            and (
+                last_tok.endswith((":", "/", "-", "_", ".", "?", "=", "&"))
+                or nxt_head.startswith(("//", "/"))
+                or ("/" in last_tok and not any(ch in first_tok for ch in "，。；"))
+            )
+        ):
+            # Only join without space if nxt_head looks like URL path continuation
+            if nxt_head.startswith("//") or (
+                last_tok.startswith(("http://", "https://"))
+                and re.match(r"^[A-Za-z0-9_./?=&%+\-#]+$", first_tok)
+                and not re.match(r"^\[\d+\]$", first_tok)
+            ):
+                out = prev_tail + nxt_head
+                continue
+        out = prev_tail + " " + nxt_head
+    return out.strip()
+
+
+def _split_reference_lines(lines: list[dict]) -> list[list[dict]]:
+    """Split a block's lines when a line at left margin starts a new [N] reference."""
+    if len(lines) < 2:
+        return [lines]
+    min_x0 = min(l["bbox"][0] for l in lines if l.get("bbox"))
+    groups: list[list[dict]] = []
+    cur: list[dict] = []
+    for line in lines:
+        lt = "".join(s.get("text", "") for s in (line.get("spans") or [])).strip()
+        lx0 = line["bbox"][0] if line.get("bbox") else min_x0
+        if cur and _REF_START_RE.match(lt) and lx0 <= min_x0 + 6.0:
+            groups.append(cur)
+            cur = [line]
+        else:
+            cur.append(line)
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _build_block_from_lines(
+    block_id: str, lines: list[dict], page_rect_width: float
+) -> tuple[dict | None, int]:
+    line_bboxes: list[list[float]] = []
+    line_texts: list[str] = []
+    span_sizes: list[float] = []
+    bold_chars = 0
+    math_chars = 0
+    char_count = 0
+    is_vertical = False
+
+    for line in lines:
+        spans = line.get("spans") or []
+        lt = "".join(s.get("text", "") for s in spans).strip()
+        if not lt:
+            continue
+        line_texts.append(lt)
+        if line.get("bbox"):
+            line_bboxes.append([float(v) for v in line["bbox"]])
+        ldir = line.get("dir")
+        if ldir and abs(float(ldir[1])) > 0.5:
+            is_vertical = True
+        for s in spans:
+            st = s.get("text", "")
+            n = len(st.strip())
+            if n == 0:
+                continue
+            char_count += n
+            span_sizes.append(float(s.get("size", 10.0)))
+            fname = (s.get("font") or "").upper()
+            flags = int(s.get("flags", 0))
+            if (flags & 16) or "BOLD" in fname:
+                bold_chars += n
+            if any(tok in fname for tok in _MATH_FONT_TOKENS):
+                math_chars += n
+
+    text = _join_lines_smart(line_texts)
+    if not text or not line_bboxes:
+        return None, 0
+    bbox = [
+        min(lb[0] for lb in line_bboxes),
+        min(lb[1] for lb in line_bboxes),
+        max(lb[2] for lb in line_bboxes),
+        max(lb[3] for lb in line_bboxes),
+    ]
+    avg_size = sum(span_sizes) / len(span_sizes) if span_sizes else 10.0
+    return {
+        "block_id": block_id,
+        "text": text,
+        "bbox": bbox,
+        "line_bboxes": line_bboxes,
+        "font_size_pt": round(avg_size, 2),
+        "is_bold": bold_chars > char_count * 0.6 if char_count else False,
+        "is_math_font": math_chars > char_count * 0.5 if char_count else False,
+        "is_vertical": is_vertical,
+    }, len(text)
 
 
 def _extract_page_blocks(page: pymupdf.Page) -> tuple[list[dict], list[list[float]], bool]:
@@ -25,52 +141,13 @@ def _extract_page_blocks(page: pymupdf.Page) -> tuple[list[dict], list[list[floa
         if b.get("type") != 0:
             continue
         lines = b.get("lines") or []
-        line_bboxes: list[list[float]] = []
-        line_texts: list[str] = []
-        span_sizes: list[float] = []
-        bold_chars = 0
-        math_chars = 0
-        char_count = 0
-
-        for line in lines:
-            spans = line.get("spans") or []
-            lt = "".join(s.get("text", "") for s in spans).strip()
-            if not lt:
-                continue
-            line_texts.append(lt)
-            if line.get("bbox"):
-                line_bboxes.append([float(v) for v in line["bbox"]])
-            for s in spans:
-                st = s.get("text", "")
-                n = len(st.strip())
-                if n == 0:
-                    continue
-                char_count += n
-                span_sizes.append(float(s.get("size", 10.0)))
-                fname = (s.get("font") or "").upper()
-                flags = int(s.get("flags", 0))
-                if (flags & 16) or "BOLD" in fname:
-                    bold_chars += n
-                if any(tok in fname for tok in _MATH_FONT_TOKENS):
-                    math_chars += n
-
-        text = " ".join(line_texts).strip()
-        if not text:
-            continue
-        # Fix hyphenated line breaks like "disag- gregation"
-        text = text.replace("- ", "")
-        total_chars += len(text)
-        bbox = [float(v) for v in b["bbox"]]
-        avg_size = sum(span_sizes) / len(span_sizes) if span_sizes else 10.0
-        blocks.append({
-            "block_id": f"p{page.number}b{idx:04d}",
-            "text": text,
-            "bbox": bbox,
-            "line_bboxes": line_bboxes or [bbox],
-            "font_size_pt": round(avg_size, 2),
-            "is_bold": bold_chars > char_count * 0.6 if char_count else False,
-            "is_math_font": math_chars > char_count * 0.5 if char_count else False,
-        })
+        sub_groups = _split_reference_lines(lines)
+        for sub_i, sub_lines in enumerate(sub_groups):
+            bid = f"p{page.number}b{idx:04d}" if len(sub_groups) == 1 else f"p{page.number}b{idx:04d}_{sub_i}"
+            blk, nchars = _build_block_from_lines(bid, sub_lines, page.rect.width)
+            if blk is not None:
+                blocks.append(blk)
+                total_chars += nchars
 
     is_scanned = total_chars < 20 and len(image_rects) > 0
     return blocks, figure_regions, is_scanned
@@ -116,12 +193,10 @@ class AutoOCRProvider:
         pages = pymupdf_prov.parse(source)
         scanned_pages = [p["page_index"] for p in pages if p.get("is_scanned")]
         if scanned_pages and all(p.get("is_scanned") for p in pages):
-            # Try paddle-cpu if installed
             try:
                 from ocr.paddle_adapter import PaddleOCRProvider
                 paddle = PaddleOCRProvider()
                 return paddle.parse(source)
             except Exception:
-                # Keep unreliable_ocr markers so source content is protected
                 return pages
         return pages

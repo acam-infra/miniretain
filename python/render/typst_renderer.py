@@ -1,22 +1,21 @@
 """Typst renderer for Miniretain: supports layout-preserving per-page overlay
-(RetainPDF-aligned) and A4 streaming fallback.
-
-Generates:
-1. Pure Chinese translated document (`output_cn`, e.g. translated_cn.pdf)
-2. Bilingual comparison document (`output_merged`, side-by-side in preserve mode,
-   or A4 comparison table in flow mode)
+(RetainPDF-aligned) with Typst-native measure() fit verification and A4 streaming fallback.
 """
 from __future__ import annotations
 
+import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
 
 import pymupdf
 
-from render.layout import find_cjk_font, fit_textbox_size, pdf_rect
+from render.layout import find_cjk_font, pdf_rect
 from render.side_by_side import build_side_by_side_pdf, merge_interleaved
+
+_URL_RE = re.compile(r"https?://[^\s)\]>]+")
 
 
 def find_typst() -> str:
@@ -44,7 +43,6 @@ def escape_typst(text: str) -> str:
     s = text.replace("\\", "\\\\")
     for ch in ["#", "$", "@", "[", "]", "*", "_", "`", "<", ">"]:
         s = s.replace(ch, "\\" + ch)
-    # Prevent // and /* from being parsed as Typst comments
     s = s.replace("//", "\\/\\/").replace("/*", "\\/\\*")
     return s
 
@@ -57,12 +55,112 @@ def typst_str_literal(text: str) -> str:
     return f'"{s}"'
 
 
+def typst_rich_text_expr(text: str) -> str:
+    """Render text with clickable #link(url)[url] for URLs and literal strings elsewhere."""
+    parts: list[str] = []
+    pos = 0
+    for m in _URL_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(f"#{typst_str_literal(text[pos:m.start()])}")
+        url = m.group(0).rstrip(".,;:")
+        trail = m.group(0)[len(url):]
+        ul = typst_str_literal(url)
+        parts.append(f"#link({ul})[#{ul}]")
+        if trail:
+            parts.append(f"#{typst_str_literal(trail)}")
+        pos = m.end()
+    if pos < len(text):
+        parts.append(f"#{typst_str_literal(text[pos:])}")
+    return "".join(parts) if parts else '""'
+
+
 def _typst_version(typst_bin: str) -> str:
     try:
         proc = subprocess.run([typst_bin, "--version"], capture_output=True, text=True, timeout=10)
         return proc.stdout.strip()
     except Exception:
         return "unknown"
+
+
+def _candidate_sizes(start_sz: float, min_size: float) -> list[float]:
+    sizes: list[float] = []
+    sz = max(min_size, round(start_sz * 2) / 2)
+    while sz > min_size + 1e-6:
+        sizes.append(round(sz, 2))
+        sz -= 0.5
+    sizes.append(round(min_size, 2))
+    return sizes
+
+
+def measure_blocks_with_typst(
+    typst_bin: str,
+    font_dir: str,
+    font_families: str,
+    workdir: Path,
+    candidates: list[dict],
+) -> dict[tuple[int, float], tuple[float, float]]:
+    """Measure exact Typst (width_pt, height_pt) for all candidate (idx, size_pt) in one query."""
+    if not candidates:
+        return {}
+    lines = [
+        f'#set text(font: {font_families}, lang: "zh", fill: black)',
+        "",
+    ]
+    for c in candidates:
+        idx = c["idx"]
+        w = max(4.0, c["width"])
+        weight = c["weight"]
+        rich = c["rich_expr"]
+        for sz in c["sizes"]:
+            leading = "0.35em" if sz < 8.5 else "0.45em"
+            lines.append(
+                f'#context {{ let m = measure(block(width: {w:.2f}pt)'
+                f'[#set text(size: {sz:.2f}pt, weight: "{weight}"); '
+                f'#set par(leading: {leading}, justify: true); {rich}]); '
+                f'[#metadata((idx: {idx}, sz: {sz:.2f}, w: m.width / 1pt, h: m.height / 1pt)) <fit>] }}'
+            )
+    probe_typ = workdir / "fit_probe.typ"
+    probe_typ.write_text("\n".join(lines), encoding="utf-8")
+    proc = subprocess.run(
+        [typst_bin, "query", "--font-path", font_dir, str(probe_typ), "<fit>"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"typst measure query failed: {proc.stderr.strip()}")
+    rows = json.loads(proc.stdout)
+    out: dict[tuple[int, float], tuple[float, float]] = {}
+    for row in rows:
+        val = row.get("value") or {}
+        out[(int(val["idx"]), round(float(val["sz"]), 2))] = (float(val["w"]), float(val["h"]))
+    return out
+
+
+def _rect_overlap_area(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    return max(0.0, x1 - x0) * max(0.0, y1 - y0)
+
+
+def _overlaps_neighbor(
+    placed_box: tuple[float, float, float, float],
+    self_idx: int,
+    neighbor_boxes: list[tuple[int, tuple[float, float, float, float]]],
+    tol_pt: float = 1.5,
+) -> bool:
+    for n_idx, nb in neighbor_boxes:
+        if n_idx == self_idx:
+            continue
+        x0 = max(placed_box[0], nb[0])
+        y0 = max(placed_box[1], nb[1])
+        x1 = min(placed_box[2], nb[2])
+        y1 = min(placed_box[3], nb[3])
+        if (x1 - x0) > tol_pt and (y1 - y0) > tol_pt:
+            return True
+    return False
 
 
 def _render_typst_preserve(
@@ -87,42 +185,44 @@ def _render_typst_preserve(
     font_families = '("Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC", "Droid Sans Fallback", "Libertinus Serif")'
 
     doc = pymupdf.open(source_pdf)
-    placed = 0
     preserved = 0
     unplaced = 0
     failed = 0
     shrunk = 0
     unplaced_block_ids: list[str] = []
+    unplaced_reasons: dict[str, str] = {}
     failed_block_ids: list[str] = []
-    per_page: list[dict] = []
 
-    overlay_pages_typ: list[str] = [
-        '#set page(margin: 0pt, fill: none)',
-        f'#set text(font: {font_families}, lang: "zh", fill: black)',
-        '#set par(justify: true, leading: 0.45em)',
-        '',
-    ]
+    # Step 1: Collect all translatable candidates & page neighbor bboxes
+    probe_candidates: list[dict] = []
+    page_meta: list[dict] = []
+    saved_links_by_page: dict[int, list[dict]] = {}
 
-    scratch_doc = pymupdf.open()
     try:
         for page_index in range(len(doc)):
             page = doc[page_index]
             pw = float(page.rect.width)
             ph = float(page.rect.height)
-            spage = scratch_doc.new_page(width=pw, height=ph)
-            spage.insert_font(fontname="mr_fit", fontfile=cjk_font_file)
             coord_space = page_coord_spaces.get(page_index, "pdf_pt")
             scale = 1.0 if coord_space == "pdf_pt" else (page_widths.get(page_index, pw) / pw)
-            is_scanned = bool(page_scanned.get(page_index, False))
+            saved_links_by_page[page_index] = [
+                {"from": pymupdf.Rect(lk["from"]), "uri": lk["uri"]}
+                for lk in page.get_links()
+                if lk.get("kind") == pymupdf.LINK_URI and lk.get("uri")
+            ]
 
             page_items = [it for it in items if it["page_index"] == page_index]
-            p_placed = 0
-            p_preserved = 0
-            p_unplaced = 0
-            p_failed = 0
-            to_render: list[tuple[dict, pymupdf.Rect, float]] = []
+            neighbor_boxes: list[tuple[int, tuple[float, float, float, float]]] = []
+            for local_i, it in enumerate(page_items):
+                if it.get("bbox"):
+                    r = pdf_rect(it["bbox"], scale)
+                    neighbor_boxes.append((local_i, (r.x0, r.y0, r.x1, r.y1)))
 
-            for it in page_items:
+            p_preserved = 0
+            p_failed = 0
+            p_candidates: list[dict] = []
+
+            for local_i, it in enumerate(page_items):
                 bid = it.get("block_id", "unknown")
                 policy = it.get("policy") or {}
                 if policy.get("translate") is False:
@@ -146,64 +246,143 @@ def _render_typst_preserve(
                     if hint and isinstance(hint, (int, float)) and hint > 0
                     else min(14.0, max(min_size, rect.height * 0.78))
                 )
-                fits, chosen_sz, steps = fit_textbox_size(
-                    pw, ph, rect, trans, cjk_font_file, start_size=start_sz, min_size=min_size, scratch_page=spage
-                )
-                shrunk += steps
-                if not fits:
-                    # Keep source block intact and report ID
+                is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
+                role = it.get("layout_role", "body")
+                weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
+                cand = {
+                    "idx": len(probe_candidates),
+                    "local_i": local_i,
+                    "item": it,
+                    "rect": rect,
+                    "width": max(4.0, float(rect.width)),
+                    "height": max(2.0, float(rect.height)),
+                    "weight": weight,
+                    "rich_expr": typst_rich_text_expr(trans),
+                    "sizes": _candidate_sizes(start_sz, min_size),
+                }
+                probe_candidates.append(cand)
+                p_candidates.append(cand)
+
+            page_meta.append({
+                "page_index": page_index,
+                "pw": pw,
+                "ph": ph,
+                "scale": scale,
+                "is_scanned": bool(page_scanned.get(page_index, False)),
+                "total_blocks": len(page_items),
+                "neighbor_boxes": neighbor_boxes,
+                "p_preserved": p_preserved,
+                "p_failed": p_failed,
+                "candidates": p_candidates,
+            })
+
+        # Step 2: Measure ALL candidates using actual Typst layout engine in one query
+        measured = measure_blocks_with_typst(
+            typst_bin, font_dir, font_families, workdir, probe_candidates
+        )
+
+        # Step 3: Select largest size >= min_size that fits box, page bounds, and doesn't overlap neighbors
+        overlay_pages_typ: list[str] = [
+            '#set page(margin: 0pt, fill: none)',
+            f'#set text(font: {font_families}, lang: "zh", fill: black)',
+            '#set par(justify: true, leading: 0.45em)',
+            '',
+        ]
+        per_page: list[dict] = []
+        to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float]]] = {}
+
+        for pm in page_meta:
+            page_index = pm["page_index"]
+            page = doc[page_index]
+            pw, ph, scale = pm["pw"], pm["ph"], pm["scale"]
+            p_unplaced = 0
+            to_render: list[tuple[dict, pymupdf.Rect, float]] = []
+
+            for cand in pm["candidates"]:
+                it = cand["item"]
+                bid = it.get("block_id", "unknown")
+                rect = cand["rect"]
+                chosen_sz = None
+                fail_reason = "overflow"
+
+                for step_i, sz in enumerate(cand["sizes"]):
+                    mw, mh = measured.get((cand["idx"], round(sz, 2)), (1e9, 1e9))
+                    if mh > rect.height + 0.5 or mw > rect.width + 0.5:
+                        fail_reason = "overflow"
+                        continue
+                    placed_box = (rect.x0, rect.y0, rect.x0 + mw, rect.y0 + mh)
+                    if (
+                        placed_box[0] < -0.5
+                        or placed_box[1] < -0.5
+                        or placed_box[2] > pw + 0.5
+                        or placed_box[3] > ph + 0.5
+                    ):
+                        fail_reason = "out_of_bounds"
+                        continue
+                    if _overlaps_neighbor(placed_box, cand["local_i"], pm["neighbor_boxes"]):
+                        fail_reason = "neighbor_overlap"
+                        continue
+                    chosen_sz = sz
+                    shrunk += step_i
+                    break
+
+                if chosen_sz is None:
                     unplaced += 1
                     p_unplaced += 1
                     unplaced_block_ids.append(bid)
+                    unplaced_reasons[bid] = fail_reason
                     continue
+
                 to_render.append((it, rect, chosen_sz))
 
-            # Redact ONLY fitted translatable blocks (fill=None on digital pages)
-            redact_fill = (1, 1, 1) if is_scanned else None
+            to_place_by_page[page_index] = to_render
+
+            # Redact ONLY fitted blocks
+            redact_fill = (1, 1, 1) if pm["is_scanned"] else None
             for it, _rect, _sz in to_render:
                 for lb in it.get("line_bboxes") or [it["bbox"]]:
                     page.add_redact_annot(pdf_rect(lb, scale), fill=redact_fill)
             if to_render:
                 page.apply_redactions(images=0, graphics=0, text=0)
 
-            # Emit Typst overlay page with exact original dimensions
             if page_index > 0:
                 overlay_pages_typ.append("#pagebreak()")
-            overlay_pages_typ.append(f"#set page(width: {pw:.2f}pt, height: {ph:.2f}pt, margin: 0pt, fill: none)")
+            overlay_pages_typ.append(
+                f"#set page(width: {pw:.2f}pt, height: {ph:.2f}pt, margin: 0pt, fill: none)"
+            )
             for it, rect, chosen_sz in to_render:
-                trans_lit = typst_str_literal(it["translation"].strip())
                 is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
                 role = it.get("layout_role", "body")
                 weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
-                w = max(4.0, rect.width)
-                h = max(4.0, rect.height)
-                # Slightly tighter leading when font shrunk to prevent vertical overflow in Typst
-                leading = "0.38em" if chosen_sz < 8.5 else "0.45em"
+                w = max(4.0, float(rect.width))
+                h = max(4.0, float(rect.height))
+                leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
+                rich = typst_rich_text_expr(it["translation"].strip())
                 overlay_pages_typ.append(
                     f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
                     f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
                     f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"); '
-                    f'#set par(leading: {leading}, justify: true); #{trans_lit}])'
+                    f'#set par(leading: {leading}, justify: true); {rich}])'
                 )
-                placed += 1
-                p_placed += 1
 
             per_page.append({
                 "page_index": page_index,
-                "total_blocks": len(page_items),
-                "placed": p_placed,
-                "preserved": p_preserved,
+                "total_blocks": pm["total_blocks"],
+                "placed": len(to_render),
+                "preserved": pm["p_preserved"],
                 "unplaced": p_unplaced,
-                "failed": p_failed,
+                "failed": pm["p_failed"],
                 "width_pt": round(pw, 2),
                 "height_pt": round(ph, 2),
             })
 
         if strict and (unplaced_block_ids or failed_block_ids):
             raise RuntimeError(
-                f"render strict mode failed: unplaced={unplaced_block_ids}, failed={failed_block_ids}"
+                f"render strict mode failed: unplaced={unplaced_block_ids} "
+                f"(reasons={unplaced_reasons}), failed={failed_block_ids}"
             )
 
+        # Step 4: Compile Typst overlay & composite; count `placed` ONLY after compile+composite succeed
         overlay_typ = workdir / "overlay.typ"
         overlay_pdf = workdir / "overlay.pdf"
         overlay_typ.write_text("\n".join(overlay_pages_typ), encoding="utf-8")
@@ -216,18 +395,36 @@ def _render_typst_preserve(
         if proc.returncode != 0:
             raise RuntimeError(f"typst overlay compile failed: {proc.stderr.strip()}")
 
+        placed = 0
         with pymupdf.open(overlay_pdf) as overlay_doc:
             if len(overlay_doc) != len(doc):
                 raise RuntimeError(
                     f"overlay page count mismatch: source={len(doc)}, overlay={len(overlay_doc)}"
                 )
             for page_index in range(len(doc)):
-                doc[page_index].show_pdf_page(doc[page_index].rect, overlay_doc, page_index, overlay=True)
+                page = doc[page_index]
+                page.show_pdf_page(page.rect, overlay_doc, page_index, overlay=True)
+                placed += len(to_place_by_page.get(page_index, []))
+
+                # Restore clickable URI links on rendered page
+                existing_uris = {
+                    (round(lk["from"].x0, 1), round(lk["from"].y0, 1), lk.get("uri"))
+                    for lk in page.get_links()
+                    if lk.get("uri")
+                }
+                for orig_lk in saved_links_by_page.get(page_index, []):
+                    uri = orig_lk["uri"]
+                    found_rects = page.search_for(uri)
+                    target_rects = found_rects if found_rects else [orig_lk["from"]]
+                    for tr in target_rects:
+                        sig = (round(tr.x0, 1), round(tr.y0, 1), uri)
+                        if sig not in existing_uris:
+                            page.insert_link({"kind": pymupdf.LINK_URI, "from": tr, "uri": uri})
+                            existing_uris.add(sig)
 
         output_cn.parent.mkdir(parents=True, exist_ok=True)
         doc.save(output_cn, garbage=4, deflate=True)
     finally:
-        scratch_doc.close()
         doc.close()
 
     if not output_cn.is_file() or output_cn.stat().st_size == 0:
@@ -251,6 +448,7 @@ def _render_typst_preserve(
         "unplaced": unplaced,
         "failed": failed,
         "unplaced_block_ids": unplaced_block_ids,
+        "unplaced_reasons": unplaced_reasons,
         "failed_block_ids": failed_block_ids,
         "shrunk_steps": shrunk,
         "per_page": per_page,

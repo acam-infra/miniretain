@@ -290,3 +290,147 @@ def test_p1_formula_protect_roundtrip():
     restored, missing = restore_formulas(f"内存为 {prot}", toks)
     assert missing == []
     assert "$O(GB)$" in restored and "O(KB)" in restored
+
+
+def test_p1_vertical_axis_label_vs_body_text(tmp_path: Path):
+    src = tmp_path / "axis.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    # Chart frame + rotated vertical axis label
+    page.draw_rect(pymupdf.Rect(90, 60, 300, 220), color=(0, 0, 0), width=1.0)
+    page.insert_text((65, 160), "of TTFT (%)", fontsize=8, rotate=90)
+    # Normal horizontal body text outside chart
+    page.insert_textbox(
+        pymupdf.Rect(50, 260, 300, 310),
+        "Normal horizontal body text outside the chart.",
+        fontsize=10,
+    )
+    doc.save(src)
+    doc.close()
+
+    pages = PyMuPDFOCRProvider().parse(str(src))
+    blocks = pages[0]["blocks"]
+    axis_blocks = [b for b in blocks if "TTFT" in b["text"]]
+    body_blocks = [b for b in blocks if "Normal horizontal" in b["text"]]
+    assert len(axis_blocks) == 1
+    assert axis_blocks[0]["layout_role"] == "figure_label"
+    assert axis_blocks[0]["policy"]["translate"] is False
+    assert axis_blocks[0]["policy"]["preserve_reason"] == "vertical_figure_label"
+    assert len(body_blocks) == 1
+    assert body_blocks[0]["layout_role"] == "body"
+    assert body_blocks[0]["policy"]["translate"] is True
+
+
+def test_p1_reference_field_protection_and_clickable_link(tmp_path: Path):
+    src = tmp_path / "ref.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    ref_rect = pymupdf.Rect(50, 100, 300, 150)
+    page.insert_textbox(
+        ref_rect,
+        '[9] N. Shazeer and J. Dean, “Sparse Mixture-of-Experts,” ICLR, 2017. https://openreview.net/forum?id=B1ckMDqlg',
+        fontsize=8,
+    )
+    page.insert_link({
+        "kind": pymupdf.LINK_URI,
+        "from": pymupdf.Rect(50, 125, 260, 140),
+        "uri": "https://openreview.net/forum?id=B1ckMDqlg",
+    })
+    doc.save(src)
+    doc.close()
+
+    prot, toks = protect_formulas(
+        '[9] N. Shazeer and J. Dean, “Sparse Mixture-of-Experts,” ICLR, 2017. https://openreview.net/forum?id=B1ckMDqlg',
+        layout_role="reference",
+    )
+    assert "[9]" not in prot
+    assert "N. Shazeer" not in prot
+    assert "https://openreview.net/forum?id=B1ckMDqlg" not in prot
+    restored, missing = restore_formulas(prot, toks)
+    assert missing == []
+    assert "https://openreview.net/forum?id=B1ckMDqlg" in restored
+
+    out_cn = tmp_path / "ref_cn.pdf"
+    out_sbs = tmp_path / "ref_sbs.pdf"
+    items = [{
+        "block_id": "p0b0000",
+        "page_index": 0,
+        "bbox": [50.0, 100.0, 300.0, 150.0],
+        "line_bboxes": [[50.0, 100.0, 300.0, 150.0]],
+        "layout_role": "reference",
+        "font_size_pt": 8.0,
+        "text": "orig",
+        "translation": '[9] N. Shazeer and J. Dean，“稀疏混合专家模型，”ICLR，2017。https://openreview.net/forum?id=B1ckMDqlg',
+        "translation_status": "ok",
+        "policy": {"translate": True, "redact_source": True},
+    }]
+    res = render_typst(
+        items=items,
+        workdir=tmp_path,
+        output_cn=out_cn,
+        output_merged=out_sbs,
+        source=str(src),
+        layout_mode="preserve",
+        bilingual_mode="side_by_side",
+        page_widths={0: 612.0},
+        page_coord_spaces={0: "pdf_pt"},
+        strict=True,
+    )
+    assert res["placed"] == 1
+    assert res["unplaced"] == 0
+    with pymupdf.open(out_cn) as cdoc:
+        uris = [lk.get("uri") for lk in cdoc[0].get_links() if lk.get("uri")]
+        assert "https://openreview.net/forum?id=B1ckMDqlg" in uris
+
+
+def test_p1_typst_preserve_rejects_out_of_bounds_and_neighbor_overlap(tmp_path: Path):
+    src = tmp_path / "bounds.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_text((52, 782), "EdgeOrig", fontsize=8)
+    doc.save(src)
+    doc.close()
+
+    # Box near bottom edge with huge translation -> cannot fit at >= 5pt without overflowing
+    items = [{
+        "block_id": "b_edge",
+        "page_index": 0,
+        "bbox": [50.0, 772.0, 120.0, 785.0],
+        "line_bboxes": [[50.0, 772.0, 120.0, 785.0]],
+        "layout_role": "body",
+        "text": "EdgeOrig",
+        "translation": "这是一段非常长且绝对会超出页面底部边界或盒子高度的译文内容，不能被裁切或强行缩到5pt以下。",
+        "translation_status": "ok",
+        "policy": {"translate": True, "redact_source": True},
+    }]
+    out_cn = tmp_path / "edge_cn.pdf"
+    out_sbs = tmp_path / "edge_sbs.pdf"
+    res = render_typst(
+        items=items,
+        workdir=tmp_path,
+        output_cn=out_cn,
+        output_merged=out_sbs,
+        source=str(src),
+        layout_mode="preserve",
+        page_widths={0: 612.0},
+        page_coord_spaces={0: "pdf_pt"},
+        strict=False,
+    )
+    assert res["placed"] == 0
+    assert res["unplaced"] == 1
+    assert res["unplaced_block_ids"] == ["b_edge"]
+    with pymupdf.open(out_cn) as cdoc:
+        assert "EdgeOrig" in cdoc[0].get_text()
+
+    with pytest.raises(RuntimeError, match="b_edge"):
+        render_typst(
+            items=items,
+            workdir=tmp_path,
+            output_cn=tmp_path / "edge_strict.pdf",
+            output_merged=tmp_path / "edge_strict_sbs.pdf",
+            source=str(src),
+            layout_mode="preserve",
+            page_widths={0: 612.0},
+            page_coord_spaces={0: "pdf_pt"},
+            strict=True,
+        )

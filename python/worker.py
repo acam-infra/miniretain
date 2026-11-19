@@ -99,7 +99,9 @@ def run_llm(spec: dict, wd: Path) -> dict:
     for idx, item in enumerate(items):
         policy = item.get("policy") or {}
         if policy.get("translate", True) and (item.get("text") or "").strip():
-            protected_text, tokens = protect_formulas(item["text"])
+            protected_text, tokens = protect_formulas(
+                item["text"], layout_role=item.get("layout_role", "body")
+            )
             formula_tokens_by_idx[idx] = tokens
             translatable_indices.append(idx)
             translatable_inputs.append({**item, "text": protected_text})
