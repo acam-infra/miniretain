@@ -162,6 +162,27 @@ class Scheduler:
                 for offset, rec in enumerate(norm):
                     results[start + offset] = rec
 
+        # Targeted single-item retry for any missing/empty items when max_retries > 0
+        if self.max_retries > 0:
+            retry_indices = [
+                i for i, rec in enumerate(results)
+                if rec is not None and rec["status"] in ("missing", "empty")
+            ]
+            for idx in retry_indices:
+                item = items[idx]
+                try:
+                    raw_out, retries = self._run_batch([item], target_lang, model)
+                    self.stats["retries"] += 1 + retries
+                    rec = _normalize_item_result(item, raw_out[0])
+                    results[idx] = rec
+                except Exception as exc:  # noqa: BLE001
+                    results[idx] = {
+                        "block_id": item["block_id"],
+                        "status": "failed",
+                        "translation": None,
+                        "error": str(exc),
+                    }
+
         for rec in results:
             assert rec is not None
             st = rec["status"]
