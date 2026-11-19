@@ -230,8 +230,25 @@ class Scheduler:
                                 for item, val in zip(batch, raw_out)
                             ]
                         except Exception as exc:  # noqa: BLE001 - record explicit failure per item
-                            self.stats["failed_batches"] += 1
                             err_msg = str(exc)
+                            if (
+                                self.max_retries > 0
+                                and len(indexed_batch) > 4
+                                and self.retry_policy.decide(exc, self.max_retries).category in ("timeout", "parse_error")
+                            ):
+                                mid = len(indexed_batch) // 2
+                                for half in (indexed_batch[:mid], indexed_batch[mid:]):
+                                    half_items = [it for _, it in half]
+                                    with self._metrics_lock:
+                                        self.stats["retries"] += 1
+                                    hf = pool.submit(
+                                        self._run_batch, half_items, target_lang, model, doc_context
+                                    )
+                                    pending[hf] = ("batch", half)
+                                    main_remaining += 1
+                                main_remaining -= 1
+                                continue
+                            self.stats["failed_batches"] += 1
                             norm = [
                                 {
                                     "block_id": item["block_id"],

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import random
 import re
 import socket
@@ -42,7 +43,12 @@ def classify_error(exc: Exception) -> tuple[str, float | None]:
         or "timeout" in msg.lower()
     ):
         return "timeout", None
-    if "json" in msg.lower() or "length mismatch" in msg.lower():
+    if (
+        isinstance(exc, (json.JSONDecodeError, ValueError))
+        or "json" in msg.lower()
+        or "expecting value" in msg.lower()
+        or "length mismatch" in msg.lower()
+    ):
         return "parse_error", None
     return "other", None
 

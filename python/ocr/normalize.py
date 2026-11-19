@@ -29,6 +29,48 @@ _NUMERIC_TICK_RE = re.compile(
 )
 _MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεθλμσφψωΔΣΠΩ")
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
+_EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+_AFFIL_KW_RE = re.compile(
+    r"\b(?:University|Institute|Research|Google|Microsoft|Berkeley|Stanford|MIT|CMU|Department|Laboratory|Labs)\b"
+)
+_CODE_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
+_CODE_CALL_RE = re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(")
+_CODE_ASSIGN_RE = re.compile(r"^\s*(?:\d+\s+)?[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\(")
+_CODE_IMPORT_RE = re.compile(r"(?:^|\s)(?:from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+|import\s+[A-Za-z_]\w*\s+as\s+)")
+_APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\b|Supplementary\b|[A-Z]\.\s+[A-Z]\S*)", re.IGNORECASE)
+
+
+def _is_code_listing(text: str) -> bool:
+    s = text.strip()
+    if not s or len(s) > 800:
+        return False
+    if "←" in s and re.search(r"\b\d+:", s):
+        return True
+    if _CODE_IMPORT_RE.search(s) and len(s) < 220:
+        return True
+    if len(s) <= 160 and (_CODE_SNAKE_RE.search(s) or _CODE_CALL_RE.search(s) or _CODE_ASSIGN_RE.search(s)):
+        return True
+    if re.search(r"\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", s) or '"""' in s or "'''" in s:
+        return True
+    return False
+
+
+def _is_author_affiliation(text: str, page_idx: int, seen_abstract: bool) -> bool:
+    if page_idx != 0 or seen_abstract:
+        return False
+    s = text.strip()
+    if not s or len(s) > 220:
+        return False
+    if _EMAIL_RE.search(s):
+        return True
+    if any(ch in s for ch in "∗†‡§"):
+        return True
+    if _AFFIL_KW_RE.search(s) and not s.endswith("."):
+        return True
+    # Multiple "First Last<digit>" author entries on one line (with or without space before marker)
+    if len(re.findall(r"\b[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]+[\d∗†‡§,\s]*\d", s)) >= 2:
+        return True
+    return False
 
 
 def _rect_intersects(a: list[float], b: list[float], pad: float = 2.0) -> bool:
@@ -137,9 +179,15 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
         return True
     math_count = sum(1 for ch in s if ch in _MATH_CHARS)
     alpha_words = re.findall(r"[A-Za-z]{3,}", s)
+    if len(s) <= 8 and not alpha_words and re.search(r"[A-Za-z]", s) and not re.match(r"^(?:yes|no|on|off|ok|id|or|in|to|of|by|at|as|is|if|an|we|it|do|so|up)$", s, re.I):
+        return True
+    if len(s) <= 30 and math_count >= 1 and len(alpha_words) <= 2:
+        return True
     if _EQ_NUM_RE.search(s) and math_count >= 1 and len(alpha_words) <= 6:
         return True
     if len(s) <= 80 and math_count >= 2 and math_count / max(1, len(s)) >= 0.08 and len(alpha_words) <= 5:
+        return True
+    if len(s) <= 100 and not s.endswith((".", "!", "?")) and re.search(r"[A-Za-z][A-Za-z0-9_]*\([^()\n]{1,40}\)\s*[=≈≤≥≠]", s):
         return True
     return False
 
@@ -206,6 +254,7 @@ def normalize_pages(
 ) -> list[dict]:
     """Normalize raw pages into RetainPDF-aligned document.v1 structure."""
     in_references = False
+    seen_abstract = False
     norm_pages: list[dict] = []
     prev_translatable_body: dict | None = None
 
@@ -271,6 +320,17 @@ def normalize_pages(
                     translate = False
                     preserve_reason = "figure_label"
                     redact_source = False
+            elif (
+                bbox
+                and (len(text) <= 45 or (bbox[2] - bbox[0]) < 80.0)
+                and (not font_size or font_size <= max(8.5, median_font * 0.92))
+                and any(_overlap_ratio(bbox, fr, pad=14.0) >= 0.5 for fr in figure_regions)
+            ):
+                # Axis / tick / legend label sitting just outside a figure frame
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "figure_label"
+                redact_source = False
             elif _is_formula_text(text, is_math_font=is_math_font):
                 layout_role = "formula"
                 translate = False
@@ -290,11 +350,30 @@ def normalize_pages(
                 layout_role = "heading"
                 in_references = True
                 translate = True
+            elif in_references and not re.match(r"^\[\d+\]", text) and len(text) < 120 and not text.rstrip().endswith((".", ",")) and (
+                _APPENDIX_HEADING_RE.match(text)
+                or (is_bold and font_size and font_size >= median_font * 1.15 and re.match(r"^(?:[A-Z](?:\.\s+|\s+[A-Z])|Appendix|Supplementary)", text))
+            ):
+                layout_role = "heading"
+                in_references = False
+                translate = True
+            elif _is_code_listing(text):
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "code_listing"
+                redact_source = False
+            elif _is_author_affiliation(text, page_idx, seen_abstract):
+                layout_role = "header_footer"
+                translate = False
+                preserve_reason = "author_affiliation"
+                redact_source = False
             elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
                 layout_role = "title"
                 translate = True
             elif _HEADING_RE.match(text) and len(text) < 120:
                 layout_role = "heading"
+                if re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", text, re.IGNORECASE):
+                    seen_abstract = True
                 translate = True
             elif in_references:
                 layout_role = "reference"
@@ -366,6 +445,93 @@ def normalize_pages(
                 prev_translatable_body = None
 
             norm_blocks.append(nb)
+
+        # Horizontal-band formula propagation: protect equation fragments sharing a y-band with formula blocks
+        formula_boxes = [
+            (nb["bbox"], nb["text"])
+            for nb in norm_blocks
+            if nb["layout_role"] == "formula" and nb.get("bbox")
+        ]
+        if formula_boxes:
+            for nb in norm_blocks:
+                if not nb["policy"]["translate"] or nb["layout_role"] != "body" or not nb.get("bbox"):
+                    continue
+                bx0, by0, bx1, by1 = nb["bbox"]
+                txt = nb["text"].strip()
+                if not txt or len(txt) > 80 or txt.endswith("."):
+                    continue
+                b_mid_y = (by0 + by1) * 0.5
+                for fbox, ftxt in formula_boxes:
+                    fx0, fy0, fx1, fy1 = fbox
+                    y_ov = min(by1, fy1) - max(by0, fy0)
+                    f_mid_y = (fy0 + fy1) * 0.5
+                    if y_ov <= 0 and abs(b_mid_y - f_mid_y) > 10.0:
+                        continue
+                    h_gap = max(0.0, max(bx0 - fx1, fx0 - bx1))
+                    if h_gap > 45.0:
+                        continue
+                    long_words = re.findall(r"[a-z]{4,}", txt)
+                    if "=" in txt or _EQ_NUM_RE.search(ftxt) or len(txt) <= 35 or len(long_words) <= 3:
+                        nb["kind"] = "formula"
+                        nb["layout_role"] = "formula"
+                        nb["policy"] = {
+                            "translate": False,
+                            "preserve_reason": "formula_band",
+                            "redact_source": False,
+                        }
+                        break
+
+        # Deduplicate/merge geometrically contained translatable child blocks (e.g. split footnotes)
+        def _box_area(box: list[float]) -> float:
+            return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+        for child in norm_blocks:
+            if not child["policy"]["translate"] or not child.get("bbox"):
+                continue
+            cb = child["bbox"]
+            c_area = _box_area(cb)
+            if c_area <= 0:
+                continue
+            best_parent = None
+            best_p_area = float("inf")
+            for parent in norm_blocks:
+                if parent is child or not parent["policy"]["translate"] or not parent.get("bbox"):
+                    continue
+                pb = parent["bbox"]
+                p_area = _box_area(pb)
+                if p_area <= c_area * 1.05:
+                    continue
+                if _overlap_ratio(cb, pb, pad=1.0) >= 0.85 and p_area < best_p_area:
+                    best_parent = parent
+                    best_p_area = p_area
+            if best_parent is not None:
+                c_txt = " ".join(child["text"].split())
+                p_txt = " ".join(best_parent["text"].split())
+                if c_txt and c_txt not in p_txt:
+                    if child["reading_order"] >= best_parent["reading_order"]:
+                        merged_txt = best_parent["text"].rstrip() + " " + child["text"].strip()
+                    else:
+                        merged_txt = child["text"].strip() + " " + best_parent["text"].lstrip()
+                    best_parent["text"] = merged_txt
+                    best_parent["content"]["text"] = merged_txt
+                child_lbs = child.get("line_bboxes") or [cb]
+                parent_lbs = list(best_parent.get("line_bboxes") or [best_parent["bbox"]])
+                for lb in child_lbs:
+                    if lb not in parent_lbs:
+                        parent_lbs.append(lb)
+                best_parent["line_bboxes"] = parent_lbs
+                pb = best_parent["bbox"]
+                best_parent["bbox"] = [
+                    min(pb[0], cb[0]),
+                    min(pb[1], cb[1]),
+                    max(pb[2], cb[2]),
+                    max(pb[3], cb[3]),
+                ]
+                child["policy"] = {
+                    "translate": False,
+                    "preserve_reason": "contained_in_parent",
+                    "redact_source": False,
+                }
 
         norm_pages.append({
             "page_index": page_idx,

@@ -18,10 +18,26 @@ def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: st
     tl = (target_lang or "").lower()
     if not tl.startswith(("zh", "ja", "ko")):
         return False
-    if item.get("layout_role") == "reference":
+    if item.get("layout_role") in ("reference", "formula", "figure_label", "header_footer"):
         return False
     src = (item.get("text") or "").strip()
     if len(src) < 40 or _CJK_CHAR_RE.search(translation):
+        return False
+    # Exempt emails, URLs/URL paths, placeholders, code listings, author/reference lines, and metric-dense table rows
+    if "@" in src or "http://" in src or "https://" in src or "⟪F" in src or "arXiv:" in src:
+        return False
+    if re.search(r"[a-z0-9\-]+/[a-z0-9\-]+", src) and " " not in src.strip():
+        return False
+    if any(ch in src for ch in "∗†‡§"):
+        return False
+    if len(re.findall(r"\b[A-Z]\.", src)) >= 3:
+        return False
+    if re.search(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(|(?:^|\s)(?:from\s+\S+\s+)?import\s+\S+|\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\"\"\"|'''", src):
+        return False
+    if "←" in src and re.search(r"\b\d+:", src):
+        return False
+    toks = src.split()
+    if len(toks) >= 6 and sum(1 for t in toks if any(c.isdigit() for c in t)) / len(toks) >= 0.30:
         return False
     if len(_LATIN_WORD_RE.findall(src)) < 6:
         return False
@@ -136,6 +152,11 @@ class OpenAICompatLLMClient:
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"empty translation for {bid}"})
                 continue
             cleaned = value.strip()
+            src_raw = (item.get("text") or "").strip()
+            effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned))
+            if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and effective_len > max(32, int(len(src_raw) * 1.25)):
+                out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"suspiciously long translation for {bid}"})
+                continue
             if _is_verbatim_untranslated_echo(item, cleaned, target_lang):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"untranslated verbatim echo for {bid}"})
                 continue

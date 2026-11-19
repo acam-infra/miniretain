@@ -19,6 +19,36 @@ from render.side_by_side import build_side_by_side_pdf, merge_interleaved
 
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
 _ASCII_RUN_RE = re.compile(r"[A-Za-z0-9_.,:;!?@#$%^&*()+=\-/<>\\\[\]{}|~`'\"]+")
+_MITEX_IMPORT_LINE = '#import "@preview/mitex:0.2.7": mi, mitex'
+
+
+def find_typst_package_cache_dir() -> str | None:
+    """Return Typst package cache directory containing preview/mitex/0.2.7 if available."""
+    candidates: list[Path] = []
+    env_cache = os.environ.get("TYPST_PACKAGE_CACHE_PATH", "").strip()
+    if env_cache:
+        candidates.append(Path(env_cache))
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    if xdg_cache:
+        candidates.append(Path(xdg_cache) / "typst" / "packages")
+    candidates.extend([
+        Path.home() / ".cache" / "typst" / "packages",
+        Path("/root/.cache/typst/packages"),
+        Path("/home/ccds/.cache/typst/packages"),
+    ])
+    seen: set[str] = set()
+    for base in candidates:
+        key = str(base)
+        if key in seen:
+            continue
+        seen.add(key)
+        if (base / "preview" / "mitex" / "0.2.7" / "typst.toml").is_file():
+            return key
+    return None
+
+
+def _typst_pkg_args(pkg_cache_dir: str | None) -> list[str]:
+    return ["--package-cache-path", pkg_cache_dir] if pkg_cache_dir else []
 
 
 def find_typst() -> str:
@@ -85,40 +115,154 @@ def _breakable_url_display(url: str) -> str:
     return "#sym.zws ".join(f"#{typst_str_literal(p)}" for p in out)
 
 
-def typst_rich_text_expr(text: str) -> str:
-    """Render text with clickable #link(url)[breakable_url] for URLs and literals elsewhere."""
+def _typst_raw_literal(expr: str) -> str:
+    """Wrap raw LaTeX in Typst backtick raw string without backslash/quote escaping."""
+    max_bt = max((len(m.group(0)) for m in re.finditer(r"`+", expr)), default=0)
+    fence = "`" if max_bt == 0 else "`" * max(3, max_bt + 1)
+    if max_bt > 0 and (expr.startswith("`") or expr.endswith("`")):
+        return f"{fence} {expr} {fence}"
+    return f"{fence}{expr}{fence}"
+
+
+def _looks_like_currency_span(inner: str) -> bool:
+    """Return True if $...$ content looks like currency (e.g. '$50 ... $100') rather than math."""
+    if not inner or inner != inner.strip():
+        return True
+    if re.match(r"^\d[\d,.\s]*(?:[-–—]|to|and|or)?$", inner, re.IGNORECASE):
+        return True
+    if re.match(r"^\d", inner) and not any(ch in inner for ch in r"\^_{}=+*/<>()[]"):
+        return True
+    return False
+
+
+def _split_math_segments(text: str) -> list[tuple[str, str]]:
+    """Split non-URL text into ('text'|'inline_math'|'display_math', content) segments."""
+    out: list[tuple[str, str]] = []
+    buf: list[str] = []
+    i = 0
+    n = len(text)
+
+    def flush_buf() -> None:
+        if buf:
+            out.append(("text", "".join(buf)))
+            buf.clear()
+
+    while i < n:
+        ch = text[i]
+        # Escaped dollar \$ is literal text
+        if ch == "\\" and i + 1 < n and text[i + 1] == "$":
+            buf.append("$")
+            i += 2
+            continue
+        # Display math $$...$$
+        if text.startswith("$$", i):
+            end = text.find("$$", i + 2)
+            if end != -1:
+                inner = text[i + 2 : end].strip()
+                if inner:
+                    flush_buf()
+                    out.append(("display_math", inner))
+                    i = end + 2
+                    continue
+        # Display math \[...\]
+        if text.startswith(r"\[", i):
+            end = text.find(r"\]", i + 2)
+            if end != -1:
+                inner = text[i + 2 : end].strip()
+                if inner:
+                    flush_buf()
+                    out.append(("display_math", inner))
+                    i = end + 2
+                    continue
+        # Inline math \(...\)
+        if text.startswith(r"\(", i):
+            end = text.find(r"\)", i + 2)
+            if end != -1 and "\n" not in text[i + 2 : end]:
+                inner = text[i + 2 : end].strip()
+                if inner:
+                    flush_buf()
+                    out.append(("inline_math", inner))
+                    i = end + 2
+                    continue
+        # Inline math $...$
+        if ch == "$" and not text.startswith("$$", i):
+            j = i + 1
+            end = -1
+            while j < n:
+                if text[j] == "\n":
+                    break
+                if text[j] == "\\" and j + 1 < n and text[j + 1] == "$":
+                    j += 2
+                    continue
+                if text[j] == "$":
+                    end = j
+                    break
+                j += 1
+            if end != -1:
+                inner = text[i + 1 : end]
+                if not _looks_like_currency_span(inner):
+                    flush_buf()
+                    out.append(("inline_math", inner))
+                    i = end + 1
+                    continue
+        buf.append(ch)
+        i += 1
+    flush_buf()
+    return out
+
+
+def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
+    if not use_mitex or ("$" not in segment and r"\(" not in segment and r"\[" not in segment):
+        return f"#{typst_str_literal(segment)}"
+    parts: list[str] = []
+    for kind, content in _split_math_segments(segment):
+        if kind == "inline_math":
+            parts.append(f"#mi({_typst_raw_literal(content)})")
+        elif kind == "display_math":
+            parts.append(f"#mitex({_typst_raw_literal(content)})")
+        else:
+            parts.append(f"#{typst_str_literal(content)}")
+    return "".join(parts) if parts else '""'
+
+
+def typst_rich_text_expr(text: str, *, use_mitex: bool = True) -> str:
+    """Render text with clickable #link(url)[breakable_url] and #mi/#mitex for math."""
     parts: list[str] = []
     pos = 0
     for m in _URL_RE.finditer(text):
         if m.start() > pos:
-            parts.append(f"#{typst_str_literal(text[pos:m.start()])}")
+            parts.append(_render_non_url_expr(text[pos:m.start()], use_mitex=use_mitex))
         url = m.group(0).rstrip(".,;:")
         trail = m.group(0)[len(url):]
         ul = typst_str_literal(url)
         parts.append(f"#link({ul})[{_breakable_url_display(url)}]")
         if trail:
-            parts.append(f"#{typst_str_literal(trail)}")
+            parts.append(_render_non_url_expr(trail, use_mitex=use_mitex))
         pos = m.end()
     if pos < len(text):
-        parts.append(f"#{typst_str_literal(text[pos:])}")
+        parts.append(_render_non_url_expr(text[pos:], use_mitex=use_mitex))
     return "".join(parts) if parts else '""'
 
 
 def _unbreakable_segments(text: str) -> list[str]:
-    """Extract unbreakable horizontal segments (ASCII runs, split at URL break points)."""
+    """Extract unbreakable horizontal segments (ASCII runs, split at URL break points, excluding math)."""
     segs: list[str] = []
     pos = 0
     for m in _URL_RE.finditer(text):
         before = text[pos : m.start()]
-        for am in _ASCII_RUN_RE.finditer(before):
-            segs.append(am.group(0))
+        for kind, seg_text in _split_math_segments(before):
+            if kind == "text":
+                for am in _ASCII_RUN_RE.finditer(seg_text):
+                    segs.append(am.group(0))
         url = m.group(0).rstrip(".,;:")
         for part in re.findall(r"[^/?&=]+[/?&=]?", url):
             segs.append(part)
         pos = m.end()
     tail = text[pos:]
-    for am in _ASCII_RUN_RE.finditer(tail):
-        segs.append(am.group(0))
+    for kind, seg_text in _split_math_segments(tail):
+        if kind == "text":
+            for am in _ASCII_RUN_RE.finditer(seg_text):
+                segs.append(am.group(0))
     # Also keep longest single CJK char as minimum width check
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         segs.append("汉")
@@ -181,6 +325,7 @@ def measure_blocks_with_typst(
     workdir: Path,
     candidates: list[dict],
     probe_name: str = "fit_probe.typ",
+    pkg_cache_dir: str | None = None,
 ) -> dict[tuple[int, float], tuple[float, float]]:
     """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates.
 
@@ -189,10 +334,17 @@ def measure_blocks_with_typst(
     """
     if not candidates:
         return {}
-    lines = [
+    needs_mitex = any(
+        "#mi(" in c.get("rich_expr", "") or "#mitex(" in c.get("rich_expr", "")
+        for c in candidates
+    )
+    lines: list[str] = []
+    if needs_mitex:
+        lines.append(_MITEX_IMPORT_LINE)
+    lines.extend([
         f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
         "",
-    ]
+    ])
     ref_sizes: dict[int, float] = {}
     for c in candidates:
         idx = c["idx"]
@@ -226,7 +378,7 @@ def measure_blocks_with_typst(
     probe_typ = workdir / probe_name
     probe_typ.write_text("\n".join(lines), encoding="utf-8")
     proc = subprocess.run(
-        [typst_bin, "query", "--font-path", font_dir, str(probe_typ), "<fit>"],
+        [typst_bin, "query", "--font-path", font_dir, *(_typst_pkg_args(pkg_cache_dir) if needs_mitex else []), str(probe_typ), "<fit>"],
         capture_output=True,
         text=True,
         timeout=120,
@@ -287,19 +439,16 @@ def _emit_overlay_typ(
     page_meta: list[dict],
     to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]],
     font_families: str,
+    use_mitex: bool = True,
 ) -> str:
-    lines: list[str] = [
-        '#set page(margin: 0pt, fill: none)',
-        f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
-        '#set par(justify: true, leading: 0.45em)',
-        '',
-    ]
+    body_lines: list[str] = []
+    needs_mitex = False
     for pm in page_meta:
         page_index = pm["page_index"]
         pw, ph = pm["pw"], pm["ph"]
         if page_index > 0:
-            lines.append("#pagebreak()")
-        lines.append(
+            body_lines.append("#pagebreak()")
+        body_lines.append(
             f"#set page(width: {pw:.2f}pt, height: {ph:.2f}pt, margin: 0pt, fill: none)"
         )
         for it, rect, chosen_sz, _local_i in to_place_by_page.get(page_index, []):
@@ -310,14 +459,25 @@ def _emit_overlay_typ(
             w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
             leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
-            rich = typst_rich_text_expr(it["translation"].strip())
-            lines.append(
+            rich = typst_rich_text_expr(it["translation"].strip(), use_mitex=use_mitex)
+            if "#mi(" in rich or "#mitex(" in rich:
+                needs_mitex = True
+            body_lines.append(
                 f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
                 f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
                 f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"); '
                 f'#set par(leading: {leading}, justify: true); {rich}])'
             )
-    return "\n".join(lines)
+    header: list[str] = []
+    if needs_mitex:
+        header.append(_MITEX_IMPORT_LINE)
+    header.extend([
+        '#set page(margin: 0pt, fill: none)',
+        f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        '#set par(justify: true, leading: 0.45em)',
+        '',
+    ])
+    return "\n".join(header + body_lines)
 
 
 def _find_compiled_overflow_blocks(
@@ -346,19 +506,38 @@ def _find_compiled_overflow_blocks(
                     # Primary match: pick placed block with highest horizontal/2D overlap.
                     # This avoids cross-column misattribution when CJK opening punctuation
                     # (e.g. "（") slightly overhangs left of its own column's rect.x0.
+                    sp_compact = "".join((span.get("text") or "").split())
+                    sp_probe = sp_compact[:12]
                     best = None
-                    best_score: tuple[float, float, float] | None = None
+                    best_score: tuple[int, float, float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
+                        tr_compact = "".join((it.get("translation") or "").split())
+                        t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                         ix = min(sx1, rect.x1) - max(sx0, rect.x0)
-                        iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
-                        if ix > 0.0 and iy > 0.0:
+                        iy_exact = min(sy1, rect.y1) - max(sy0, rect.y0)
+                        if ix > 0.0 and iy_exact > 0.0:
                             x_cov = ix / span_w
-                            area_cov = (ix * iy) / span_area
+                            y_cov = iy_exact / span_h
+                            area_cov = (ix * iy_exact) / span_area
                             dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
-                            score = (round(x_cov, 4), round(area_cov, 4), -dist)
+                            score = (t_match, round(area_cov, 4), round(y_cov, 4), round(x_cov, 4), -dist)
                             if best_score is None or score > best_score:
                                 best_score = score
                                 best = (it, rect, local_i)
+                    if best is None:
+                        for it, rect, _sz, local_i in placed_list:
+                            tr_compact = "".join((it.get("translation") or "").split())
+                            t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
+                            ix = min(sx1, rect.x1) - max(sx0, rect.x0)
+                            iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
+                            if ix > 0.0 and iy > 0.0:
+                                x_cov = ix / span_w
+                                area_cov = (ix * iy) / span_area
+                                dist = abs(sx0 - rect.x0) + abs(sy0 - rect.y0)
+                                score = (t_match, round(x_cov, 4), round(area_cov, 4), 0.0, -dist)
+                                if best_score is None or score > best_score:
+                                    best_score = score
+                                    best = (it, rect, local_i)
                     if best is None:
                         # Fallback for spans that escaped all rects: match nearest in same vertical/column band
                         best_dist = 1e9
@@ -404,6 +583,8 @@ def _render_typst_preserve(
 ) -> dict:
     """RetainPDF-style per-page Typst overlay onto redacted source PDF."""
     t_total_0 = time.perf_counter()
+    pkg_cache_dir = find_typst_package_cache_dir()
+    use_mitex = bool(pkg_cache_dir)
     typst_bin = find_typst()
     cjk_font_file = find_cjk_font(font)
     font_dir = str(Path(cjk_font_file).parent)
@@ -477,7 +658,7 @@ def _render_typst_preserve(
                     "width": max(4.0, float(rect.width)),
                     "height": max(2.0, float(rect.height)),
                     "weight": weight,
-                    "rich_expr": typst_rich_text_expr(trans),
+                    "rich_expr": typst_rich_text_expr(trans, use_mitex=use_mitex),
                     "segments": _unbreakable_segments(trans),
                     "sizes": _candidate_sizes(start_sz, min_size),
                 }
@@ -507,7 +688,7 @@ def _render_typst_preserve(
             p1_szs = [szs[0]] if len(szs) <= 1 else [szs[0], szs[min(2, len(szs) - 1)]]
             pass1_candidates.append({**c, "sizes": p1_szs})
         measured = measure_blocks_with_typst(
-            typst_bin, font_dir, font_families, workdir, pass1_candidates, probe_name="fit_probe.typ"
+            typst_bin, font_dir, font_families, workdir, pass1_candidates, probe_name="fit_probe.typ", pkg_cache_dir=pkg_cache_dir
         )
 
         # Check which candidates need Pass 2 (remaining sizes)
@@ -532,6 +713,7 @@ def _render_typst_preserve(
                         (rect.x0, rect.y0, rect.x0 + rect.width, rect.y0 + mh0),
                         cand["local_i"],
                         pm["neighbor_boxes"],
+                        self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
                     )
                 )
                 if not fits_top:
@@ -540,7 +722,7 @@ def _render_typst_preserve(
                         pass2_candidates.append({**cand, "sizes": rem_szs})
         if pass2_candidates:
             measured2 = measure_blocks_with_typst(
-                typst_bin, font_dir, font_families, workdir, pass2_candidates, probe_name="fit_probe_p2.typ"
+                typst_bin, font_dir, font_families, workdir, pass2_candidates, probe_name="fit_probe_p2.typ", pkg_cache_dir=pkg_cache_dir
             )
             measured.update(measured2)
         fit_probe_s = round(time.perf_counter() - t_probe_0, 3)
@@ -576,7 +758,12 @@ def _render_typst_preserve(
                     ):
                         fail_reason = "out_of_bounds"
                         continue
-                    if _overlaps_neighbor(placed_box, cand["local_i"], pm["neighbor_boxes"]):
+                    if _overlaps_neighbor(
+                        placed_box,
+                        cand["local_i"],
+                        pm["neighbor_boxes"],
+                        self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
+                    ):
                         fail_reason = "neighbor_overlap"
                         continue
                     chosen_sz = sz
@@ -598,11 +785,11 @@ def _render_typst_preserve(
         overlay_typ = workdir / "overlay.typ"
         overlay_pdf = workdir / "overlay.pdf"
         overlay_typ.write_text(
-            _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+            _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
             encoding="utf-8",
         )
         proc = subprocess.run(
-            [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
+            [typst_bin, "compile", "--font-path", font_dir, *_typst_pkg_args(pkg_cache_dir), str(overlay_typ), str(overlay_pdf)],
             capture_output=True,
             text=True,
             timeout=120,
@@ -613,8 +800,8 @@ def _render_typst_preserve(
         with pymupdf.open(overlay_pdf) as check_doc:
             compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
 
-        # Retry any compiled-overflow blocks up to 6 steps down (>= min_size)
-        for _retry_step in range(6):
+        # Retry any compiled-overflow blocks step-by-step down to min_size
+        for _retry_step in range(24):
             if not compiled_bad:
                 break
             changed = False
@@ -634,11 +821,11 @@ def _render_typst_preserve(
             if not changed:
                 break
             overlay_typ.write_text(
-                _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
                 encoding="utf-8",
             )
             proc_retry = subprocess.run(
-                [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
+                [typst_bin, "compile", "--font-path", font_dir, *_typst_pkg_args(pkg_cache_dir), str(overlay_typ), str(overlay_pdf)],
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -662,11 +849,11 @@ def _render_typst_preserve(
                 to_place_by_page[page_index] = kept
             # Recompile clean overlay.pdf without overflowing blocks
             overlay_typ.write_text(
-                _emit_overlay_typ(page_meta, to_place_by_page, font_families),
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
                 encoding="utf-8",
             )
             proc2 = subprocess.run(
-                [typst_bin, "compile", "--font-path", font_dir, str(overlay_typ), str(overlay_pdf)],
+                [typst_bin, "compile", "--font-path", font_dir, *_typst_pkg_args(pkg_cache_dir), str(overlay_typ), str(overlay_pdf)],
                 capture_output=True,
                 text=True,
                 timeout=120,
