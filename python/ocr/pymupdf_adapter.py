@@ -150,7 +150,48 @@ def _extract_page_blocks(page: pymupdf.Page) -> tuple[list[dict], list[list[floa
                 total_chars += nchars
 
     is_scanned = total_chars < 20 and len(image_rects) > 0
+    blocks = _merge_split_references(blocks)
     return blocks, figure_regions, is_scanned
+
+
+def _merge_split_references(blocks: list[dict]) -> list[dict]:
+    """Merge a [N]-starting reference header block with its immediate continuation block."""
+    if len(blocks) < 2:
+        return blocks
+    merged: list[dict] = []
+    i = 0
+    while i < len(blocks):
+        cur = blocks[i]
+        if (
+            i + 1 < len(blocks)
+            and _REF_START_RE.match(cur["text"])
+            and not _REF_START_RE.match(blocks[i + 1]["text"])
+            and not cur.get("is_vertical")
+            and not blocks[i + 1].get("is_vertical")
+            and abs(cur["bbox"][2] - blocks[i + 1]["bbox"][2]) < 30.0
+            and 0 <= blocks[i + 1]["bbox"][1] - cur["bbox"][3] <= 12.0
+        ):
+            nxt = blocks[i + 1]
+            # Keep merging if there's another continuation? Usually 1 continuation block
+            comb_lines = _join_lines_smart([cur["text"], nxt["text"]])
+            comb_lbs = list(cur["line_bboxes"]) + list(nxt["line_bboxes"])
+            comb_bbox = [
+                min(cur["bbox"][0], nxt["bbox"][0]),
+                min(cur["bbox"][1], nxt["bbox"][1]),
+                max(cur["bbox"][2], nxt["bbox"][2]),
+                max(cur["bbox"][3], nxt["bbox"][3]),
+            ]
+            merged.append({
+                **cur,
+                "text": comb_lines,
+                "bbox": comb_bbox,
+                "line_bboxes": comb_lbs,
+            })
+            i += 2
+            continue
+        merged.append(cur)
+        i += 1
+    return merged
 
 
 class PyMuPDFOCRProvider:
