@@ -226,3 +226,136 @@ def test_protect_and_restore_formulas_handles_paren_and_bracket_math_spans():
     assert missing == []
     assert restored == src
 
+
+def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
+    """Reproduce 2208.06102 p6 Gaussian paragraph: mid-line split at 'ˆσ2' / 'b).' and '1/ˆσ2' / 'b can'
+    must merge into one intact body block, reconstruct LaTeX accents/sub/sup, produce non-empty
+    protect_formulas tokens, and compile cleanly via Typst MiTeX in strict mode."""
+    from llm.formula_protect import protect_formulas, restore_formulas
+    from ocr.pymupdf_adapter import _merge_inline_math_split_blocks
+
+    raw_blocks = [
+        {
+            "block_id": "p5b0048",
+            "text": "Specifically, the cost distribution has unknown mean θb. That is, θb ∼N (ˆµb, ˆσ2",
+            "bbox": [317.9, 423.8, 528.6, 470.8],
+            "line_bboxes": [[317.9, 423.8, 558.0, 446.5], [317.9, 457.9, 528.6, 470.8]],
+            "font_size_pt": 9.96,
+            "is_bold": False,
+            "is_math_font": False,
+            "is_vertical": False,
+        },
+        {
+            "block_id": "p5b0049",
+            "text": "b). Here it is important to note that 1/ˆσ2",
+            "bbox": [317.9, 459.4, 558.0, 482.2],
+            "line_bboxes": [[524.9, 459.4, 558.0, 471.9], [317.9, 469.9, 449.4, 482.2]],
+            "font_size_pt": 9.96,
+            "is_bold": False,
+            "is_math_font": False,
+            "is_vertical": False,
+        },
+        {
+            "block_id": "p5b0050",
+            "text": "b can be thought of as confidence, choosing ˆθb ∼N (ˆµb, ˆσ2",
+            "bbox": [317.9, 471.5, 558.4, 542.5],
+            "line_bboxes": [[445.7, 471.5, 558.4, 484.6], [317.9, 528.9, 554.4, 542.5]],
+            "font_size_pt": 9.96,
+            "is_bold": False,
+            "is_math_font": False,
+            "is_vertical": False,
+        },
+        {
+            "block_id": "p5b0051",
+            "text": "b) (Algorithm 1).",
+            "bbox": [550.7, 531.1, 558.8, 543.6],
+            "line_bboxes": [[550.7, 531.1, 558.8, 543.6]],
+            "font_size_pt": 9.96,
+            "is_bold": False,
+            "is_math_font": False,
+            "is_vertical": False,
+        },
+    ]
+
+    merged = _merge_inline_math_split_blocks(raw_blocks)
+    assert len(merged) == 1
+    assert merged[0]["block_id"] == "p5b0048"
+
+    norm = normalize_pages(
+        [
+            {
+                "page_index": 5,
+                "width": 612.0,
+                "height": 792.0,
+                "figure_regions": [],
+                "table_regions": [],
+                "blocks": merged,
+            }
+        ],
+        coord_space="pdf_pt",
+        dpi=72.0,
+    )
+    blk = norm[0]["blocks"][0]
+    assert blk["layout_role"] == "body"
+    assert blk["policy"]["translate"] is True
+    assert r"$\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in blk["text"]
+    assert r"$1/\hat{\sigma}_b^2$" in blk["text"]
+    assert r"$\hat{\theta}_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in blk["text"]
+
+    protected, tokens = protect_formulas(blk["text"], layout_role="body")
+    assert len(tokens) == 4
+    vals = set(tokens.values())
+    assert r"$\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in vals
+    assert r"$1/\hat{\sigma}_b^2$" in vals
+    assert r"$\hat{\theta}_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in vals
+
+    # Simulate translated prose preserving placeholders, restore, and compile via Typst MiTeX
+    zh_with_toks = "具体而言，开销分布的未知均值为 ⟪F0⟫，即 ⟪F1⟫。其中 ⟪F2⟫ 表示置信度，并采样 ⟪F3⟫（算法 1）。"
+    restored, missing = restore_formulas(zh_with_toks, tokens)
+    assert missing == []
+
+    if find_typst_package_cache_dir():
+        with tempfile.TemporaryDirectory() as td:
+            wd = Path(td)
+            src_pdf = wd / "src.pdf"
+            doc = pymupdf.open()
+            pg = doc.new_page(width=612, height=792)
+            pg.insert_text((318, 440), "Gaussian placeholder", fontsize=10.0)
+            doc.save(src_pdf)
+            doc.close()
+            res = render_typst(
+                items=[
+                    {
+                        "block_id": "p5b0048",
+                        "page_index": 0,
+                        "reading_order": 0,
+                        "layout_role": "body",
+                        "policy": {"translate": True, "preserve_reason": None, "redact_source": True},
+                        "bbox": [317.6, 423.8, 559.7, 543.6],
+                        "line_bboxes": [[317.6, 423.8, 559.7, 543.6]],
+                        "font_size_pt": 9.96,
+                        "text": blk["text"],
+                        "translation": restored,
+                        "translation_status": "ok",
+                    }
+                ],
+                workdir=wd,
+                output_cn=wd / "cn.pdf",
+                output_merged=wd / "merged.pdf",
+                legacy_output=None,
+                font="",
+                source=str(src_pdf),
+                layout_mode="preserve",
+                bilingual_mode="side_by_side",
+                page_widths={0: 612.0},
+                page_coord_spaces={0: "pdf_pt"},
+                page_scanned={0: False},
+                strict=True,
+            )
+            assert res["placed"] == 1
+            assert res["unplaced"] == 0
+            overlay = (wd / "overlay.typ").read_text(encoding="utf-8")
+            assert r"#mi(`\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)`)" in overlay
+            assert r"#mi(`1/\hat{\sigma}_b^2`)" in overlay
+
+

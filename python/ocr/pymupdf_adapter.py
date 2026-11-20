@@ -292,9 +292,68 @@ def _extract_page_blocks(
                 total_chars += nchars
 
     is_scanned = total_chars < scanned_char_threshold and len(image_rects) > 0
+    blocks = _merge_inline_math_split_blocks(blocks)
     blocks = _merge_split_references(blocks)
     table_regions = _extract_table_regions(page, drawing_rects, blocks)
     return blocks, figure_regions, table_regions, is_scanned
+
+
+def _merge_inline_math_split_blocks(blocks: list[dict]) -> list[dict]:
+    """Merge paragraph blocks split mid-line by PyMuPDF at lowered math subscripts
+    (e.g. 'ˆσ2' ending block N and 'b). Here...' starting block N+1 on the same line)."""
+    if len(blocks) < 2:
+        return blocks
+    merged: list[dict] = []
+    for blk in blocks:
+        if (
+            merged
+            and not merged[-1].get("is_vertical")
+            and not blk.get("is_vertical")
+            and merged[-1].get("line_bboxes")
+            and blk.get("line_bboxes")
+        ):
+            prev = merged[-1]
+            cl = prev["line_bboxes"][-1]
+            nl = blk["line_bboxes"][0]
+            min_h = max(1.0, min(cl[3] - cl[1], nl[3] - nl[1]))
+            y_ov = min(cl[3], nl[3]) - max(cl[1], nl[1])
+            same_line = y_ov >= 0.45 * min_h
+            # Subscript continues right where the previous line ended (often overlapping x by ~3-5pt)
+            x_cont = (cl[2] - 10.0 <= nl[0] <= cl[2] + 8.0) and (nl[0] > prev["bbox"][0] + 40.0)
+            same_col = True
+            if len(blk["line_bboxes"]) >= 2:
+                nxt_left = min(lb[0] for lb in blk["line_bboxes"][1:])
+                same_col = abs(nxt_left - prev["bbox"][0]) <= 22.0
+            if same_line and x_cont and same_col:
+                prev_txt = prev["text"].rstrip()
+                nxt_txt = blk["text"].lstrip()
+                # If previous text ends in math superscript/Greek and next starts with short subscript
+                if re.search(r"[ˆθµμσηλαβγδε]\d*$", prev_txt) and re.match(r"^[a-zA-Z0-9]{1,2}(?:[^a-zA-Z0-9]|$)", nxt_txt):
+                    comb_text = prev_txt + nxt_txt
+                else:
+                    comb_text = _join_lines_smart([prev_txt, nxt_txt])
+                joined_line = [
+                    min(cl[0], nl[0]),
+                    min(cl[1], nl[1]),
+                    max(cl[2], nl[2]),
+                    max(cl[3], nl[3]),
+                ]
+                comb_lbs = list(prev["line_bboxes"][:-1]) + [joined_line] + list(blk["line_bboxes"][1:])
+                comb_bbox = [
+                    min(prev["bbox"][0], blk["bbox"][0]),
+                    min(prev["bbox"][1], blk["bbox"][1]),
+                    max(prev["bbox"][2], blk["bbox"][2]),
+                    max(prev["bbox"][3], blk["bbox"][3]),
+                ]
+                merged[-1] = {
+                    **prev,
+                    "text": comb_text,
+                    "bbox": comb_bbox,
+                    "line_bboxes": comb_lbs,
+                }
+                continue
+        merged.append(blk)
+    return merged
 
 
 def _merge_split_references(blocks: list[dict]) -> list[dict]:

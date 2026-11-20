@@ -28,6 +28,108 @@ _NUMERIC_TICK_RE = re.compile(
     r")$"
 )
 _MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεζηθκλμνξπρστυφχψωΔΣΠΩ·−∼⊂⊆∪∩∀∃∝‖⟨⟩")
+_GREEK_TO_LATEX = {
+    "θ": r"\theta",
+    "µ": r"\mu",
+    "μ": r"\mu",
+    "σ": r"\sigma",
+    "η": r"\eta",
+    "λ": r"\lambda",
+    "α": r"\alpha",
+    "β": r"\beta",
+    "γ": r"\gamma",
+    "δ": r"\delta",
+    "ε": r"\epsilon",
+    "ρ": r"\rho",
+    "τ": r"\tau",
+    "φ": r"\phi",
+    "ω": r"\omega",
+}
+_GREEK_CLS = "".join(_GREEK_TO_LATEX.keys())
+_INLINE_DIST_RE = re.compile(
+    rf"(?P<lhat>ˆ\s*)?(?P<lg>[{_GREEK_CLS}])(?P<lsub>[a-z0-9])\s*[∼~]\s*N\s*\("
+    rf"\s*(?P<a1hat>ˆ\s*)?(?P<a1g>[{_GREEK_CLS}])(?P<a1sub>[a-z0-9])\s*,\s*"
+    rf"(?P<a2hat>ˆ\s*)?(?P<a2g>[{_GREEK_CLS}])(?:(?P<a2sup>2)(?P<a2sub>[a-z0-9])|(?P<a2sub2>[a-z0-9]))\s*\)"
+)
+_INLINE_FRAC_HAT_RE = re.compile(
+    rf"(?<![A-Za-z0-9$])(?P<num>\d+)\s*/\s*(?P<hat>ˆ\s*)?(?P<g>[σµμθ])(?P<sup>2)(?P<sub>[a-z0-9])(?![A-Za-z0-9])"
+)
+_INLINE_HAT_ATOM_RE = re.compile(
+    rf"(?<![A-Za-z0-9$])ˆ\s*(?P<g>[{_GREEK_CLS}])(?:(?P<sup>2)(?P<sub>[a-z0-9])|(?P<sub2>[a-z0-9]))(?![A-Za-z0-9])"
+)
+_INLINE_GREEK_SUB_RE = re.compile(
+    rf"(?<![A-Za-z0-9$\\])(?P<g>[θµμσ])(?P<sub>[a-z0-9])(?![A-Za-z0-9])"
+)
+
+
+def _fmt_greek_atom(hat: str | None, g: str, sub: str | None = None, sup: str | None = None) -> str:
+    base = _GREEK_TO_LATEX[g]
+    if hat:
+        base = rf"\hat{{{base}}}"
+    if sub:
+        base += f"_{sub}" if len(sub) == 1 else f"_{{{sub}}}"
+    if sup:
+        base += f"^{sup}" if len(sup) == 1 else f"^{{{sup}}}"
+    return base
+
+
+def _reconstruct_inline_math_latex(text: str) -> str:
+    """Reconstruct complete inline LaTeX math ($...$) from Unicode Greek+hat+sub/sup spans
+    in translatable prose so protect_formulas() protects them as intact tokens and Typst MiTeX
+    renders true accents, subscripts, and superscripts."""
+    if not text or not any(ch in text for ch in ("ˆ", "θ", "µ", "μ", "σ", "∼")):
+        return text
+
+    # Split around any pre-existing $...$ spans so we never double-wrap LaTeX.
+    parts = re.split(r"(\$\$[^$]+\$\$|\$[^$\n]+\$)", text)
+    for idx in range(0, len(parts), 2):
+        seg = parts[idx]
+        if not seg:
+            continue
+
+        def _rep_dist(m: re.Match) -> str:
+            lhs = _fmt_greek_atom(m.group("lhat"), m.group("lg"), m.group("lsub"))
+            a1 = _fmt_greek_atom(m.group("a1hat"), m.group("a1g"), m.group("a1sub"))
+            a2 = _fmt_greek_atom(
+                m.group("a2hat"),
+                m.group("a2g"),
+                m.group("a2sub") or m.group("a2sub2"),
+                m.group("a2sup"),
+            )
+            return rf"${lhs} \sim \mathcal{{N}}({a1}, {a2})$"
+
+        seg = _INLINE_DIST_RE.sub(_rep_dist, seg)
+
+        # Protect newly created $...$ spans before running smaller atom patterns
+        sub_parts = re.split(r"(\$[^$\n]+\$)", seg)
+        for j in range(0, len(sub_parts), 2):
+            s2 = sub_parts[j]
+            if not s2:
+                continue
+            s2 = _INLINE_FRAC_HAT_RE.sub(
+                lambda m: f"${m.group('num')}/{_fmt_greek_atom(m.group('hat'), m.group('g'), m.group('sub'), m.group('sup'))}$",
+                s2,
+            )
+            s2_parts = re.split(r"(\$[^$\n]+\$)", s2)
+            for k in range(0, len(s2_parts), 2):
+                s3 = s2_parts[k]
+                if not s3:
+                    continue
+                s3 = _INLINE_HAT_ATOM_RE.sub(
+                    lambda m: f"${_fmt_greek_atom('ˆ', m.group('g'), m.group('sub') or m.group('sub2'), m.group('sup'))}$",
+                    s3,
+                )
+                s3_parts = re.split(r"(\$[^$\n]+\$)", s3)
+                for p in range(0, len(s3_parts), 2):
+                    if s3_parts[p]:
+                        s3_parts[p] = _INLINE_GREEK_SUB_RE.sub(
+                            lambda m: f"${_fmt_greek_atom(None, m.group('g'), m.group('sub'))}$",
+                            s3_parts[p],
+                        )
+                s2_parts[k] = "".join(s3_parts)
+            sub_parts[j] = "".join(s2_parts)
+        parts[idx] = "".join(sub_parts)
+    return "".join(parts)
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _AFFIL_KW_RE = re.compile(
@@ -463,6 +565,9 @@ def normalize_pages(
                 translate = bool(b["policy"]["translate"])
                 preserve_reason = b["policy"].get("preserve_reason", preserve_reason)
                 redact_source = bool(b["policy"].get("redact_source", translate))
+
+            if translate:
+                text = _reconstruct_inline_math_latex(text)
 
             nb = {
                 "block_id": b["block_id"],
