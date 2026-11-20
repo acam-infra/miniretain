@@ -4,9 +4,13 @@ from __future__ import annotations
 import re
 
 _PATTERNS = [
-    # Display math $$...$$ and inline math $...$
+    # Complete math spans first (aligned with Typst MiTeX renderer):
+    # Display math $$...$$ and \[...\]
     re.compile(r"\$\$[^$]+\$\$"),
-    re.compile(r"(?<!\\)\$[^$\n]+\$"),
+    re.compile(r"\\\[[\s\S]+?\\\]"),
+    # Inline math \(...\) and $...$
+    re.compile(r"\\\([^\n]+?\\\)"),
+    re.compile(r"(?<!\\)\$(?!\s)[^$\n]+?(?<!\s)\$"),
     # LaTeX commands with braces like \mathcal{O}(...), \frac{...}{...}
     re.compile(r"\\[a-zA-Z]+\{[^}]*\}(?:\{[^}]*\})?"),
     # Big-O / memory notations like O(GB), O(KB), O(MB), O(n log n), O(1)

@@ -152,3 +152,77 @@ def test_typst_strict_compile_two_column_inline_math_spacing():
         overlay_typ = (wd / "overlay.typ").read_text(encoding="utf-8")
         assert _INLINE_MATH_GAP in overlay_typ
         assert '#mi(`Q`)#"，按"' in overlay_typ
+
+
+def test_two_same_width_booktabs_tables_do_not_swallow_intervening_body():
+    """Exact reproduction: two same-width 3-rule booktabs tables at x=60..280, y=(100,116,151)
+    and y=(225,241,276) with body prose at y=198 must keep body prose translatable."""
+    with tempfile.TemporaryDirectory() as td:
+        pdf_path = Path(td) / "two_tables.pdf"
+        doc = pymupdf.open()
+        pg = doc.new_page(width=612, height=792)
+
+        # Table 1: y=(100, 116, 151)
+        for y in (100.0, 116.0, 151.0):
+            pg.draw_line((60.0, y), (280.0, y), color=(0, 0, 0), width=0.8)
+        pg.insert_text((66, 112), "Metric       Value", fontsize=8.5)
+        pg.insert_text((66, 130), "Throughput   120", fontsize=8.5)
+        pg.insert_text((66, 146), "Latency      4.2", fontsize=8.5)
+
+        # Intervening body prose at y=198
+        pg.insert_text(
+            (60, 198),
+            "This body paragraph sits between two same-width tables and must be translated.",
+            fontsize=10.0,
+        )
+
+        # Table 2: y=(225, 241, 276)
+        for y in (225.0, 241.0, 276.0):
+            pg.draw_line((60.0, y), (280.0, y), color=(0, 0, 0), width=0.8)
+        pg.insert_text((66, 237), "Hardware     Count", fontsize=8.5)
+        pg.insert_text((66, 255), "V100         4", fontsize=8.5)
+        pg.insert_text((66, 271), "A40          8", fontsize=8.5)
+
+        doc.save(pdf_path)
+        doc.close()
+
+        pages = PyMuPDFOCRProvider().parse(str(pdf_path))
+        t_regions = pages[0].get("table_regions") or []
+        assert len(t_regions) == 2
+        # Neither region may span from y=100 to y=276
+        assert all((r[3] - r[1]) < 80.0 for r in t_regions)
+
+        blocks = pages[0]["blocks"]
+        mid_body = [b for b in blocks if "between two same-width tables" in b["text"]]
+        assert len(mid_body) == 1
+        assert mid_body[0]["layout_role"] == "body"
+        assert mid_body[0]["policy"]["translate"] is True
+
+        tbl_blocks = [b for b in blocks if b["layout_role"] == "table"]
+        assert len(tbl_blocks) >= 2
+        assert all(b["policy"]["translate"] is False for b in tbl_blocks)
+
+
+def test_protect_and_restore_formulas_handles_paren_and_bracket_math_spans():
+    """protect_formulas must protect whole \\(...\\) and \\[...\\] spans before internal LaTeX commands."""
+    from llm.formula_protect import protect_formulas, restore_formulas
+
+    src = (
+        r"Given \(x_i = y_i + 1\) and display \[\frac{1}{\sqrt{d_k}} + \mathcal{O}(n)\], "
+        r"we also keep $z_k$ and $$a + b$$ intact."
+    )
+    protected, tokens = protect_formulas(src, layout_role="body")
+    assert len(tokens) == 4
+    vals = set(tokens.values())
+    assert r"\(x_i = y_i + 1\)" in vals
+    assert r"\[\frac{1}{\sqrt{d_k}} + \mathcal{O}(n)\]" in vals
+    assert "$z_k$" in vals
+    assert "$$a + b$$" in vals
+    # Raw LaTeX spans must not leak to LLM prompt text
+    assert r"\(x_i = y_i + 1\)" not in protected
+    assert r"\frac" not in protected
+
+    restored, missing = restore_formulas(protected, tokens)
+    assert missing == []
+    assert restored == src
+

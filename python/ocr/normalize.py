@@ -199,6 +199,8 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
     s = text.strip()
     if not s:
         return False
+    if re.match(r"^\(\d+(?:\.\d+)*\)$", s):
+        return True
     if _BIG_O_ONLY_RE.match(s):
         return True
     if is_math_font and len(s) < 120:

@@ -10,6 +10,8 @@ from ocr.normalize import cluster_figure_regions, normalize_pages
 
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
 _REF_START_RE = re.compile(r"^\[\d+\]\s+")
+_STANDALONE_EQ_NUM_RE = re.compile(r"^\(\d+(?:\.\d+)*\)$")
+_TABLE_CAPTION_RE = re.compile(r"^(?:Table|Tab\.|Fig\.|Figure|Algorithm|Listing)\s*\d+", re.IGNORECASE)
 
 
 def _join_lines_smart(lines_text: list[str]) -> str:
@@ -49,9 +51,19 @@ def _join_lines_smart(lines_text: list[str]) -> str:
 
 
 def _split_reference_lines(lines: list[dict]) -> list[list[dict]]:
-    """Split a block's lines when a line at left margin starts a new [N] reference."""
+    """Split a block's lines for leading right-aligned equation numbers or new [N] references."""
     if len(lines) < 2:
         return [lines]
+    # Split a leading right-aligned standalone equation number (e.g. "(9)") that PyMuPDF
+    # grouped with the following body paragraph so the equation number stays preserved in place.
+    first_txt = "".join(s.get("text", "") for s in (lines[0].get("spans") or [])).strip()
+    if (
+        _STANDALONE_EQ_NUM_RE.match(first_txt)
+        and lines[0].get("bbox")
+        and lines[1].get("bbox")
+        and lines[0]["bbox"][0] > lines[1]["bbox"][0] + 60.0
+    ):
+        return [[lines[0]]] + _split_reference_lines(lines[1:])
     min_x0 = min(l["bbox"][0] for l in lines if l.get("bbox"))
     groups: list[list[dict]] = []
     cur: list[dict] = []
@@ -127,14 +139,17 @@ def _build_block_from_lines(
 
 
 def _extract_table_regions(
-    page: pymupdf.Page, drawing_rects: list[list[float]]
+    page: pymupdf.Page,
+    drawing_rects: list[list[float]],
+    blocks: list[dict] | None = None,
 ) -> list[list[float]]:
     """Detect bordered and minimal-border (booktabs) table regions on a digital PDF page.
 
     Combines PyMuPDF's native `find_tables()` (multi-row, multi-column) with a
     conservative horizontal-rule booktabs detector (>=3 aligned horizontal rules
-    with a compact header band) so borderless-side academic tables are preserved
-    without swallowing adjacent column prose.
+    with a compact header band). Splits rule groups across intervening prose/captions
+    or inter-table gaps and rejects fallback boxes that span already-detected tables,
+    preventing two same-width tables from swallowing body text between them.
     """
     pw = float(page.rect.width)
     ph = float(page.rect.height)
@@ -152,24 +167,68 @@ def _extract_table_regions(
     except Exception:
         pass
 
-    # Booktabs / minimal-border table detector: group aligned horizontal rules.
+    def _has_intervening_prose(gx0: float, gx1: float, y_lo: float, y_hi: float) -> bool:
+        if not blocks or y_hi - y_lo < 12.0:
+            return False
+        for b in blocks:
+            bb = b.get("bbox")
+            if not bb:
+                continue
+            # Block sits vertically between the two rules and horizontally in the same band
+            if bb[1] >= y_lo - 2.0 and bb[3] <= y_hi + 2.0 and bb[2] > gx0 + 10.0 and bb[0] < gx1 - 10.0:
+                txt = (b.get("text") or "").strip()
+                if not txt:
+                    continue
+                if _TABLE_CAPTION_RE.match(txt):
+                    return True
+                if len(txt) >= 40 or (len(txt) >= 20 and txt.endswith((".", ":", "?", "!"))):
+                    return True
+        return False
+
+    def _distinct_y_count(rules: list[list[float]]) -> int:
+        ys: list[float] = []
+        for r in rules:
+            if not ys or abs(r[1] - ys[-1]) > 4.0:
+                ys.append(r[1])
+        return len(ys)
+
+    # Booktabs / minimal-border table detector: group aligned horizontal rules per table.
     hlines = [
         r for r in drawing_rects
         if (r[2] - r[0]) >= 60.0 and (r[3] - r[1]) <= 3.0 and (r[2] - r[0]) <= pw * 0.96
     ]
-    groups: list[list[list[float]]] = []
+    # Bucket rules by horizontal alignment (x0, x1) first, then split vertically into independent tables.
+    x_buckets: list[list[list[float]]] = []
     for r in sorted(hlines, key=lambda x: (x[1], x[0])):
         placed = False
-        for g in groups:
-            gx0 = g[0][0]
-            gx1 = g[0][2]
-            if abs(r[0] - gx0) <= 10.0 and abs(r[2] - gx1) <= 10.0:
-                if r[1] - g[-1][1] <= 180.0:
-                    g.append(r)
-                    placed = True
-                    break
+        for bkt in x_buckets:
+            if abs(r[0] - bkt[0][0]) <= 10.0 and abs(r[2] - bkt[0][2]) <= 10.0:
+                bkt.append(r)
+                placed = True
+                break
         if not placed:
-            groups.append([r])
+            x_buckets.append([r])
+
+    groups: list[list[list[float]]] = []
+    for bkt in x_buckets:
+        cur: list[list[float]] = [bkt[0]]
+        for r in bkt[1:]:
+            prev_y = cur[-1][1]
+            gap = r[1] - prev_y
+            gx0 = min(x[0] for x in cur)
+            gx1 = max(x[2] for x in cur)
+            # Split into a new table if gap is large, prose/caption sits between rules,
+            # or current group already forms a complete >=3-rule booktabs table before a >28pt gap.
+            if (
+                gap > 180.0
+                or _has_intervening_prose(gx0, gx1, prev_y, r[1])
+                or (_distinct_y_count(cur) >= 3 and gap > 28.0)
+            ):
+                groups.append(cur)
+                cur = [r]
+            else:
+                cur.append(r)
+        groups.append(cur)
 
     for g in groups:
         # Collapse near-duplicate double rules (within 4pt vertically)
@@ -191,15 +250,16 @@ def _extract_table_regions(
         th = box[3] - box[1]
         if not (24.0 <= th <= ph * 0.75):
             continue
-        # Skip if already covered by a find_tables() region
-        already = any(
-            abs(box[0] - er[0]) <= 15.0
-            and abs(box[1] - er[1]) <= 15.0
-            and abs(box[2] - er[2]) <= 15.0
-            and abs(box[3] - er[3]) <= 15.0
-            for er in regions
-        )
-        if not already:
+        # Reject any fallback box that overlaps/merges already-detected independent find_tables() regions
+        overlaps_existing = False
+        for er in regions:
+            ix = max(0.0, min(box[2], er[2]) - max(box[0], er[0]))
+            iy = max(0.0, min(box[3], er[3]) - max(box[1], er[1]))
+            er_area = max(1.0, (er[2] - er[0]) * (er[3] - er[1]))
+            if (ix * iy) / er_area >= 0.5:
+                overlaps_existing = True
+                break
+        if not overlaps_existing:
             regions.append(box)
 
     return regions
@@ -216,7 +276,6 @@ def _extract_page_blocks(
     figure_regions = cluster_figure_regions(
         drawing_rects, image_rects, page.rect.width, page.rect.height
     )
-    table_regions = _extract_table_regions(page, drawing_rects)
 
     blocks: list[dict] = []
     total_chars = 0
@@ -234,6 +293,7 @@ def _extract_page_blocks(
 
     is_scanned = total_chars < scanned_char_threshold and len(image_rects) > 0
     blocks = _merge_split_references(blocks)
+    table_regions = _extract_table_regions(page, drawing_rects, blocks)
     return blocks, figure_regions, table_regions, is_scanned
 
 
