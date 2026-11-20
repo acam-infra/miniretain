@@ -424,3 +424,31 @@ def test_batch_split_preserves_parent_attempts_in_child_counts():
     assert all(rec["attempts"] == 3 for rec in records)
     assert stats["requests"] == 4
 
+
+def test_algorithm_io_header_and_tiny_chart_label_preserved():
+    """Structured Input/Output headers above Function Observe(...) and <=5.5pt chart labels stay preserved."""
+    pages = [
+        {
+            "page_index": 5,
+            "width": 612.0,
+            "height": 792.0,
+            "figure_regions": [],
+            "blocks": [
+                {"block_id": "p5b0024", "text": "Input: Batch size b and observed cost C", "bbox": [327.8, 86.8, 488.5, 96.9], "font_size_pt": 9.0},
+                {"block_id": "p5b0025", "text": "Previous cost observations Cb for b Belief prior parameters ˆµ0 and ˆσ2", "bbox": [357.5, 98.7, 497.4, 122.3], "font_size_pt": 9.0},
+                {"block_id": "p5b0026", "text": "0 Output: Belief posterior parameters ˆµb and ˆσ2", "bbox": [327.8, 115.7, 513.8, 134.4], "font_size_pt": 9.0},
+                {"block_id": "p5b0028", "text": "Function Observe(b, C, Cb, ˆµ0, ˆσ2", "bbox": [327.8, 145.5, 469.3, 158.1], "font_size_pt": 9.0},
+                {"block_id": "p20b0179", "text": "Batch Size", "bbox": [222.6, 670.7, 240.5, 674.9], "font_size_pt": 3.75},
+            ],
+        }
+    ]
+    norm = normalize_pages(pages, coord_space="pdf_pt", dpi=72.0)
+    by_id = {b["block_id"]: b for b in norm[0]["blocks"]}
+    for bid in ("p5b0024", "p5b0025", "p5b0026"):
+        assert by_id[bid]["policy"]["translate"] is False
+        assert by_id[bid]["policy"]["preserve_reason"] == "algorithm_io_header"
+        assert by_id[bid]["policy"]["redact_source"] is False
+    assert by_id["p20b0179"]["policy"]["translate"] is False
+    assert by_id["p20b0179"]["policy"]["preserve_reason"] == "tiny_figure_label"
+
+

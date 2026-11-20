@@ -37,6 +37,8 @@ _CODE_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 _CODE_CALL_RE = re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(")
 _CODE_ASSIGN_RE = re.compile(r"^\s*(?:\d+\s+)?[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\(")
 _CODE_IMPORT_RE = re.compile(r"(?:^|\s)(?:from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+|import\s+[A-Za-z_]\w*\s+as\s+)")
+_ALGO_FUNC_RE = re.compile(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(")
+_ALGO_IO_RE = re.compile(r"^(?:[A-Za-z0-9∗†‡]{1,3}\s+)?(?:Input|Output|Require|Ensure)\s*:")
 _APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\b|Supplementary\b|[A-Z]\.\s+[A-Z]\S*)", re.IGNORECASE)
 
 
@@ -534,6 +536,44 @@ def normalize_pages(
                             "redact_source": False,
                         }
                         break
+
+        # Algorithm pseudocode Input/Output header preservation:
+        # Preserve structured Input/Output/Require/Ensure parameter lines immediately above
+        # preserved Function/Procedure/Algorithm headers in the same column so split math
+        # subscripts (e.g. "0 Output:") and overlapping header boxes stay intact as vector PDF.
+        algo_anchors = [
+            nb["bbox"]
+            for nb in norm_blocks
+            if not nb["policy"]["translate"]
+            and nb.get("bbox")
+            and _ALGO_FUNC_RE.match((nb.get("text") or "").strip())
+        ]
+        for ax0, ay0, ax1, _ay1 in algo_anchors:
+            above = [
+                nb
+                for nb in norm_blocks
+                if nb["policy"]["translate"]
+                and nb["layout_role"] == "body"
+                and nb.get("bbox")
+                and nb["bbox"][1] >= ay0 - 95.0
+                and nb["bbox"][3] <= ay0 + 2.0
+                and nb["bbox"][0] >= ax0 - 20.0
+                and nb["bbox"][0] <= ax1 + 40.0
+                and nb["bbox"][2] <= max(ax1 + 100.0, ax0 + page_w * 0.48)
+            ]
+            io_blocks = [
+                nb for nb in above if _ALGO_IO_RE.match((nb.get("text") or "").strip())
+            ]
+            if io_blocks:
+                top_io_y = min(nb["bbox"][1] for nb in io_blocks)
+                for nb in above:
+                    if nb["bbox"][1] >= top_io_y - 2.0:
+                        nb["layout_role"] = "figure_label"
+                        nb["policy"] = {
+                            "translate": False,
+                            "preserve_reason": "algorithm_io_header",
+                            "redact_source": False,
+                        }
 
         # Deduplicate/merge geometrically contained translatable child blocks (e.g. split footnotes)
         def _box_area(box: list[float]) -> float:
