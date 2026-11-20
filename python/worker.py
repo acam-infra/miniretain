@@ -135,6 +135,9 @@ def run_llm(spec: dict, wd: Path) -> dict:
     payload: list[dict] = []
     per_page: dict[int, dict] = {}
     formula_warnings: list[str] = []
+    critical_failures: list[dict] = []
+    non_critical_fallbacks: list[dict] = []
+    non_critical_roles = frozenset({"title", "header_footer", "author_affiliation", "reference"})
 
     for idx, item in enumerate(items):
         p_idx = int(item["page_index"])
@@ -143,7 +146,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
             {"page_index": p_idx, "total": 0, "translatable": 0, "succeeded": 0, "preserved": 0, "failed": 0},
         )
         p_stat["total"] += 1
-        policy = item.get("policy") or {"translate": True, "preserve_reason": None, "redact_source": True}
+        policy = dict(item.get("policy") or {"translate": True, "preserve_reason": None, "redact_source": True})
 
         if idx not in rec_by_item_idx:
             p_stat["preserved"] += 1
@@ -160,6 +163,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
                 "text": item.get("text"),
                 "translation": item.get("text"),
                 "translation_status": "preserved",
+                "attempts": 0,
                 "error": None,
                 "continuation": item.get("continuation", {}),
             })
@@ -170,6 +174,8 @@ def run_llm(spec: dict, wd: Path) -> dict:
         t_status = rec["status"]
         trans_text = rec["translation"]
         err_msg = rec["error"]
+        attempts = int(rec.get("attempts", 1))
+        role = item.get("layout_role", "body")
 
         if t_status == "ok" and trans_text:
             restored, missing_toks = restore_formulas(trans_text, formula_tokens_by_idx.get(idx, {}))
@@ -178,13 +184,35 @@ def run_llm(spec: dict, wd: Path) -> dict:
                 formula_warnings.append(f"{item['block_id']}: missing formula tokens {missing_toks}")
             p_stat["succeeded"] += 1
         else:
-            p_stat["failed"] += 1
+            diag = {
+                "stage": "llm",
+                "page_index": p_idx,
+                "page_number": p_idx + 1,
+                "block_id": item["block_id"],
+                "layout_role": role,
+                "status": t_status,
+                "reason": err_msg or t_status,
+                "attempts": attempts,
+            }
+            if role in non_critical_roles:
+                # Non-critical metadata/title blocks may preserve source cleanly and let the job finish.
+                policy["translate"] = False
+                policy["redact_source"] = False
+                policy["preserve_reason"] = f"fallback_{t_status}"
+                trans_text = item.get("text")
+                t_status = "preserved_fallback"
+                p_stat["preserved"] += 1
+                non_critical_fallbacks.append(diag)
+            else:
+                policy["redact_source"] = False
+                p_stat["failed"] += 1
+                critical_failures.append(diag)
 
         payload.append({
             "block_id": item["block_id"],
             "page_index": p_idx,
             "reading_order": item.get("reading_order", 0),
-            "layout_role": item.get("layout_role", "body"),
+            "layout_role": role,
             "policy": policy,
             "bbox": item.get("bbox"),
             "line_bboxes": item.get("line_bboxes"),
@@ -193,6 +221,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
             "text": item.get("text"),
             "translation": trans_text,
             "translation_status": t_status,
+            "attempts": attempts,
             "error": err_msg,
             "continuation": item.get("continuation", {}),
         })
@@ -200,6 +229,8 @@ def run_llm(spec: dict, wd: Path) -> dict:
     total_translatable = len(translatable_indices)
     succeeded_count = stats["succeeded_items"]
     failed_count = stats["failed_items"] + stats["missing_items"] + stats["empty_items"]
+    critical_failed_count = len(critical_failures)
+    allow_partial = bool(cfg.get("allow_partial", False))
     coverage = round(succeeded_count / total_translatable, 4) if total_translatable else 1.0
 
     _dump(wd / "translation.payload.json", {"version": "payload.v1", "items": payload})
@@ -213,6 +244,13 @@ def run_llm(spec: dict, wd: Path) -> dict:
             "preserved_items": len(payload) - total_translatable,
             "succeeded_items": succeeded_count,
             "failed_items": failed_count,
+            "critical_failed_items": critical_failed_count,
+            "non_critical_fallback_items": len(non_critical_fallbacks),
+            "partial_mode": allow_partial,
+            "partial_missing_body": bool(critical_failures and allow_partial),
+            "failed_stage": "llm" if critical_failures else None,
+            "critical_failures": critical_failures,
+            "non_critical_fallbacks": non_critical_fallbacks,
             "coverage_ratio": coverage,
             "formula_warnings": formula_warnings,
             "payload": "translation.payload.json",
@@ -228,6 +266,12 @@ def run_llm(spec: dict, wd: Path) -> dict:
         "preserved": len(payload) - total_translatable,
         "translated": succeeded_count,
         "failed_total": failed_count,
+        "critical_failed": critical_failed_count,
+        "non_critical_fallbacks": non_critical_fallbacks,
+        "critical_failures": critical_failures,
+        "failed_stage": "llm" if critical_failures else None,
+        "partial_mode": allow_partial,
+        "partial_missing_body": bool(critical_failures and allow_partial),
         "coverage_ratio": coverage,
         "formula_warnings": len(formula_warnings),
         "per_page": [per_page[k] for k in sorted(per_page)],
@@ -235,11 +279,14 @@ def run_llm(spec: dict, wd: Path) -> dict:
     }
     _dump(wd / "llm.result.json", result)
 
-    if failed_count > 0 and not cfg.get("allow_partial", False):
-        bad_ids = stats["failed_block_ids"] + stats["missing_block_ids"] + stats["empty_block_ids"]
+    if critical_failures and not allow_partial:
+        summary = "; ".join(
+            f"p{d['page_number']}/{d['block_id']}({d['layout_role']}): {d['reason']} [attempts={d['attempts']}]"
+            for d in critical_failures[:8]
+        )
         raise RuntimeError(
-            f"llm translation incomplete: {failed_count}/{total_translatable} failed/missing/empty "
-            f"(block_ids={bad_ids[:10]})"
+            f"llm stage failed: {critical_failed_count}/{total_translatable} critical body blocks failed "
+            f"(allow_partial=false): {summary}"
         )
 
     return result

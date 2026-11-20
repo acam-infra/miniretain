@@ -180,7 +180,11 @@ func (h *Handler) result(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if j.Status != job.Succeeded {
-		writeJSON(w, 409, map[string]any{"id": j.ID, "status": j.Status, "error": j.Error})
+		resp := map[string]any{"id": j.ID, "status": j.Status, "stage": j.Stage, "error": j.Error}
+		if j.Result != nil {
+			resp["result"] = j.Result
+		}
+		writeJSON(w, 409, resp)
 		return
 	}
 	writeJSON(w, 200, map[string]any{"id": j.ID, "result": j.Result})

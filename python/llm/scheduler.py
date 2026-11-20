@@ -143,7 +143,14 @@ class Scheduler:
             "retry_s": 0.0,
         }
 
-    def _run_batch(self, batch: list[dict], target_lang: str, model: str, doc_context: str = ""):
+    def _run_batch(
+        self,
+        batch: list[dict],
+        target_lang: str,
+        model: str,
+        doc_context: str = "",
+        max_transport_retries: int | None = None,
+    ):
         t0 = time.perf_counter()
         last: Exception | None = None
         payload_batch = (
@@ -151,7 +158,12 @@ class Scheduler:
             if (doc_context and batch)
             else batch
         )
-        for attempt in range(self.retry_policy.max_retries + 1):
+        retry_limit = (
+            self.retry_policy.max_retries
+            if max_transport_retries is None
+            else max(0, max_transport_retries)
+        )
+        for attempt in range(retry_limit + 1):
             self.retry_policy.wait_if_cooling_down()
             try:
                 with self.limiter.acquire():
@@ -173,7 +185,7 @@ class Scheduler:
                         self.stats["timeouts"] += 1
                 if decision.cooldown_s > 0:
                     self.retry_policy.note_cooldown(decision.cooldown_s)
-                if decision.retryable:
+                if decision.retryable and attempt < retry_limit:
                     with self._metrics_lock:
                         self.stats["retries"] += 1
                     if decision.delay_s > 0:
@@ -203,6 +215,8 @@ class Scheduler:
         pool_workers = max(1, min(self.concurrency, self.limiter.limit))
         main_done_at: float | None = None
         main_remaining = len(planned_batches)
+        item_attempts: list[int] = [0] * len(items)
+        item_retry_counts: list[int] = [0] * len(items)
         retried_indices: set[int] = set()
 
         with ThreadPoolExecutor(max_workers=pool_workers) as pool:
@@ -222,8 +236,10 @@ class Scheduler:
                         indexed_batch = meta
                         assert isinstance(indexed_batch, list)
                         batch = [it for _, it in indexed_batch]
+                        batch_attempts = 1
                         try:
-                            raw_out, _retries, lat_s = fut.result()
+                            raw_out, batch_retries, lat_s = fut.result()
+                            batch_attempts = 1 + int(batch_retries)
                             batch_latencies.append(lat_s)
                             norm = [
                                 _normalize_item_result(item, val)
@@ -248,6 +264,7 @@ class Scheduler:
                                     main_remaining += 1
                                 main_remaining -= 1
                                 continue
+                            batch_attempts = 1 + self.retry_policy.max_retries
                             self.stats["failed_batches"] += 1
                             norm = [
                                 {
@@ -260,18 +277,26 @@ class Scheduler:
                             ]
 
                         for (orig_idx, item), rec in zip(indexed_batch, norm):
+                            item_attempts[orig_idx] += batch_attempts
+                            rec["attempts"] = item_attempts[orig_idx]
                             results[orig_idx] = rec
-                            # Immediate streaming single-item retry without waiting for all batches!
+                            # Immediate streaming single-item retry up to configured max_retries budget.
+                            # Sibling blocks that already succeeded stay untouched.
                             if (
-                                self.max_retries > 0
-                                and rec["status"] in ("missing", "empty")
-                                and orig_idx not in retried_indices
+                                rec["status"] in ("missing", "empty")
+                                and item_retry_counts[orig_idx] < self.max_retries
                             ):
+                                item_retry_counts[orig_idx] += 1
                                 retried_indices.add(orig_idx)
                                 with self._metrics_lock:
                                     self.stats["retries"] += 1
                                 rf = pool.submit(
-                                    self._run_batch, [item], target_lang, model, doc_context
+                                    self._run_batch,
+                                    [item],
+                                    target_lang,
+                                    model,
+                                    doc_context,
+                                    0,
                                 )
                                 pending[rf] = ("item_retry", orig_idx)
 
@@ -282,16 +307,47 @@ class Scheduler:
                         orig_idx = meta
                         assert isinstance(orig_idx, int)
                         item = items[orig_idx]
+                        item_attempts[orig_idx] += 1
+                        retry_exc: Exception | None = None
                         try:
                             raw_out, _retries, _lat = fut.result()
-                            results[orig_idx] = _normalize_item_result(item, raw_out[0])
+                            rec = _normalize_item_result(item, raw_out[0])
                         except Exception as exc:  # noqa: BLE001
-                            results[orig_idx] = {
+                            retry_exc = exc
+                            rec = {
                                 "block_id": item["block_id"],
                                 "status": "failed",
                                 "translation": None,
                                 "error": str(exc),
                             }
+                        rec["attempts"] = item_attempts[orig_idx]
+                        results[orig_idx] = rec
+                        should_requeue = False
+                        requeue_delay = 0.0
+                        if item_retry_counts[orig_idx] < self.max_retries:
+                            if rec["status"] in ("missing", "empty"):
+                                should_requeue = True
+                            elif retry_exc is not None:
+                                dec = self.retry_policy.decide(retry_exc, item_retry_counts[orig_idx] - 1)
+                                if dec.retryable:
+                                    should_requeue = True
+                                    requeue_delay = dec.delay_s
+                        if should_requeue:
+                            if requeue_delay > 0:
+                                time.sleep(requeue_delay)
+                            item_retry_counts[orig_idx] += 1
+                            retried_indices.add(orig_idx)
+                            with self._metrics_lock:
+                                self.stats["retries"] += 1
+                            rf = pool.submit(
+                                self._run_batch,
+                                [item],
+                                target_lang,
+                                model,
+                                doc_context,
+                                0,
+                            )
+                            pending[rf] = ("item_retry", orig_idx)
 
         t_end = time.perf_counter()
         self.stats["retry_s"] = (

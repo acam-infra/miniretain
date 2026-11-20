@@ -498,16 +498,18 @@ def _find_compiled_overflow_blocks(
         # Build spatial index of placed blocks on this page
         for blk in opage.get_text("dict").get("blocks", []):
             for line in blk.get("lines", []):
+                line_compact = "".join("".join((s.get("text") or "") for s in line.get("spans", [])).split())
+                line_probe = line_compact[:12]
                 for span in line.get("spans", []):
                     sx0, sy0, sx1, sy1 = span["bbox"]
                     span_w = max(0.5, sx1 - sx0)
                     span_h = max(0.5, sy1 - sy0)
                     span_area = span_w * span_h
-                    # Primary match: pick placed block with highest horizontal/2D overlap.
-                    # This avoids cross-column misattribution when CJK opening punctuation
-                    # (e.g. "（") slightly overhangs left of its own column's rect.x0.
+                    # Primary match: pick placed block with highest text + 2D overlap.
+                    # Using full line_probe avoids misattributing short accent/symbol spans (e.g. "ˆ")
+                    # to an overlapping adjacent block that happens to share the same single glyph.
                     sp_compact = "".join((span.get("text") or "").split())
-                    sp_probe = sp_compact[:12]
+                    sp_probe = line_probe if len(line_probe) >= 3 else sp_compact[:12]
                     best = None
                     best_score: tuple[int, float, float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:

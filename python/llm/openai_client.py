@@ -11,37 +11,64 @@ import urllib.request
 
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+_EXEMPT_ECHO_ROLES = frozenset({"reference", "formula", "figure_label", "header_footer", "author_affiliation"})
+_PROTECTED_FRAGMENT_RE = re.compile(
+    r"⟪F\d+⟫"
+    r"|https?://\S+"
+    r"|\b[\w.+-]+@[\w-]+\.[\w.-]+\b"
+    r"|arXiv:\S+"
+    r"|§\s*\d+(?:\.\d+)*"
+    r"|[∗†‡§]"
+    r"|\[\d+(?:\s*[-–—,]\s*\d+)*\]",
+    re.IGNORECASE,
+)
+
+
+def _strip_protected_fragments(text: str) -> str:
+    """Remove protected tokens (URLs, emails, placeholders, section symbols, citations) before prose comparison."""
+    cleaned = _PROTECTED_FRAGMENT_RE.sub(" ", text or "")
+    return " ".join(cleaned.split())
 
 
 def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: str) -> bool:
-    """Detect when an LLM silently echoes a long English prose block unchanged for a CJK target."""
+    """Detect when an LLM silently echoes a long English prose block unchanged for a CJK target.
+
+    Preserved/non-prose roles are exempt by role. For prose roles, protected inline
+    fragments (URLs, emails, formula placeholders, arXiv IDs, section markers like §3,
+    citations) are stripped first so the remaining body prose is still checked.
+    """
     tl = (target_lang or "").lower()
     if not tl.startswith(("zh", "ja", "ko")):
         return False
-    if item.get("layout_role") in ("reference", "formula", "figure_label", "header_footer"):
+    if item.get("layout_role") in _EXEMPT_ECHO_ROLES:
         return False
     src = (item.get("text") or "").strip()
     if len(src) < 40 or _CJK_CHAR_RE.search(translation):
         return False
-    # Exempt emails, URLs/URL paths, placeholders, code listings, author/reference lines, and metric-dense table rows
-    if "@" in src or "http://" in src or "https://" in src or "⟪F" in src or "arXiv:" in src:
-        return False
+    # Exempt pure non-prose blocks (single-token URL paths, pseudocode, short code listings,
+    # pure author-initial lines, and metric-dense table rows).
     if re.search(r"[a-z0-9\-]+/[a-z0-9\-]+", src) and " " not in src.strip():
         return False
-    if any(ch in src for ch in "∗†‡§"):
-        return False
-    if len(re.findall(r"\b[A-Z]\.", src)) >= 3:
-        return False
-    if re.search(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(|(?:^|\s)(?:from\s+\S+\s+)?import\s+\S+|\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\"\"\"|'''", src):
-        return False
     if "←" in src and re.search(r"\b\d+:", src):
+        return False
+    if len(src) <= 220 and re.search(r"(?:^|\s)(?:from\s+\S+\s+)?import\s+\S+", src):
+        return False
+    if len(src) <= 160 and re.search(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b|\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(", src):
+        return False
+    if len(src) <= 240 and re.search(r"\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+|\"\"\"|'''", src):
+        return False
+    if len(src) <= 200 and len(re.findall(r"\b[A-Z]\.", src)) >= 3:
         return False
     toks = src.split()
     if len(toks) >= 6 and sum(1 for t in toks if any(c.isdigit() for c in t)) / len(toks) >= 0.30:
         return False
-    if len(_LATIN_WORD_RE.findall(src)) < 6:
+
+    # Strip protected inline fragments and check the remaining prose.
+    rem_src = _strip_protected_fragments(src)
+    if len(rem_src) < 40 or len(_LATIN_WORD_RE.findall(rem_src)) < 6:
         return False
-    return translation.strip() == src
+    rem_trans = _strip_protected_fragments(translation)
+    return translation.strip() == src or rem_trans == rem_src
 
 
 def _is_tailnet_or_local(url: str) -> bool:

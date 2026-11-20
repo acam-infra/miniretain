@@ -46,6 +46,8 @@ def _is_code_listing(text: str) -> bool:
         return False
     if "←" in s and re.search(r"\b\d+:", s):
         return True
+    if re.match(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(", s) and len(s) <= 220:
+        return True
     if _CODE_IMPORT_RE.search(s) and len(s) < 220:
         return True
     if len(s) <= 160 and (_CODE_SNAKE_RE.search(s) or _CODE_CALL_RE.search(s) or _CODE_ASSIGN_RE.search(s)):
@@ -55,8 +57,30 @@ def _is_code_listing(text: str) -> bool:
     return False
 
 
-def _is_author_affiliation(text: str, page_idx: int, seen_abstract: bool) -> bool:
-    if page_idx != 0 or seen_abstract:
+def _is_author_affiliation(
+    text: str,
+    page_idx: int,
+    seen_abstract: bool,
+    *,
+    bbox: list[float] | None = None,
+    page_h: float = 792.0,
+    abstract_y0: float | None = None,
+    font_size: float | None = None,
+    median_font: float = 10.0,
+) -> bool:
+    if page_idx != 0:
+        return False
+    # Never misclassify large title text as an author/affiliation line
+    if font_size and font_size >= median_font * 1.25:
+        return False
+    # Restrict to the geometric author region on page 0 (above Abstract, or top 35% of page)
+    if bbox is not None:
+        if abstract_y0 is not None:
+            if bbox[3] > abstract_y0 + 6.0:
+                return False
+        elif bbox[1] > page_h * 0.35:
+            return False
+    elif seen_abstract:
         return False
     s = text.strip()
     if not s or len(s) > 220:
@@ -234,7 +258,7 @@ def _assign_columns(blocks: list[dict], page_width: float) -> list[dict]:
             band.append(b)
             continue
         width = bbox[2] - bbox[0]
-        spans_center = bbox[0] < mid - 25.0 and bbox[2] > mid + 25.0 and width > page_width * 0.48
+        spans_center = bbox[0] < mid - 25.0 and bbox[2] > mid + 25.0 and width > page_width * 0.42
         if spans_center:
             _flush_band(band)
             band = []
@@ -272,6 +296,17 @@ def normalize_pages(
         median_font = statistics.median(font_sizes) if font_sizes else 10.0
 
         ordered = _assign_columns(list(raw_blocks), page_w)
+        abstract_y0: float | None = None
+        if page_idx == 0:
+            abs_ys = [
+                float(rb["bbox"][1])
+                for rb in ordered
+                if rb.get("bbox")
+                and re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", (rb.get("text") or "").strip(), re.IGNORECASE)
+                and len((rb.get("text") or "").strip()) < 120
+            ]
+            if abs_ys:
+                abstract_y0 = min(abs_ys)
         norm_blocks: list[dict] = []
 
         for order_idx, b in enumerate(ordered):
@@ -331,6 +366,16 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "figure_label"
                 redact_source = False
+            elif (
+                bbox
+                and len(text) <= 45
+                and ((font_size and font_size <= 5.5) or (bbox[3] - bbox[1]) <= 6.0)
+            ):
+                # Microscopic chart/plot axis/legend labels below Typst's minimum readable font floor
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "tiny_figure_label"
+                redact_source = False
             elif _is_formula_text(text, is_math_font=is_math_font):
                 layout_role = "formula"
                 translate = False
@@ -362,14 +407,23 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "code_listing"
                 redact_source = False
-            elif _is_author_affiliation(text, page_idx, seen_abstract):
+            elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
+                layout_role = "title"
+                translate = True
+            elif _is_author_affiliation(
+                text,
+                page_idx,
+                seen_abstract,
+                bbox=bbox,
+                page_h=page_h,
+                abstract_y0=abstract_y0,
+                font_size=font_size,
+                median_font=median_font,
+            ):
                 layout_role = "header_footer"
                 translate = False
                 preserve_reason = "author_affiliation"
                 redact_source = False
-            elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
-                layout_role = "title"
-                translate = True
             elif _HEADING_RE.match(text) and len(text) < 120:
                 layout_role = "heading"
                 if re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", text, re.IGNORECASE):
