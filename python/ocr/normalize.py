@@ -27,7 +27,7 @@ _NUMERIC_TICK_RE = re.compile(
     r"|(?:[+\-−]?\d+(?:[.,]\d+)?[kKmM%]?(?:\s+|$)){2,8}"
     r")$"
 )
-_MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεθλμσφψωΔΣΠΩ")
+_MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεζηθκλμνξπρστυφχψωΔΣΠΩ·−∼⊂⊆∪∩∀∃∝‖⟨⟩")
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _AFFIL_KW_RE = re.compile(
@@ -46,15 +46,17 @@ def _is_code_listing(text: str) -> bool:
     s = text.strip()
     if not s or len(s) > 800:
         return False
-    if "←" in s and re.search(r"\b\d+:", s):
+    # Strip inline/display LaTeX math spans so LaTeX subscripts like \theta_b are never mistaken for snake_case code.
+    s_nomath = re.sub(r"\$\$[^$]+\$\$|\$[^$\n]+\$|\\\([^\n]+?\\\)|\\\[[\s\S]+?\\\]", " ", s)
+    if "←" in s_nomath and re.search(r"\b\d+:", s_nomath):
         return True
-    if re.match(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(", s) and len(s) <= 220:
+    if re.match(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(", s_nomath) and len(s) <= 220:
         return True
-    if _CODE_IMPORT_RE.search(s) and len(s) < 220:
+    if _CODE_IMPORT_RE.search(s_nomath) and len(s) < 220:
         return True
-    if len(s) <= 160 and (_CODE_SNAKE_RE.search(s) or _CODE_CALL_RE.search(s) or _CODE_ASSIGN_RE.search(s)):
+    if len(s) <= 160 and (_CODE_SNAKE_RE.search(s_nomath) or _CODE_CALL_RE.search(s_nomath) or _CODE_ASSIGN_RE.search(s_nomath)):
         return True
-    if re.search(r"\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", s) or '"""' in s or "'''" in s:
+    if re.search(r"\b[a-z_]\w*\s*:\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", s_nomath) or '"""' in s_nomath or "'''" in s_nomath:
         return True
     return False
 
@@ -199,6 +201,8 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
     s = text.strip()
     if not s:
         return False
+    if re.match(r"^\(\d+(?:\.\d+)*\)$", s):
+        return True
     if _BIG_O_ONLY_RE.match(s):
         return True
     if is_math_font and len(s) < 120:
@@ -289,6 +293,7 @@ def normalize_pages(
         page_w = float(page.get("width") or 612.0)
         page_h = float(page.get("height") or 792.0)
         figure_regions = page.get("figure_regions") or []
+        table_regions = page.get("table_regions") or []
         is_scanned = bool(page.get("is_scanned", False))
         ocr_reliable = bool(page.get("ocr_reliable", True))
         raw_blocks = page.get("blocks") or []
@@ -350,6 +355,12 @@ def normalize_pages(
             elif _CAPTION_RE.match(text):
                 layout_role = "caption"
                 translate = True
+            elif bbox and any(_overlap_ratio(bbox, tr, pad=3.0) >= 0.5 for tr in table_regions):
+                # Table header / cell inside a detected bordered or booktabs table region
+                layout_role = "table"
+                translate = False
+                preserve_reason = "table"
+                redact_source = False
             elif bbox and any(_overlap_ratio(bbox, fr, pad=4.0) >= 0.5 for fr in figure_regions):
                 # Inside a figure/diagram region and NOT a caption
                 if len(text) <= 120 or (bbox[2] - bbox[0]) < page_w * 0.35:
@@ -640,6 +651,7 @@ def normalize_pages(
             "is_scanned": is_scanned,
             "ocr_reliable": ocr_reliable,
             "figure_regions": figure_regions,
+            "table_regions": table_regions,
             "blocks": norm_blocks,
         })
 

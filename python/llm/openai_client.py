@@ -11,7 +11,7 @@ import urllib.request
 
 _CJK_CHAR_RE = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 _LATIN_WORD_RE = re.compile(r"[A-Za-z]{3,}")
-_EXEMPT_ECHO_ROLES = frozenset({"reference", "formula", "figure_label", "header_footer", "author_affiliation"})
+_EXEMPT_ECHO_ROLES = frozenset({"reference", "formula", "figure_label", "header_footer", "author_affiliation", "table"})
 _PROTECTED_FRAGMENT_RE = re.compile(
     r"⟪F\d+⟫"
     r"|https?://\S+"
