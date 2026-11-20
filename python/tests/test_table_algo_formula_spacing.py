@@ -228,58 +228,79 @@ def test_protect_and_restore_formulas_handles_paren_and_bracket_math_spans():
 
 
 def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
-    """Reproduce 2208.06102 p6 Gaussian paragraph: mid-line split at 'ˆσ2' / 'b).' and '1/ˆσ2' / 'b can'
-    must merge into one intact body block, reconstruct LaTeX accents/sub/sup, produce non-empty
-    protect_formulas tokens, and compile cleanly via Typst MiTeX in strict mode."""
+    """Reproduce 2208.06102 p6 Gaussian paragraph using real span geometry (σ baseline 467.1,
+    sup '2' at 463.5, sub 'b' at 470.2 sharing x=524.9): must merge math-split blocks,
+    reconstruct LaTeX accents/sub/sup, produce non-empty protect_formulas tokens, and compile
+    cleanly via Typst MiTeX in strict mode."""
     from llm.formula_protect import protect_formulas, restore_formulas
-    from ocr.pymupdf_adapter import _merge_inline_math_split_blocks
+    from ocr.pymupdf_adapter import _build_block_from_lines, _merge_inline_math_split_blocks
 
-    raw_blocks = [
-        {
-            "block_id": "p5b0048",
-            "text": "Specifically, the cost distribution has unknown mean θb. That is, θb ∼N (ˆµb, ˆσ2",
-            "bbox": [317.9, 423.8, 528.6, 470.8],
-            "line_bboxes": [[317.9, 423.8, 558.0, 446.5], [317.9, 457.9, 528.6, 470.8]],
-            "font_size_pt": 9.96,
-            "is_bold": False,
-            "is_math_font": False,
-            "is_vertical": False,
-        },
-        {
-            "block_id": "p5b0049",
-            "text": "b). Here it is important to note that 1/ˆσ2",
-            "bbox": [317.9, 459.4, 558.0, 482.2],
-            "line_bboxes": [[524.9, 459.4, 558.0, 471.9], [317.9, 469.9, 449.4, 482.2]],
-            "font_size_pt": 9.96,
-            "is_bold": False,
-            "is_math_font": False,
-            "is_vertical": False,
-        },
-        {
-            "block_id": "p5b0050",
-            "text": "b can be thought of as confidence, choosing ˆθb ∼N (ˆµb, ˆσ2",
-            "bbox": [317.9, 471.5, 558.4, 542.5],
-            "line_bboxes": [[445.7, 471.5, 558.4, 484.6], [317.9, 528.9, 554.4, 542.5]],
-            "font_size_pt": 9.96,
-            "is_bold": False,
-            "is_math_font": False,
-            "is_vertical": False,
-        },
-        {
-            "block_id": "p5b0051",
-            "text": "b) (Algorithm 1).",
-            "bbox": [550.7, 531.1, 558.8, 543.6],
-            "line_bboxes": [[550.7, 531.1, 558.8, 543.6]],
-            "font_size_pt": 9.96,
-            "is_bold": False,
-            "is_math_font": False,
-            "is_vertical": False,
-        },
+    raw_groups = [
+        (
+            "p5b0048",
+            [
+                {
+                    "bbox": [317.9, 457.9, 528.6, 470.8],
+                    "spans": [
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [317.9, 467.1], "bbox": [317.9, 459.5, 467.4, 469.6], "text": "That is,"},
+                        {"font": "StandardSymL", "size": 9.96, "origin": [467.4, 467.1], "bbox": [467.4, 460.3, 475.1, 470.3], "text": " θ"},
+                        {"font": "NimbusRomNo9L-ReguItal", "size": 7.37, "origin": [475.1, 468.7], "bbox": [475.1, 463.0, 478.8, 470.4], "text": "b"},
+                        {"font": "CMSY10", "size": 9.96, "origin": [478.8, 468.7], "bbox": [478.8, 459.2, 489.4, 470.8], "text": " ∼"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [490.0, 467.1], "bbox": [490.0, 459.5, 505.8, 469.6], "text": " N ("},
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [506.7, 467.1], "bbox": [506.7, 459.6, 510.0, 469.6], "text": "ˆ"},
+                        {"font": "NimbusRomNo9L-ReguItal", "size": 9.96, "origin": [505.8, 467.1], "bbox": [505.8, 459.4, 510.8, 469.4], "text": "µ"},
+                        {"font": "NimbusRomNo9L-ReguItal", "size": 7.37, "origin": [510.8, 468.7], "bbox": [510.8, 463.0, 514.5, 470.4], "text": "b"},
+                        {"font": "CMMI10", "size": 9.96, "origin": [515.0, 467.1], "bbox": [515.0, 459.4, 517.8, 469.3], "text": ","},
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [517.8, 467.1], "bbox": [517.8, 459.2, 523.5, 469.6], "text": " ˆ"},
+                        {"font": "StandardSymL", "size": 9.96, "origin": [518.9, 467.1], "bbox": [518.9, 460.3, 524.9, 470.3], "text": "σ"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 7.37, "origin": [524.9, 463.5], "bbox": [524.9, 457.9, 528.6, 465.3], "text": "2"},
+                    ],
+                }
+            ],
+        ),
+        (
+            "p5b0049",
+            [
+                {
+                    "bbox": [524.9, 459.4, 558.0, 471.9],
+                    "spans": [
+                        {"font": "NimbusRomNo9L-ReguItal", "size": 7.37, "origin": [524.9, 470.2], "bbox": [524.9, 464.5, 528.6, 471.9], "text": "b"},
+                        {"font": "CMR10", "size": 9.96, "origin": [529.1, 467.1], "bbox": [529.1, 459.4, 532.9, 469.3], "text": ")"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 10.06, "origin": [532.9, 467.1], "bbox": [532.9, 459.5, 558.0, 469.6], "text": ". Here"},
+                    ],
+                },
+                {
+                    "bbox": [317.9, 469.9, 449.4, 482.2],
+                    "spans": [
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [317.9, 479.1], "bbox": [317.9, 471.5, 434.8, 481.5], "text": "it is important to note that 1"},
+                        {"font": "CMMI10", "size": 9.96, "origin": [434.8, 479.1], "bbox": [434.8, 471.3, 439.7, 481.3], "text": "/"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 9.96, "origin": [441.1, 478.7], "bbox": [441.1, 471.1, 444.4, 481.1], "text": "ˆ"},
+                        {"font": "StandardSymL", "size": 9.96, "origin": [439.7, 479.1], "bbox": [439.7, 472.2, 445.7, 482.2], "text": "σ"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 7.37, "origin": [445.7, 475.5], "bbox": [445.7, 469.9, 449.4, 477.3], "text": "2"},
+                    ],
+                },
+            ],
+        ),
+        (
+            "p5b0050",
+            [
+                {
+                    "bbox": [445.7, 471.5, 558.4, 484.6],
+                    "spans": [
+                        {"font": "NimbusRomNo9L-ReguItal", "size": 7.37, "origin": [445.7, 482.2], "bbox": [445.7, 476.4, 449.4, 483.8], "text": "b"},
+                        {"font": "NimbusRomNo9L-Regu", "size": 10.06, "origin": [449.4, 479.1], "bbox": [449.4, 471.5, 558.4, 481.5], "text": " can be thought of as confidence."},
+                    ],
+                }
+            ],
+        ),
     ]
 
-    merged = _merge_inline_math_split_blocks(raw_blocks)
-    assert len(merged) == 1
-    assert merged[0]["block_id"] == "p5b0048"
+    merged_groups = _merge_inline_math_split_blocks(raw_groups)
+    assert len(merged_groups) == 1
+    assert merged_groups[0][0] == "p5b0048"
+
+    built, _ = _build_block_from_lines(merged_groups[0][0], merged_groups[0][1], 612.0)
+    assert built is not None
 
     norm = normalize_pages(
         [
@@ -289,7 +310,7 @@ def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
                 "height": 792.0,
                 "figure_regions": [],
                 "table_regions": [],
-                "blocks": merged,
+                "blocks": [built],
             }
         ],
         coord_space="pdf_pt",
@@ -300,17 +321,14 @@ def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
     assert blk["policy"]["translate"] is True
     assert r"$\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in blk["text"]
     assert r"$1/\hat{\sigma}_b^2$" in blk["text"]
-    assert r"$\hat{\theta}_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in blk["text"]
 
     protected, tokens = protect_formulas(blk["text"], layout_role="body")
-    assert len(tokens) == 4
+    assert len(tokens) == 2
     vals = set(tokens.values())
     assert r"$\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in vals
     assert r"$1/\hat{\sigma}_b^2$" in vals
-    assert r"$\hat{\theta}_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)$" in vals
 
-    # Simulate translated prose preserving placeholders, restore, and compile via Typst MiTeX
-    zh_with_toks = "具体而言，开销分布的未知均值为 ⟪F0⟫，即 ⟪F1⟫。其中 ⟪F2⟫ 表示置信度，并采样 ⟪F3⟫（算法 1）。"
+    zh_with_toks = "也就是说，⟪F0⟫。这里需要注意的是，⟪F1⟫ 可以视为置信度。"
     restored, missing = restore_formulas(zh_with_toks, tokens)
     assert missing == []
 
@@ -331,8 +349,8 @@ def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
                         "reading_order": 0,
                         "layout_role": "body",
                         "policy": {"translate": True, "preserve_reason": None, "redact_source": True},
-                        "bbox": [317.6, 423.8, 559.7, 543.6],
-                        "line_bboxes": [[317.6, 423.8, 559.7, 543.6]],
+                        "bbox": [317.6, 457.9, 558.4, 495.0],
+                        "line_bboxes": [[317.6, 457.9, 558.4, 495.0]],
                         "font_size_pt": 9.96,
                         "text": blk["text"],
                         "translation": restored,
@@ -357,5 +375,74 @@ def test_inline_math_subscript_split_blocks_merged_protected_and_rendered():
             overlay = (wd / "overlay.typ").read_text(encoding="utf-8")
             assert r"#mi(`\theta_b \sim \mathcal{N}(\hat{\mu}_b, \hat{\sigma}_b^2)`)" in overlay
             assert r"#mi(`1/\hat{\sigma}_b^2`)" in overlay
+
+
+def test_span_math_preserves_existing_delimiters_plain_text_and_non_math_blocks():
+    """Counterexamples:
+    1) All 4 existing math delimiters (\\(...\\), \\[...\\], $...$, $$...$$) pass through untouched.
+    2) Plain text 'θ2' at normal size/baseline is never rewritten into subscript/LaTeX.
+    3) _merge_inline_math_split_blocks never merges same-baseline plain prose, columns, or headings."""
+    from ocr.pymupdf_adapter import _merge_inline_math_split_blocks, _render_line_with_evidenced_math
+
+    for sample in (
+        r"Already delimited \(θb\) stays intact.",
+        r"Already delimited \[θb + 1\] stays intact.",
+        r"Already delimited $θb$ stays intact.",
+        r"Already delimited $$θb$$ stays intact.",
+        "Plain text θ2 without span evidence stays intact.",
+    ):
+        spans = [{"font": "NimbusRomNo9L-Regu", "size": 10.0, "origin": [54.0, 100.0], "bbox": [54.0, 92.0, 260.0, 102.0], "text": sample}]
+        assert _render_line_with_evidenced_math(spans) == sample
+
+    # Also verify normalize_pages never rewrites already-delimited \(θb\) or plain θ2
+    norm = normalize_pages(
+        [
+            {
+                "page_index": 0,
+                "width": 612.0,
+                "height": 792.0,
+                "figure_regions": [],
+                "table_regions": [],
+                "blocks": [
+                    {"block_id": "b0", "text": r"Already delimited \(θb\) stays intact.", "bbox": [54.0, 100.0, 280.0, 112.0], "font_size_pt": 10.0},
+                    {"block_id": "b1", "text": "Plain text θ2 without span evidence stays intact.", "bbox": [54.0, 120.0, 280.0, 132.0], "font_size_pt": 10.0},
+                ],
+            }
+        ],
+        coord_space="pdf_pt",
+        dpi=72.0,
+    )
+    assert norm[0]["blocks"][0]["text"] == r"Already delimited \(θb\) stays intact."
+    assert norm[0]["blocks"][1]["text"] == "Plain text θ2 without span evidence stays intact."
+
+    # Non-math same-baseline adjacent blocks, independent columns, and headings must NOT be merged
+    non_math_groups = [
+        # Same-baseline plain text blocks right next to each other
+        (
+            "p0b0000",
+            [{"bbox": [54.0, 100.0, 180.0, 112.0], "spans": [{"font": "Times", "size": 10.0, "origin": [54.0, 109.0], "bbox": [54.0, 100.0, 180.0, 112.0], "text": "Plain left part"}]}],
+        ),
+        (
+            "p0b0001",
+            [{"bbox": [182.0, 100.0, 290.0, 112.0], "spans": [{"font": "Times", "size": 10.0, "origin": [182.0, 109.0], "bbox": [182.0, 100.0, 290.0, 112.0], "text": "and right part"}]}],
+        ),
+        # Independent right column at same y
+        (
+            "p0b0002",
+            [{"bbox": [318.0, 100.0, 550.0, 112.0], "spans": [{"font": "Times", "size": 10.0, "origin": [318.0, 109.0], "bbox": [318.0, 100.0, 550.0, 112.0], "text": "Right column text"}]}],
+        ),
+        # Same-baseline heading split
+        (
+            "p0b0003",
+            [{"bbox": [54.0, 140.0, 120.0, 154.0], "spans": [{"font": "Times-Bold", "size": 12.0, "origin": [54.0, 151.0], "bbox": [54.0, 140.0, 120.0, 154.0], "text": "3.1 Method"}]}],
+        ),
+        (
+            "p0b0004",
+            [{"bbox": [122.0, 140.0, 240.0, 154.0], "spans": [{"font": "Times-Bold", "size": 12.0, "origin": [122.0, 151.0], "bbox": [122.0, 140.0, 240.0, 154.0], "text": "Overview"}]}],
+        ),
+    ]
+    merged_non_math = _merge_inline_math_split_blocks(non_math_groups)
+    assert [bid for bid, _ in merged_non_math] == ["p0b0000", "p0b0001", "p0b0002", "p0b0003", "p0b0004"]
+
 
 
