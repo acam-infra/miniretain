@@ -211,17 +211,79 @@ def _split_math_segments(text: str) -> list[tuple[str, str]]:
     return out
 
 
+_CJK_PUNCT = set("，。、；：？！（）「」《》【】“”‘’—…·")
+_INLINE_MATH_GAP = "#h(0.18em, weak: true)"
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return (
+        ("\u4e00" <= ch <= "\u9fff")
+        or ("\u3040" <= ch <= "\u30ff")
+        or ("\uac00" <= ch <= "\ud7af")
+    )
+
+
+def _strip_trailing_hspaces(s: str) -> str:
+    """Strip trailing spaces/tabs while preserving explicit newlines."""
+    return s.rstrip(" \t")
+
+
+def _strip_leading_hspaces(s: str) -> str:
+    """Strip leading spaces/tabs while preserving explicit newlines."""
+    return s.lstrip(" \t")
+
+
 def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     if not use_mitex or ("$" not in segment and r"\(" not in segment and r"\[" not in segment):
         return f"#{typst_str_literal(segment)}"
+    raw_segs = _split_math_segments(segment)
+    # Normalize spacing around inline math in this single shared expression builder
+    # so fit_probe.typ measurement and overlay.typ placement stay 100% consistent:
+    # - Between CJK char and #mi(): replace arbitrary/stretched ASCII spaces with weak 0.18em gap
+    # - Between CJK punctuation (or explicit newline) and #mi(): keep tight (no stray space)
+    # - Between English/ASCII words and #mi(): preserve necessary word spaces
+    segs: list[list[str]] = [[k, c] for k, c in raw_segs]
     parts: list[str] = []
-    for kind, content in _split_math_segments(segment):
+    n = len(segs)
+    for idx, (kind, content) in enumerate(segs):
         if kind == "inline_math":
+            need_left_gap = False
+            if idx > 0 and segs[idx - 1][0] == "text":
+                prev_raw = segs[idx - 1][1]
+                prev_stripped = _strip_trailing_hspaces(prev_raw)
+                if prev_stripped:
+                    last_ch = prev_stripped[-1]
+                    if _is_cjk_char(last_ch):
+                        # Replace trailing spaces (if any) on the previously emitted text part
+                        if parts:
+                            parts[-1] = f"#{typst_str_literal(prev_stripped)}"
+                        need_left_gap = True
+                    elif last_ch in _CJK_PUNCT or last_ch == "\n":
+                        if parts:
+                            parts[-1] = f"#{typst_str_literal(prev_stripped)}"
+                elif prev_raw and not prev_raw.strip(" \t"):
+                    # Pure horizontal whitespace between something and inline_math
+                    pass
+            if need_left_gap:
+                parts.append(_INLINE_MATH_GAP)
             parts.append(f"#mi({_typst_raw_literal(content)})")
+            if idx + 1 < n and segs[idx + 1][0] == "text":
+                nxt_raw = segs[idx + 1][1]
+                nxt_stripped = _strip_leading_hspaces(nxt_raw)
+                if nxt_stripped:
+                    first_ch = nxt_stripped[0]
+                    if _is_cjk_char(first_ch):
+                        parts.append(_INLINE_MATH_GAP)
+                        segs[idx + 1][1] = nxt_stripped
+                    elif first_ch in _CJK_PUNCT or first_ch == "\n":
+                        segs[idx + 1][1] = nxt_stripped
         elif kind == "display_math":
-            parts.append(f"#mitex({_typst_raw_literal(content)})")
+            parts.append(
+                f"#block(above: 0.45em, below: 0.45em, breakable: false)[#mitex({_typst_raw_literal(content)})]"
+            )
         else:
-            parts.append(f"#{typst_str_literal(content)}")
+            if content:
+                parts.append(f"#{typst_str_literal(content)}")
     return "".join(parts) if parts else '""'
 
 

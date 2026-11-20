@@ -126,10 +126,89 @@ def _build_block_from_lines(
     }, len(text)
 
 
+def _extract_table_regions(
+    page: pymupdf.Page, drawing_rects: list[list[float]]
+) -> list[list[float]]:
+    """Detect bordered and minimal-border (booktabs) table regions on a digital PDF page.
+
+    Combines PyMuPDF's native `find_tables()` (multi-row, multi-column) with a
+    conservative horizontal-rule booktabs detector (>=3 aligned horizontal rules
+    with a compact header band) so borderless-side academic tables are preserved
+    without swallowing adjacent column prose.
+    """
+    pw = float(page.rect.width)
+    ph = float(page.rect.height)
+    regions: list[list[float]] = []
+
+    try:
+        tf = page.find_tables()
+        for t in getattr(tf, "tables", None) or []:
+            if getattr(t, "row_count", 0) < 2 or getattr(t, "col_count", 0) < 2:
+                continue
+            tb = [float(v) for v in t.bbox]
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            if tw >= 60.0 and 20.0 <= th < ph * 0.85:
+                regions.append(tb)
+    except Exception:
+        pass
+
+    # Booktabs / minimal-border table detector: group aligned horizontal rules.
+    hlines = [
+        r for r in drawing_rects
+        if (r[2] - r[0]) >= 60.0 and (r[3] - r[1]) <= 3.0 and (r[2] - r[0]) <= pw * 0.96
+    ]
+    groups: list[list[list[float]]] = []
+    for r in sorted(hlines, key=lambda x: (x[1], x[0])):
+        placed = False
+        for g in groups:
+            gx0 = g[0][0]
+            gx1 = g[0][2]
+            if abs(r[0] - gx0) <= 10.0 and abs(r[2] - gx1) <= 10.0:
+                if r[1] - g[-1][1] <= 180.0:
+                    g.append(r)
+                    placed = True
+                    break
+        if not placed:
+            groups.append([r])
+
+    for g in groups:
+        # Collapse near-duplicate double rules (within 4pt vertically)
+        ys: list[float] = []
+        for r in g:
+            if not ys or abs(r[1] - ys[-1]) > 4.0:
+                ys.append(r[1])
+        if len(ys) < 3:
+            continue
+        # Booktabs tables have a compact header band between toprule and midrule (<= 45pt)
+        if (ys[1] - ys[0]) > 45.0:
+            continue
+        box = [
+            min(r[0] for r in g),
+            min(r[1] for r in g),
+            max(r[2] for r in g),
+            max(r[3] for r in g),
+        ]
+        th = box[3] - box[1]
+        if not (24.0 <= th <= ph * 0.75):
+            continue
+        # Skip if already covered by a find_tables() region
+        already = any(
+            abs(box[0] - er[0]) <= 15.0
+            and abs(box[1] - er[1]) <= 15.0
+            and abs(box[2] - er[2]) <= 15.0
+            and abs(box[3] - er[3]) <= 15.0
+            for er in regions
+        )
+        if not already:
+            regions.append(box)
+
+    return regions
+
+
 def _extract_page_blocks(
     page: pymupdf.Page, *, scanned_char_threshold: int = 20
-) -> tuple[list[dict], list[list[float]], bool]:
-    """Extract paragraph/line blocks and figure regions from a digital PDF page."""
+) -> tuple[list[dict], list[list[float]], list[list[float]], bool]:
+    """Extract paragraph/line blocks, figure regions, and table regions from a digital PDF page."""
     d = page.get_text("dict")
     raw_blocks = d.get("blocks", [])
     drawing_rects = [list(dr["rect"]) for dr in page.get_drawings() if dr.get("rect")]
@@ -137,6 +216,7 @@ def _extract_page_blocks(
     figure_regions = cluster_figure_regions(
         drawing_rects, image_rects, page.rect.width, page.rect.height
     )
+    table_regions = _extract_table_regions(page, drawing_rects)
 
     blocks: list[dict] = []
     total_chars = 0
@@ -154,7 +234,7 @@ def _extract_page_blocks(
 
     is_scanned = total_chars < scanned_char_threshold and len(image_rects) > 0
     blocks = _merge_split_references(blocks)
-    return blocks, figure_regions, is_scanned
+    return blocks, figure_regions, table_regions, is_scanned
 
 
 def _merge_split_references(blocks: list[dict]) -> list[dict]:
@@ -217,7 +297,7 @@ class PyMuPDFOCRProvider(OCRProvider):
         raw_pages: list[dict] = []
         try:
             for page in doc:
-                blocks, figure_regions, is_scanned = _extract_page_blocks(
+                blocks, figure_regions, table_regions, is_scanned = _extract_page_blocks(
                     page, scanned_char_threshold=self.scanned_char_threshold
                 )
                 raw_pages.append({
@@ -225,6 +305,7 @@ class PyMuPDFOCRProvider(OCRProvider):
                     "width": float(page.rect.width),
                     "height": float(page.rect.height),
                     "figure_regions": figure_regions,
+                    "table_regions": table_regions,
                     "is_scanned": is_scanned,
                     "ocr_reliable": not is_scanned,
                     "blocks": blocks,

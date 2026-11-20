@@ -27,7 +27,7 @@ _NUMERIC_TICK_RE = re.compile(
     r"|(?:[+\-−]?\d+(?:[.,]\d+)?[kKmM%]?(?:\s+|$)){2,8}"
     r")$"
 )
-_MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεθλμσφψωΔΣΠΩ")
+_MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεζηθκλμνξπρστυφχψωΔΣΠΩ·−∼⊂⊆∪∩∀∃∝‖⟨⟩")
 _MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _AFFIL_KW_RE = re.compile(
@@ -289,6 +289,7 @@ def normalize_pages(
         page_w = float(page.get("width") or 612.0)
         page_h = float(page.get("height") or 792.0)
         figure_regions = page.get("figure_regions") or []
+        table_regions = page.get("table_regions") or []
         is_scanned = bool(page.get("is_scanned", False))
         ocr_reliable = bool(page.get("ocr_reliable", True))
         raw_blocks = page.get("blocks") or []
@@ -350,6 +351,12 @@ def normalize_pages(
             elif _CAPTION_RE.match(text):
                 layout_role = "caption"
                 translate = True
+            elif bbox and any(_overlap_ratio(bbox, tr, pad=3.0) >= 0.5 for tr in table_regions):
+                # Table header / cell inside a detected bordered or booktabs table region
+                layout_role = "table"
+                translate = False
+                preserve_reason = "table"
+                redact_source = False
             elif bbox and any(_overlap_ratio(bbox, fr, pad=4.0) >= 0.5 for fr in figure_regions):
                 # Inside a figure/diagram region and NOT a caption
                 if len(text) <= 120 or (bbox[2] - bbox[0]) < page_w * 0.35:
@@ -640,6 +647,7 @@ def normalize_pages(
             "is_scanned": is_scanned,
             "ocr_reliable": ocr_reliable,
             "figure_regions": figure_regions,
+            "table_regions": table_regions,
             "blocks": norm_blocks,
         })
 
