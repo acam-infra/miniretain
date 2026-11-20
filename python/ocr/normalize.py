@@ -368,16 +368,6 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "figure_label"
                 redact_source = False
-            elif (
-                bbox
-                and len(text) <= 45
-                and ((font_size and font_size <= 5.5) or (bbox[3] - bbox[1]) <= 6.0)
-            ):
-                # Microscopic chart/plot axis/legend labels below Typst's minimum readable font floor
-                layout_role = "figure_label"
-                translate = False
-                preserve_reason = "tiny_figure_label"
-                redact_source = False
             elif _is_formula_text(text, is_math_font=is_math_font):
                 layout_role = "formula"
                 translate = False
@@ -387,6 +377,20 @@ def normalize_pages(
                 layout_role = "figure_label"
                 translate = False
                 preserve_reason = "numeric_axis_tick"
+                redact_source = False
+            elif (
+                bbox
+                and len(text) <= 45
+                and (
+                    (font_size and font_size <= 5.5)
+                    or (bbox[3] - bbox[1]) <= 6.0
+                    or (font_size and font_size <= 6.5 and (bbox[2] - bbox[0]) <= 60.0)
+                )
+            ):
+                # Microscopic chart/plot axis/legend labels below Typst's minimum readable font floor
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "tiny_figure_label"
                 redact_source = False
             elif bbox and (bbox[1] < page_h * 0.045 or bbox[3] > page_h * 0.96) and len(text) < 80:
                 layout_role = "header_footer"
