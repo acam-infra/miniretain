@@ -138,3 +138,40 @@ func TestJobDefaultsAndPerRequestOverrides(t *testing.T) {
 		t.Fatalf("expected render omitted when request passes render:null, got %+v", j2.Params["render"])
 	}
 }
+
+func TestFailedJobResultReturnsStageAndDiagnostics(t *testing.T) {
+	store := job.NewStore()
+	j := &job.Job{
+		ID:     "fail-diag-1",
+		Status: job.Failed,
+		Stage:  "llm",
+		Error:  "llm stage failed: p1/p0b0011: untranslated verbatim echo [attempts=3]",
+		Result: map[string]any{
+			"llm": map[string]any{
+				"failed_stage":    "llm",
+				"critical_failed": 1,
+			},
+		},
+	}
+	if err := store.Create(j); err != nil {
+		t.Fatal(err)
+	}
+	h := New(store, nil, nil)
+	req := httptest.NewRequest(http.MethodGet, "/v1/jobs/fail-diag-1/result", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", rec.Code)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["stage"] != "llm" {
+		t.Fatalf("expected stage=llm in 409 body, got %+v", body)
+	}
+	resMap, ok := body["result"].(map[string]any)
+	if !ok || resMap["llm"] == nil {
+		t.Fatalf("expected llm diagnostics in 409 result body, got %+v", body)
+	}
+}

@@ -37,6 +37,8 @@ _CODE_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]*_[a-z0-9_]+\b")
 _CODE_CALL_RE = re.compile(r"\b[A-Za-z_]\w*\.[A-Za-z_]\w*\s*\(")
 _CODE_ASSIGN_RE = re.compile(r"^\s*(?:\d+\s+)?[A-Za-z_]\w*\s*=\s*[A-Za-z_]\w*\s*\(")
 _CODE_IMPORT_RE = re.compile(r"(?:^|\s)(?:from\s+[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*\s+import\s+|import\s+[A-Za-z_]\w*\s+as\s+)")
+_ALGO_FUNC_RE = re.compile(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(")
+_ALGO_IO_RE = re.compile(r"^(?:[A-Za-z0-9∗†‡]{1,3}\s+)?(?:Input|Output|Require|Ensure)\s*:")
 _APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\b|Supplementary\b|[A-Z]\.\s+[A-Z]\S*)", re.IGNORECASE)
 
 
@@ -45,6 +47,8 @@ def _is_code_listing(text: str) -> bool:
     if not s or len(s) > 800:
         return False
     if "←" in s and re.search(r"\b\d+:", s):
+        return True
+    if re.match(r"^(?:Function|Procedure|Algorithm)\s+[A-Za-z_]\w*\s*\(", s) and len(s) <= 220:
         return True
     if _CODE_IMPORT_RE.search(s) and len(s) < 220:
         return True
@@ -55,8 +59,30 @@ def _is_code_listing(text: str) -> bool:
     return False
 
 
-def _is_author_affiliation(text: str, page_idx: int, seen_abstract: bool) -> bool:
-    if page_idx != 0 or seen_abstract:
+def _is_author_affiliation(
+    text: str,
+    page_idx: int,
+    seen_abstract: bool,
+    *,
+    bbox: list[float] | None = None,
+    page_h: float = 792.0,
+    abstract_y0: float | None = None,
+    font_size: float | None = None,
+    median_font: float = 10.0,
+) -> bool:
+    if page_idx != 0:
+        return False
+    # Never misclassify large title text as an author/affiliation line
+    if font_size and font_size >= median_font * 1.25:
+        return False
+    # Restrict to the geometric author region on page 0 (above Abstract, or top 35% of page)
+    if bbox is not None:
+        if abstract_y0 is not None:
+            if bbox[3] > abstract_y0 + 6.0:
+                return False
+        elif bbox[1] > page_h * 0.35:
+            return False
+    elif seen_abstract:
         return False
     s = text.strip()
     if not s or len(s) > 220:
@@ -234,7 +260,7 @@ def _assign_columns(blocks: list[dict], page_width: float) -> list[dict]:
             band.append(b)
             continue
         width = bbox[2] - bbox[0]
-        spans_center = bbox[0] < mid - 25.0 and bbox[2] > mid + 25.0 and width > page_width * 0.48
+        spans_center = bbox[0] < mid - 25.0 and bbox[2] > mid + 25.0 and width > page_width * 0.42
         if spans_center:
             _flush_band(band)
             band = []
@@ -272,6 +298,17 @@ def normalize_pages(
         median_font = statistics.median(font_sizes) if font_sizes else 10.0
 
         ordered = _assign_columns(list(raw_blocks), page_w)
+        abstract_y0: float | None = None
+        if page_idx == 0:
+            abs_ys = [
+                float(rb["bbox"][1])
+                for rb in ordered
+                if rb.get("bbox")
+                and re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", (rb.get("text") or "").strip(), re.IGNORECASE)
+                and len((rb.get("text") or "").strip()) < 120
+            ]
+            if abs_ys:
+                abstract_y0 = min(abs_ys)
         norm_blocks: list[dict] = []
 
         for order_idx, b in enumerate(ordered):
@@ -341,6 +378,20 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "numeric_axis_tick"
                 redact_source = False
+            elif (
+                bbox
+                and len(text) <= 45
+                and (
+                    (font_size and font_size <= 5.5)
+                    or (bbox[3] - bbox[1]) <= 6.0
+                    or (font_size and font_size <= 6.5 and (bbox[2] - bbox[0]) <= 60.0)
+                )
+            ):
+                # Microscopic chart/plot axis/legend labels below Typst's minimum readable font floor
+                layout_role = "figure_label"
+                translate = False
+                preserve_reason = "tiny_figure_label"
+                redact_source = False
             elif bbox and (bbox[1] < page_h * 0.045 or bbox[3] > page_h * 0.96) and len(text) < 80:
                 layout_role = "header_footer"
                 translate = False
@@ -362,14 +413,23 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "code_listing"
                 redact_source = False
-            elif _is_author_affiliation(text, page_idx, seen_abstract):
+            elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
+                layout_role = "title"
+                translate = True
+            elif _is_author_affiliation(
+                text,
+                page_idx,
+                seen_abstract,
+                bbox=bbox,
+                page_h=page_h,
+                abstract_y0=abstract_y0,
+                font_size=font_size,
+                median_font=median_font,
+            ):
                 layout_role = "header_footer"
                 translate = False
                 preserve_reason = "author_affiliation"
                 redact_source = False
-            elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
-                layout_role = "title"
-                translate = True
             elif _HEADING_RE.match(text) and len(text) < 120:
                 layout_role = "heading"
                 if re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", text, re.IGNORECASE):
@@ -480,6 +540,44 @@ def normalize_pages(
                             "redact_source": False,
                         }
                         break
+
+        # Algorithm pseudocode Input/Output header preservation:
+        # Preserve structured Input/Output/Require/Ensure parameter lines immediately above
+        # preserved Function/Procedure/Algorithm headers in the same column so split math
+        # subscripts (e.g. "0 Output:") and overlapping header boxes stay intact as vector PDF.
+        algo_anchors = [
+            nb["bbox"]
+            for nb in norm_blocks
+            if not nb["policy"]["translate"]
+            and nb.get("bbox")
+            and _ALGO_FUNC_RE.match((nb.get("text") or "").strip())
+        ]
+        for ax0, ay0, ax1, _ay1 in algo_anchors:
+            above = [
+                nb
+                for nb in norm_blocks
+                if nb["policy"]["translate"]
+                and nb["layout_role"] == "body"
+                and nb.get("bbox")
+                and nb["bbox"][1] >= ay0 - 95.0
+                and nb["bbox"][3] <= ay0 + 2.0
+                and nb["bbox"][0] >= ax0 - 20.0
+                and nb["bbox"][0] <= ax1 + 40.0
+                and nb["bbox"][2] <= max(ax1 + 100.0, ax0 + page_w * 0.48)
+            ]
+            io_blocks = [
+                nb for nb in above if _ALGO_IO_RE.match((nb.get("text") or "").strip())
+            ]
+            if io_blocks:
+                top_io_y = min(nb["bbox"][1] for nb in io_blocks)
+                for nb in above:
+                    if nb["bbox"][1] >= top_io_y - 2.0:
+                        nb["layout_role"] = "figure_label"
+                        nb["policy"] = {
+                            "translate": False,
+                            "preserve_reason": "algorithm_io_header",
+                            "redact_source": False,
+                        }
 
         # Deduplicate/merge geometrically contained translatable child blocks (e.g. split footnotes)
         def _box_area(box: list[float]) -> float:

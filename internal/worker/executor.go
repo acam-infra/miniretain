@@ -93,6 +93,13 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 		return ctx.Err()
 	}
 
+	// Remove any stale result file from a previous /retry run so a crash before
+	// writing a fresh result never surfaces stale diagnostics from an earlier run.
+	resultPath := filepath.Join(wd, stage+".result.json")
+	if rmErr := os.Remove(resultPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("remove stale %s result: %w", stage, rmErr)
+	}
+
 	// The worker reads BOTH the spec and the schema; no defaults are hardcoded
 	// in Python either.
 	started := time.Now()
@@ -115,6 +122,22 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	}
 	out, err := cmd.CombinedOutput()
 	durMS := time.Since(started).Milliseconds()
+	if b, rerr := os.ReadFile(resultPath); rerr == nil {
+		var result map[string]any
+		if uerr := json.Unmarshal(b, &result); uerr == nil {
+			result["stage_wall_ms"] = durMS
+			e.Store.Update(j.ID, func(jj *job.Job) {
+				if jj.Result == nil {
+					jj.Result = map[string]any{}
+				}
+				jj.Result[stage] = result
+			})
+		} else if err == nil {
+			return fmt.Errorf("decode %s result: %w", stage, uerr)
+		}
+	} else if err == nil {
+		return fmt.Errorf("read %s result: %w", stage, rerr)
+	}
 	if err != nil {
 		tail := string(out)
 		if len(tail) > 800 {
@@ -122,23 +145,6 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 		}
 		return fmt.Errorf("python %s stage failed: %w: %s", stage, err, strings.TrimSpace(tail))
 	}
-
-	resultPath := filepath.Join(wd, stage+".result.json")
-	b, err := os.ReadFile(resultPath)
-	if err != nil {
-		return fmt.Errorf("read %s result: %w", stage, err)
-	}
-	var result map[string]any
-	if err := json.Unmarshal(b, &result); err != nil {
-		return fmt.Errorf("decode %s result: %w", stage, err)
-	}
-	result["stage_wall_ms"] = durMS
-	e.Store.Update(j.ID, func(jj *job.Job) {
-		if jj.Result == nil {
-			jj.Result = map[string]any{}
-		}
-		jj.Result[stage] = result
-	})
 	return nil
 }
 

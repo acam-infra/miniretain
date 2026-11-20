@@ -27,6 +27,15 @@ from llm.retry import RetryPolicy
 _SENTINEL_PREFIXES = ("<translation failed:", "<missing translation")
 
 
+class _BatchExecutionError(RuntimeError):
+    """Carries the underlying exception and the exact number of client.translate() calls made."""
+
+    def __init__(self, cause: Exception, attempts: int) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempts = attempts
+
+
 class LLMClient(ABC):
     name = "base"
 
@@ -143,7 +152,14 @@ class Scheduler:
             "retry_s": 0.0,
         }
 
-    def _run_batch(self, batch: list[dict], target_lang: str, model: str, doc_context: str = ""):
+    def _run_batch(
+        self,
+        batch: list[dict],
+        target_lang: str,
+        model: str,
+        doc_context: str = "",
+        max_transport_retries: int | None = None,
+    ):
         t0 = time.perf_counter()
         last: Exception | None = None
         payload_batch = (
@@ -151,18 +167,25 @@ class Scheduler:
             if (doc_context and batch)
             else batch
         )
-        for attempt in range(self.retry_policy.max_retries + 1):
+        retry_limit = (
+            self.retry_policy.max_retries
+            if max_transport_retries is None
+            else max(0, max_transport_retries)
+        )
+        actual_attempts = 0
+        for attempt in range(retry_limit + 1):
             self.retry_policy.wait_if_cooling_down()
             try:
                 with self.limiter.acquire():
                     with self._metrics_lock:
                         self.stats["requests"] += 1
+                    actual_attempts += 1
                     out = self.client.translate(payload_batch, target_lang, model, self.timeout_ms)
                 if len(out) != len(batch):
                     raise RuntimeError(
                         f"batch length mismatch: expected {len(batch)}, got {len(out)}"
                     )
-                return out, attempt, round(time.perf_counter() - t0, 3)
+                return out, actual_attempts, round(time.perf_counter() - t0, 3)
             except Exception as exc:  # noqa: BLE001 - classify and retry via policy
                 last = exc
                 decision = self.retry_policy.decide(exc, attempt)
@@ -173,15 +196,15 @@ class Scheduler:
                         self.stats["timeouts"] += 1
                 if decision.cooldown_s > 0:
                     self.retry_policy.note_cooldown(decision.cooldown_s)
-                if decision.retryable:
+                if decision.retryable and attempt < retry_limit:
                     with self._metrics_lock:
                         self.stats["retries"] += 1
                     if decision.delay_s > 0:
                         time.sleep(decision.delay_s)
                     continue
-                raise
+                raise _BatchExecutionError(exc, actual_attempts) from exc
         assert last is not None
-        raise last
+        raise _BatchExecutionError(last, actual_attempts) from last
 
     def _build_batches(self, items: list[dict]) -> list[list[tuple[int, dict]]]:
         """Compatibility helper delegating to the configured BatchPlanner."""
@@ -203,6 +226,8 @@ class Scheduler:
         pool_workers = max(1, min(self.concurrency, self.limiter.limit))
         main_done_at: float | None = None
         main_remaining = len(planned_batches)
+        item_attempts: list[int] = [0] * len(items)
+        item_retry_counts: list[int] = [0] * len(items)
         retried_indices: set[int] = set()
 
         with ThreadPoolExecutor(max_workers=pool_workers) as pool:
@@ -222,20 +247,26 @@ class Scheduler:
                         indexed_batch = meta
                         assert isinstance(indexed_batch, list)
                         batch = [it for _, it in indexed_batch]
+                        batch_attempts = 0
                         try:
-                            raw_out, _retries, lat_s = fut.result()
+                            raw_out, batch_attempts, lat_s = fut.result()
                             batch_latencies.append(lat_s)
                             norm = [
                                 _normalize_item_result(item, val)
                                 for item, val in zip(batch, raw_out)
                             ]
                         except Exception as exc:  # noqa: BLE001 - record explicit failure per item
-                            err_msg = str(exc)
+                            cause = exc.cause if isinstance(exc, _BatchExecutionError) else exc
+                            batch_attempts = exc.attempts if isinstance(exc, _BatchExecutionError) else 1
+                            err_msg = str(cause)
                             if (
                                 self.max_retries > 0
                                 and len(indexed_batch) > 4
-                                and self.retry_policy.decide(exc, self.max_retries).category in ("timeout", "parse_error")
+                                and self.retry_policy.decide(cause, self.max_retries).category in ("timeout", "parse_error")
                             ):
+                                # Preserve the parent batch's actual call attempts before splitting into halves.
+                                for orig_idx, _ in indexed_batch:
+                                    item_attempts[orig_idx] += batch_attempts
                                 mid = len(indexed_batch) // 2
                                 for half in (indexed_batch[:mid], indexed_batch[mid:]):
                                     half_items = [it for _, it in half]
@@ -260,18 +291,26 @@ class Scheduler:
                             ]
 
                         for (orig_idx, item), rec in zip(indexed_batch, norm):
+                            item_attempts[orig_idx] += batch_attempts
+                            rec["attempts"] = item_attempts[orig_idx]
                             results[orig_idx] = rec
-                            # Immediate streaming single-item retry without waiting for all batches!
+                            # Immediate streaming single-item retry up to configured max_retries budget.
+                            # Sibling blocks that already succeeded stay untouched.
                             if (
-                                self.max_retries > 0
-                                and rec["status"] in ("missing", "empty")
-                                and orig_idx not in retried_indices
+                                rec["status"] in ("missing", "empty")
+                                and item_retry_counts[orig_idx] < self.max_retries
                             ):
+                                item_retry_counts[orig_idx] += 1
                                 retried_indices.add(orig_idx)
                                 with self._metrics_lock:
                                     self.stats["retries"] += 1
                                 rf = pool.submit(
-                                    self._run_batch, [item], target_lang, model, doc_context
+                                    self._run_batch,
+                                    [item],
+                                    target_lang,
+                                    model,
+                                    doc_context,
+                                    0,
                                 )
                                 pending[rf] = ("item_retry", orig_idx)
 
@@ -282,16 +321,50 @@ class Scheduler:
                         orig_idx = meta
                         assert isinstance(orig_idx, int)
                         item = items[orig_idx]
+                        retry_exc: Exception | None = None
                         try:
-                            raw_out, _retries, _lat = fut.result()
-                            results[orig_idx] = _normalize_item_result(item, raw_out[0])
+                            raw_out, call_attempts, _lat = fut.result()
+                            item_attempts[orig_idx] += call_attempts
+                            rec = _normalize_item_result(item, raw_out[0])
                         except Exception as exc:  # noqa: BLE001
-                            results[orig_idx] = {
+                            cause = exc.cause if isinstance(exc, _BatchExecutionError) else exc
+                            call_attempts = exc.attempts if isinstance(exc, _BatchExecutionError) else 1
+                            item_attempts[orig_idx] += call_attempts
+                            retry_exc = cause
+                            rec = {
                                 "block_id": item["block_id"],
                                 "status": "failed",
                                 "translation": None,
-                                "error": str(exc),
+                                "error": str(cause),
                             }
+                        rec["attempts"] = item_attempts[orig_idx]
+                        results[orig_idx] = rec
+                        should_requeue = False
+                        requeue_delay = 0.0
+                        if item_retry_counts[orig_idx] < self.max_retries:
+                            if rec["status"] in ("missing", "empty"):
+                                should_requeue = True
+                            elif retry_exc is not None:
+                                dec = self.retry_policy.decide(retry_exc, item_retry_counts[orig_idx] - 1)
+                                if dec.retryable:
+                                    should_requeue = True
+                                    requeue_delay = dec.delay_s
+                        if should_requeue:
+                            if requeue_delay > 0:
+                                time.sleep(requeue_delay)
+                            item_retry_counts[orig_idx] += 1
+                            retried_indices.add(orig_idx)
+                            with self._metrics_lock:
+                                self.stats["retries"] += 1
+                            rf = pool.submit(
+                                self._run_batch,
+                                [item],
+                                target_lang,
+                                model,
+                                doc_context,
+                                0,
+                            )
+                            pending[rf] = ("item_retry", orig_idx)
 
         t_end = time.perf_counter()
         self.stats["retry_s"] = (
