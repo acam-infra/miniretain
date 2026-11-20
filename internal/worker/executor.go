@@ -93,6 +93,13 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 		return ctx.Err()
 	}
 
+	// Remove any stale result file from a previous /retry run so a crash before
+	// writing a fresh result never surfaces stale diagnostics from an earlier run.
+	resultPath := filepath.Join(wd, stage+".result.json")
+	if rmErr := os.Remove(resultPath); rmErr != nil && !os.IsNotExist(rmErr) {
+		return fmt.Errorf("remove stale %s result: %w", stage, rmErr)
+	}
+
 	// The worker reads BOTH the spec and the schema; no defaults are hardcoded
 	// in Python either.
 	started := time.Now()
@@ -115,7 +122,6 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 	}
 	out, err := cmd.CombinedOutput()
 	durMS := time.Since(started).Milliseconds()
-	resultPath := filepath.Join(wd, stage+".result.json")
 	if b, rerr := os.ReadFile(resultPath); rerr == nil {
 		var result map[string]any
 		if uerr := json.Unmarshal(b, &result); uerr == nil {

@@ -27,6 +27,15 @@ from llm.retry import RetryPolicy
 _SENTINEL_PREFIXES = ("<translation failed:", "<missing translation")
 
 
+class _BatchExecutionError(RuntimeError):
+    """Carries the underlying exception and the exact number of client.translate() calls made."""
+
+    def __init__(self, cause: Exception, attempts: int) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.attempts = attempts
+
+
 class LLMClient(ABC):
     name = "base"
 
@@ -163,18 +172,20 @@ class Scheduler:
             if max_transport_retries is None
             else max(0, max_transport_retries)
         )
+        actual_attempts = 0
         for attempt in range(retry_limit + 1):
             self.retry_policy.wait_if_cooling_down()
             try:
                 with self.limiter.acquire():
                     with self._metrics_lock:
                         self.stats["requests"] += 1
+                    actual_attempts += 1
                     out = self.client.translate(payload_batch, target_lang, model, self.timeout_ms)
                 if len(out) != len(batch):
                     raise RuntimeError(
                         f"batch length mismatch: expected {len(batch)}, got {len(out)}"
                     )
-                return out, attempt, round(time.perf_counter() - t0, 3)
+                return out, actual_attempts, round(time.perf_counter() - t0, 3)
             except Exception as exc:  # noqa: BLE001 - classify and retry via policy
                 last = exc
                 decision = self.retry_policy.decide(exc, attempt)
@@ -191,9 +202,9 @@ class Scheduler:
                     if decision.delay_s > 0:
                         time.sleep(decision.delay_s)
                     continue
-                raise
+                raise _BatchExecutionError(exc, actual_attempts) from exc
         assert last is not None
-        raise last
+        raise _BatchExecutionError(last, actual_attempts) from last
 
     def _build_batches(self, items: list[dict]) -> list[list[tuple[int, dict]]]:
         """Compatibility helper delegating to the configured BatchPlanner."""
@@ -236,22 +247,26 @@ class Scheduler:
                         indexed_batch = meta
                         assert isinstance(indexed_batch, list)
                         batch = [it for _, it in indexed_batch]
-                        batch_attempts = 1
+                        batch_attempts = 0
                         try:
-                            raw_out, batch_retries, lat_s = fut.result()
-                            batch_attempts = 1 + int(batch_retries)
+                            raw_out, batch_attempts, lat_s = fut.result()
                             batch_latencies.append(lat_s)
                             norm = [
                                 _normalize_item_result(item, val)
                                 for item, val in zip(batch, raw_out)
                             ]
                         except Exception as exc:  # noqa: BLE001 - record explicit failure per item
-                            err_msg = str(exc)
+                            cause = exc.cause if isinstance(exc, _BatchExecutionError) else exc
+                            batch_attempts = exc.attempts if isinstance(exc, _BatchExecutionError) else 1
+                            err_msg = str(cause)
                             if (
                                 self.max_retries > 0
                                 and len(indexed_batch) > 4
-                                and self.retry_policy.decide(exc, self.max_retries).category in ("timeout", "parse_error")
+                                and self.retry_policy.decide(cause, self.max_retries).category in ("timeout", "parse_error")
                             ):
+                                # Preserve the parent batch's actual call attempts before splitting into halves.
+                                for orig_idx, _ in indexed_batch:
+                                    item_attempts[orig_idx] += batch_attempts
                                 mid = len(indexed_batch) // 2
                                 for half in (indexed_batch[:mid], indexed_batch[mid:]):
                                     half_items = [it for _, it in half]
@@ -264,7 +279,6 @@ class Scheduler:
                                     main_remaining += 1
                                 main_remaining -= 1
                                 continue
-                            batch_attempts = 1 + self.retry_policy.max_retries
                             self.stats["failed_batches"] += 1
                             norm = [
                                 {
@@ -307,18 +321,21 @@ class Scheduler:
                         orig_idx = meta
                         assert isinstance(orig_idx, int)
                         item = items[orig_idx]
-                        item_attempts[orig_idx] += 1
                         retry_exc: Exception | None = None
                         try:
-                            raw_out, _retries, _lat = fut.result()
+                            raw_out, call_attempts, _lat = fut.result()
+                            item_attempts[orig_idx] += call_attempts
                             rec = _normalize_item_result(item, raw_out[0])
                         except Exception as exc:  # noqa: BLE001
-                            retry_exc = exc
+                            cause = exc.cause if isinstance(exc, _BatchExecutionError) else exc
+                            call_attempts = exc.attempts if isinstance(exc, _BatchExecutionError) else 1
+                            item_attempts[orig_idx] += call_attempts
+                            retry_exc = cause
                             rec = {
                                 "block_id": item["block_id"],
                                 "status": "failed",
                                 "translation": None,
-                                "error": str(exc),
+                                "error": str(cause),
                             }
                         rec["attempts"] = item_attempts[orig_idx]
                         results[orig_idx] = rec

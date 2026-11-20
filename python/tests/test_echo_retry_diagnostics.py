@@ -348,3 +348,79 @@ def test_non_critical_title_fallback_preserves_source_and_allows_completion(tmp_
     assert by_id["p0b0000"]["policy"]["redact_source"] is False
     assert by_id["p0b0000"]["translation"] == title_text
     assert by_id["p0b0011"]["translation_status"] == "ok"
+
+
+def test_mock_gateway_http_401_reports_actual_single_attempt(tmp_path, monkeypatch):
+    """Non-retryable HTTP 401 with max_retries=2 must report attempts=1 (matching 1 actual request, 0 retries)."""
+    _write_doc(
+        tmp_path,
+        [{"block_id": "p0b0011", "reading_order": 0, "text": P0B0011_TEXT, "layout_role": "body", "policy": {"translate": True, "preserve_reason": None, "redact_source": True}}],
+    )
+    calls = []
+
+    class Handler401(BaseHTTPRequestHandler):
+        def do_POST(self):  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            _ = self.rfile.read(length)
+            calls.append(1)
+            raw = b'{"error":{"message":"invalid api key"}}'
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, format, *args):  # noqa: A002
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler401)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        monkeypatch.setenv("OPENAI_BASE_URL", f"http://127.0.0.1:{server.server_address[1]}/v1")
+        with pytest.raises(RuntimeError) as exc_info:
+            worker_mod.run_llm(_make_spec(tmp_path, max_retries=2, allow_partial=False), tmp_path)
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert len(calls) == 1
+    assert "attempts=1" in str(exc_info.value)
+    diag = json.loads((tmp_path / "llm.result.json").read_text(encoding="utf-8"))
+    assert diag["requests"] == 1
+    assert diag["retries"] == 0
+    assert diag["critical_failures"][0]["attempts"] == 1
+    assert "401" in diag["critical_failures"][0]["reason"]
+
+
+def test_batch_split_preserves_parent_attempts_in_child_counts():
+    """When a >4-item batch exhausts timeout retries and splits in half, child items keep parent attempt counts."""
+    from llm.retry import RetryPolicy
+    from llm.scheduler import LLMClient, Scheduler
+
+    class _TimeoutLargeBatchClient(LLMClient):
+        name = "timeout-large-batch"
+
+        def translate(self, items, target_lang, model, timeout_ms):
+            if len(items) > 4:
+                raise TimeoutError("simulated batch read timeout")
+            return [f"[{target_lang}] {it['text']}" for it in items]
+
+    policy = RetryPolicy(max_retries=1, rate_limit_base_s=0.0, rate_limit_cap_s=0.0, jitter=False)
+    sc = Scheduler(
+        _TimeoutLargeBatchClient(),
+        concurrency=2,
+        batch_size=8,
+        max_retries=1,
+        timeout_ms=1000,
+        retry_policy=policy,
+        enable_doc_context=False,
+    )
+    items = [{"block_id": f"p0b{i:04d}", "text": f"Sentence {i} for split test."} for i in range(6)]
+    records, stats = sc.run(items, "zh", "fake")
+    assert stats["succeeded_items"] == 6
+    # Parent batch tried 2 times (1 + max_retries=1), then split into 2 halves each succeeding on attempt 1 -> 3 attempts/item
+    assert all(rec["attempts"] == 3 for rec in records)
+    assert stats["requests"] == 4
+
