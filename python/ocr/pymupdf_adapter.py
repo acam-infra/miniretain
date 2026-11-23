@@ -629,9 +629,9 @@ class AutoOCRProvider(OCRProvider):
         auto_cfg = self.config.get("auto") if isinstance(self.config.get("auto"), dict) else {}
         self.scanned_char_threshold = int(auto_cfg.get("scanned_char_threshold", 20))
         self.fallback_provider = str(auto_cfg.get("fallback_provider") or "").strip()
-        if self.fallback_provider and self.fallback_provider not in {"paddle-http", "paddle-cpu", "none"}:
+        if self.fallback_provider and self.fallback_provider not in {"paddle-http", "paddle-cpu", "paddle-cloud", "mineru", "none"}:
             raise OCRConfigError(
-                f"auto.fallback_provider must be one of ['paddle-http', 'paddle-cpu', 'none'], got {self.fallback_provider!r}"
+                f"auto.fallback_provider must be one of ['paddle-http', 'paddle-cpu', 'paddle-cloud', 'mineru', 'none'], got {self.fallback_provider!r}"
             )
         self.service_info: dict = {}
         self.paddle_pages: list[int] = []
@@ -693,6 +693,18 @@ class AutoOCRProvider(OCRProvider):
                 self.routed_providers["pymupdf"] = digital_indices
             if self.paddle_pages:
                 self.routed_providers["paddle-http"] = list(self.paddle_pages)
+        elif scanned_indices and self.fallback_provider in ("paddle-cloud", "mineru"):
+            from ocr.adapter import get_provider
+            cloud_prov = get_provider(self.fallback_provider, self.config)
+            cloud_pages = {p["page_index"]: p for p in cloud_prov.parse(source)}
+            pages = [
+                cloud_pages.get(p["page_index"], p) if p["page_index"] in scanned_indices else p
+                for p in pages
+            ]
+            self.paddle_pages = sorted(scanned_indices)
+            if digital_indices:
+                self.routed_providers["pymupdf"] = digital_indices
+            self.routed_providers[self.fallback_provider] = list(self.paddle_pages)
         elif scanned_indices and (
             self.fallback_provider == "paddle-cpu" or len(scanned_indices) == len(pages)
         ):

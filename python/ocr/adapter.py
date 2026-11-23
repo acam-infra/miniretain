@@ -43,6 +43,8 @@ class StubOCRProvider(OCRProvider):
 
 from ocr.paddle_adapter import PaddleOCRProvider  # noqa: E402,F401
 from ocr.paddle_http_adapter import PaddleHTTPOCRProvider  # noqa: E402,F401
+from ocr.paddle_cloud_adapter import PaddleCloudOCRProvider  # noqa: E402,F401
+from ocr.mineru_cloud_adapter import MinerUCloudOCRProvider  # noqa: E402,F401
 from ocr.pymupdf_adapter import AutoOCRProvider, PyMuPDFOCRProvider  # noqa: E402,F401
 
 
@@ -150,5 +152,7 @@ def get_provider(name: str, config: dict[str, Any] | None = None) -> OCRProvider
 register_provider(StubOCRProvider.name, StubOCRProvider, eager=True)
 register_provider(PyMuPDFOCRProvider.name, PyMuPDFOCRProvider, eager=True)
 register_provider(PaddleHTTPOCRProvider.name, PaddleHTTPOCRProvider, eager=True)
+register_provider(PaddleCloudOCRProvider.name, PaddleCloudOCRProvider, eager=True)
+register_provider(MinerUCloudOCRProvider.name, MinerUCloudOCRProvider, eager=True)
 register_provider(AutoOCRProvider.name, AutoOCRProvider, eager=True)
 register_provider(_LazyPaddle.name, _LazyPaddle, eager=True)

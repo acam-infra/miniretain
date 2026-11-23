@@ -4,7 +4,15 @@
   "title": "Miniretain task spec v1",
   "description": "Single source of truth for the Go <-> Python boundary. Both sides load THIS file to validate and to fill defaults. Never hardcode a default in Go or Python separately.",
   "type": "object",
-  "required": ["job_id", "stage", "workdir", "source", "target_lang", "ocr", "llm"],
+  "required": [
+    "job_id",
+    "stage",
+    "workdir",
+    "source",
+    "target_lang",
+    "ocr",
+    "llm"
+  ],
   "properties": {
     "job_id": {
       "type": "string",
@@ -12,7 +20,11 @@
     },
     "stage": {
       "type": "string",
-      "enum": ["ocr", "llm", "render"],
+      "enum": [
+        "ocr",
+        "llm",
+        "render"
+      ],
       "description": "Which Python worker stage to run."
     },
     "workdir": {
@@ -30,11 +42,21 @@
     },
     "ocr": {
       "type": "object",
-      "required": ["provider"],
+      "required": [
+        "provider"
+      ],
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["stub", "paddle-cpu", "paddle-http", "pymupdf", "auto"],
+          "enum": [
+            "stub",
+            "paddle-cpu",
+            "paddle-http",
+            "pymupdf",
+            "auto",
+            "paddle-cloud",
+            "mineru"
+          ],
           "default": "stub",
           "description": "OCR adapter name. Register real providers in python/ocr/adapter.py."
         },
@@ -46,11 +68,16 @@
     },
     "llm": {
       "type": "object",
-      "required": ["provider"],
+      "required": [
+        "provider"
+      ],
       "properties": {
         "provider": {
           "type": "string",
-          "enum": ["stub", "openai-compat"],
+          "enum": [
+            "stub",
+            "openai-compat"
+          ],
           "default": "stub",
           "description": "LLM client name. Register real clients in python/llm/scheduler.py."
         },
@@ -95,7 +122,10 @@
       "properties": {
         "engine": {
           "type": "string",
-          "enum": ["typst", "pymupdf"],
+          "enum": [
+            "typst",
+            "pymupdf"
+          ],
           "default": "typst",
           "description": "Render engine: 'typst' for structured typesetting, 'pymupdf' for in-place bbox replacement."
         },
@@ -121,13 +151,22 @@
         },
         "layout_mode": {
           "type": "string",
-          "enum": ["auto", "preserve", "flow"],
+          "enum": [
+            "auto",
+            "preserve",
+            "flow"
+          ],
           "default": "auto",
           "description": "Layout mode: 'preserve' for original-page overlay, 'flow' for A4 streaming, 'auto' picks preserve when PDF+bboxes exist."
         },
         "bilingual_mode": {
           "type": "string",
-          "enum": ["auto", "side_by_side", "interleaved", "table"],
+          "enum": [
+            "auto",
+            "side_by_side",
+            "interleaved",
+            "table"
+          ],
           "default": "auto",
           "description": "Bilingual output mode: 'side_by_side' (left orig + right trans), 'interleaved', 'table', or 'auto'."
         },

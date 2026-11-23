@@ -65,11 +65,40 @@ type RuntimeConfig struct {
 }
 
 type OCRConfig struct {
-	Provider   string           `yaml:"provider"`
-	PaddleHTTP PaddleHTTPConfig `yaml:"paddle_http"`
-	PaddleCPU  PaddleCPUConfig  `yaml:"paddle_cpu"`
-	Auto       AutoOCRConfig    `yaml:"auto"`
-	Options    map[string]any   `yaml:"options"`
+	Provider    string            `yaml:"provider"`
+	PaddleHTTP  PaddleHTTPConfig  `yaml:"paddle_http"`
+	PaddleCPU   PaddleCPUConfig   `yaml:"paddle_cpu"`
+	PaddleCloud PaddleCloudConfig `yaml:"paddle_cloud"`
+	MinerU      MinerUConfig      `yaml:"mineru"`
+	Auto        AutoOCRConfig     `yaml:"auto"`
+	Options     map[string]any    `yaml:"options"`
+}
+
+type PaddleCloudConfig struct {
+	JobURL           string   `yaml:"job_url"`
+	Model            string   `yaml:"model"`
+	TokenEnv         string   `yaml:"token_env"`
+	TokenFile        string   `yaml:"token_file"`
+	Tokens           []string `yaml:"tokens"`
+	ProxyFile        string   `yaml:"proxy_file"`
+	Proxies          []string `yaml:"proxies"`
+	FallbackProvider string   `yaml:"fallback_provider"`
+	TimeoutS         *float64 `yaml:"timeout_s"`
+	PollIntervalS    *float64 `yaml:"poll_interval_s"`
+}
+
+type MinerUConfig struct {
+	BaseURL          string   `yaml:"base_url"`
+	ModelVersion     string   `yaml:"model_version"`
+	Language         string   `yaml:"language"`
+	TokenEnv         string   `yaml:"token_env"`
+	TokenFile        string   `yaml:"token_file"`
+	Tokens           []string `yaml:"tokens"`
+	ProxyFile        string   `yaml:"proxy_file"`
+	Proxies          []string `yaml:"proxies"`
+	FallbackProvider string   `yaml:"fallback_provider"`
+	TimeoutS         *float64 `yaml:"timeout_s"`
+	PollIntervalS    *float64 `yaml:"poll_interval_s"`
 }
 
 type PaddleHTTPConfig struct {
@@ -90,10 +119,14 @@ type AutoOCRConfig struct {
 }
 
 type LLMConfig struct {
-	Provider     string `yaml:"provider"`
-	BaseURL      string `yaml:"base_url"`
-	APIKeyEnv    string `yaml:"api_key_env"`
-	APIKeyFile   string `yaml:"api_key_file"`
+	Provider       string   `yaml:"provider"`
+	BaseURL        string   `yaml:"base_url"`
+	APIKeyEnv      string   `yaml:"api_key_env"`
+	APIKeyFile     string   `yaml:"api_key_file"`
+	FallbackModels []string `yaml:"fallback_models"`
+	ProxyFile      string   `yaml:"proxy_file"`
+	Proxies        []string `yaml:"proxies"`
+	PoolFile       string   `yaml:"pool_file"`
 	Model        string `yaml:"model"`
 	BatchSize    *int   `yaml:"batch_size"`
 	Concurrency  *int   `yaml:"concurrency"`
@@ -257,6 +290,24 @@ func (c *Config) applyDefaultsAndResolvePaths(baseDir string) {
 	if strings.TrimSpace(c.LLM.APIKeyFile) != "" {
 		c.LLM.APIKeyFile = resolveRel(baseDir, c.LLM.APIKeyFile)
 	}
+	if strings.TrimSpace(c.LLM.ProxyFile) != "" {
+		c.LLM.ProxyFile = resolveRel(baseDir, c.LLM.ProxyFile)
+	}
+	if strings.TrimSpace(c.LLM.PoolFile) != "" {
+		c.LLM.PoolFile = resolveRel(baseDir, c.LLM.PoolFile)
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.TokenFile) != "" {
+		c.OCR.PaddleCloud.TokenFile = resolveRel(baseDir, c.OCR.PaddleCloud.TokenFile)
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.ProxyFile) != "" {
+		c.OCR.PaddleCloud.ProxyFile = resolveRel(baseDir, c.OCR.PaddleCloud.ProxyFile)
+	}
+	if strings.TrimSpace(c.OCR.MinerU.TokenFile) != "" {
+		c.OCR.MinerU.TokenFile = resolveRel(baseDir, c.OCR.MinerU.TokenFile)
+	}
+	if strings.TrimSpace(c.OCR.MinerU.ProxyFile) != "" {
+		c.OCR.MinerU.ProxyFile = resolveRel(baseDir, c.OCR.MinerU.ProxyFile)
+	}
 	if strings.TrimSpace(c.Render.Font) != "" && looksLikePath(c.Render.Font) {
 		c.Render.Font = resolveRel(baseDir, c.Render.Font)
 	}
@@ -367,7 +418,7 @@ func (c *Config) Validate(schema *worker.Schema) error {
 		return fmt.Errorf("config validation: ocr.auto.scanned_char_threshold must be >= 0, got %d", *c.OCR.Auto.ScannedCharThreshold)
 	}
 	if c.OCR.Auto.FallbackProvider != "" {
-		allowedFallback := []string{"paddle-http", "paddle-cpu", "none"}
+		allowedFallback := []string{"paddle-http", "paddle-cpu", "paddle-cloud", "mineru", "none"}
 		if !slices.Contains(allowedFallback, c.OCR.Auto.FallbackProvider) {
 			return fmt.Errorf("config validation: ocr.auto.fallback_provider %q is invalid; allowed: %v", c.OCR.Auto.FallbackProvider, allowedFallback)
 		}
@@ -470,6 +521,57 @@ func (c *Config) WorkerEnv() []string {
 	if c.OCR.PaddleHTTP.HealthTimeoutS != nil {
 		env = append(env, "PADDLE_OCR_HEALTH_TIMEOUT_S="+strconv.FormatFloat(*c.OCR.PaddleHTTP.HealthTimeoutS, 'f', -1, 64))
 	}
+	if len(c.LLM.FallbackModels) > 0 {
+		env = append(env, "OPENAI_FALLBACK_MODELS="+strings.Join(c.LLM.FallbackModels, ","))
+	}
+	if strings.TrimSpace(c.LLM.ProxyFile) != "" {
+		env = append(env, "OPENAI_PROXY_FILE="+strings.TrimSpace(c.LLM.ProxyFile))
+	}
+	if len(c.LLM.Proxies) > 0 {
+		env = append(env, "OPENAI_PROXY_POOL="+strings.Join(c.LLM.Proxies, ","))
+	}
+	if strings.TrimSpace(c.LLM.PoolFile) != "" {
+		env = append(env, "OPENAI_POOL_FILE="+strings.TrimSpace(c.LLM.PoolFile))
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.JobURL) != "" {
+		env = append(env, "PADDLE_CLOUD_JOB_URL="+strings.TrimSpace(c.OCR.PaddleCloud.JobURL))
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.Model) != "" {
+		env = append(env, "PADDLE_CLOUD_MODEL="+strings.TrimSpace(c.OCR.PaddleCloud.Model))
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.TokenFile) != "" {
+		env = append(env, "PADDLE_CLOUD_TOKEN_FILE="+strings.TrimSpace(c.OCR.PaddleCloud.TokenFile))
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.ProxyFile) != "" {
+		env = append(env, "PADDLE_CLOUD_PROXY_FILE="+strings.TrimSpace(c.OCR.PaddleCloud.ProxyFile))
+	}
+	if len(c.OCR.PaddleCloud.Proxies) > 0 {
+		env = append(env, "PADDLE_CLOUD_PROXY_POOL="+strings.Join(c.OCR.PaddleCloud.Proxies, ","))
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.FallbackProvider) != "" {
+		env = append(env, "PADDLE_CLOUD_FALLBACK="+strings.TrimSpace(c.OCR.PaddleCloud.FallbackProvider))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.BaseURL) != "" {
+		env = append(env, "MINERU_BASE_URL="+strings.TrimSpace(c.OCR.MinerU.BaseURL))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.ModelVersion) != "" {
+		env = append(env, "MINERU_MODEL_VERSION="+strings.TrimSpace(c.OCR.MinerU.ModelVersion))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.Language) != "" {
+		env = append(env, "MINERU_LANGUAGE="+strings.TrimSpace(c.OCR.MinerU.Language))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.TokenFile) != "" {
+		env = append(env, "MINERU_TOKEN_FILE="+strings.TrimSpace(c.OCR.MinerU.TokenFile))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.ProxyFile) != "" {
+		env = append(env, "MINERU_PROXY_FILE="+strings.TrimSpace(c.OCR.MinerU.ProxyFile))
+	}
+	if len(c.OCR.MinerU.Proxies) > 0 {
+		env = append(env, "MINERU_PROXY_POOL="+strings.Join(c.OCR.MinerU.Proxies, ","))
+	}
+	if strings.TrimSpace(c.OCR.MinerU.FallbackProvider) != "" {
+		env = append(env, "MINERU_FALLBACK="+strings.TrimSpace(c.OCR.MinerU.FallbackProvider))
+	}
 	return env
 }
 
@@ -513,6 +615,71 @@ func (c *Config) OCRConfigMap() map[string]any {
 	}
 	if len(autoCfg) > 0 {
 		out["auto"] = autoCfg
+	}
+	paddleCloud := map[string]any{}
+	if strings.TrimSpace(c.OCR.PaddleCloud.JobURL) != "" {
+		paddleCloud["job_url"] = strings.TrimSpace(c.OCR.PaddleCloud.JobURL)
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.Model) != "" {
+		paddleCloud["model"] = strings.TrimSpace(c.OCR.PaddleCloud.Model)
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.TokenFile) != "" {
+		paddleCloud["token_file"] = strings.TrimSpace(c.OCR.PaddleCloud.TokenFile)
+	}
+	if len(c.OCR.PaddleCloud.Tokens) > 0 {
+		paddleCloud["tokens"] = c.OCR.PaddleCloud.Tokens
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.ProxyFile) != "" {
+		paddleCloud["proxy_file"] = strings.TrimSpace(c.OCR.PaddleCloud.ProxyFile)
+	}
+	if len(c.OCR.PaddleCloud.Proxies) > 0 {
+		paddleCloud["proxies"] = c.OCR.PaddleCloud.Proxies
+	}
+	if strings.TrimSpace(c.OCR.PaddleCloud.FallbackProvider) != "" {
+		paddleCloud["fallback_provider"] = strings.TrimSpace(c.OCR.PaddleCloud.FallbackProvider)
+	}
+	if c.OCR.PaddleCloud.TimeoutS != nil {
+		paddleCloud["timeout_s"] = *c.OCR.PaddleCloud.TimeoutS
+	}
+	if c.OCR.PaddleCloud.PollIntervalS != nil {
+		paddleCloud["poll_interval_s"] = *c.OCR.PaddleCloud.PollIntervalS
+	}
+	if len(paddleCloud) > 0 {
+		out["paddle_cloud"] = paddleCloud
+	}
+	mineruCfg := map[string]any{}
+	if strings.TrimSpace(c.OCR.MinerU.BaseURL) != "" {
+		mineruCfg["base_url"] = strings.TrimSpace(c.OCR.MinerU.BaseURL)
+	}
+	if strings.TrimSpace(c.OCR.MinerU.ModelVersion) != "" {
+		mineruCfg["model_version"] = strings.TrimSpace(c.OCR.MinerU.ModelVersion)
+	}
+	if strings.TrimSpace(c.OCR.MinerU.Language) != "" {
+		mineruCfg["language"] = strings.TrimSpace(c.OCR.MinerU.Language)
+	}
+	if strings.TrimSpace(c.OCR.MinerU.TokenFile) != "" {
+		mineruCfg["token_file"] = strings.TrimSpace(c.OCR.MinerU.TokenFile)
+	}
+	if len(c.OCR.MinerU.Tokens) > 0 {
+		mineruCfg["tokens"] = c.OCR.MinerU.Tokens
+	}
+	if strings.TrimSpace(c.OCR.MinerU.ProxyFile) != "" {
+		mineruCfg["proxy_file"] = strings.TrimSpace(c.OCR.MinerU.ProxyFile)
+	}
+	if len(c.OCR.MinerU.Proxies) > 0 {
+		mineruCfg["proxies"] = c.OCR.MinerU.Proxies
+	}
+	if strings.TrimSpace(c.OCR.MinerU.FallbackProvider) != "" {
+		mineruCfg["fallback_provider"] = strings.TrimSpace(c.OCR.MinerU.FallbackProvider)
+	}
+	if c.OCR.MinerU.TimeoutS != nil {
+		mineruCfg["timeout_s"] = *c.OCR.MinerU.TimeoutS
+	}
+	if c.OCR.MinerU.PollIntervalS != nil {
+		mineruCfg["poll_interval_s"] = *c.OCR.MinerU.PollIntervalS
+	}
+	if len(mineruCfg) > 0 {
+		out["mineru"] = mineruCfg
 	}
 
 	if len(c.OCR.Options) > 0 {
