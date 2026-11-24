@@ -218,3 +218,9 @@ def test_typst_bold_uses_heiti_font_in_compiled_pdf():
         assert '#show strong: set text(font: ("Libertinus Serif", "Noto Sans CJK SC"' in otyp
         assert r"#mi(`\sqrt{d_{model}}`)" in otyp
         assert "#mi(`𝜔_𝐷 ≥ 0`)" in otyp
+
+
+def test_author_affiliation_catches_ieee_and_plain_comma_author_lists():
+    from ocr.normalize import _is_author_affiliation
+    assert _is_author_affiliation("Zheng Lin, Student Member, IEEE, Yuxin Zhang, and Xianhao Chen", page_idx=0, seen_abstract=False, bbox=[72.0, 140.0, 540.0, 155.0], page_h=792.0, abstract_y0=240.0, font_size=10.0, median_font=10.0)
+    assert _is_author_affiliation("A. Reddy, B. Smith, C. Kumar, and D. Lee", page_idx=0, seen_abstract=False, bbox=[72.0, 140.0, 540.0, 155.0], page_h=792.0, abstract_y0=240.0, font_size=10.0, median_font=10.0)

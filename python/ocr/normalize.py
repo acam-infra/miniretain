@@ -98,6 +98,14 @@ def _is_author_affiliation(
     # Multiple "First Last<digit>" author entries on one line (with or without space before marker)
     if len(re.findall(r"\b[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]+[\d∗†‡§,\s]*\d", s)) >= 2:
         return True
+    # IEEE / arXiv comma-separated author lists without superscript markers (e.g. "Zheng Lin, Member, IEEE, ...")
+    if re.search(r"\b(?:Fellow|Member|Senior Member|Student Member),\s*IEEE\b", s):
+        return True
+    if not s.endswith((".", "?", "!")) and "," in s:
+        name_hits = re.findall(r"\b(?:[A-Z][a-z]+|[A-Z]\.)\s+(?:[A-Z]\.\s*)?[A-Z][a-zA-Z\-]{1,}\b", s)
+        words = s.split()
+        if len(name_hits) >= 2 and len(words) <= 24 and len(name_hits) * 2 >= len(words) * 0.55:
+            return True
     return False
 
 
