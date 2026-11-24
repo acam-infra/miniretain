@@ -27,7 +27,7 @@ from ocr.pymupdf_adapter import _extract_table_regions
 
 DEFAULT_MINERU_BASE_URL = "https://mineru.net"
 DEFAULT_MINERU_MODEL_VERSION = "vlm"
-_TAG_RE = re.compile(r"<[^>]+>")
+_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9\-]*(?:\s+[^<>]*)?>")
 
 
 _BOLD_TAG_RE = re.compile(r"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>", re.IGNORECASE | re.DOTALL)
@@ -282,6 +282,32 @@ class MinerUCloudOCRProvider(OCRProvider):
         raise OCRBackendUnavailableError("mineru result zip did not contain layout.json")
 
     @staticmethod
+    def _split_cross_column_lines(lines: list[dict], sx: float, sy: float, pdf_w: float) -> list[list[dict]]:
+        """Split a MinerU para_block's lines when they jump across columns (e.g. bottom of col 1 -> top of col 2)."""
+        if len(lines) < 2:
+            return [lines] if lines else []
+        groups: list[list[dict]] = []
+        cur: list[dict] = []
+        prev_x0: float | None = None
+        prev_y0: float | None = None
+        for ln in lines:
+            lb = ln.get("bbox")
+            if isinstance(lb, list) and len(lb) >= 4:
+                x0 = float(lb[0]) * sx
+                y0 = float(lb[1]) * sy
+                if cur and prev_x0 is not None and prev_y0 is not None:
+                    if abs(x0 - prev_x0) > pdf_w * 0.25 or y0 < prev_y0 - 24.0:
+                        groups.append(cur)
+                        cur = [ln]
+                        prev_x0, prev_y0 = x0, y0
+                        continue
+                prev_x0, prev_y0 = x0, y0
+            cur.append(ln)
+        if cur:
+            groups.append(cur)
+        return groups
+
+    @staticmethod
     def _extract_lines_and_text(blk: dict, sx: float, sy: float) -> tuple[str, list[list[float]]]:
         chunks: list[str] = []
         line_bboxes: list[list[float]] = []
@@ -295,8 +321,15 @@ class MinerUCloudOCRProvider(OCRProvider):
                     round(float(lb[3]) * sy, 2),
                 ])
             line_parts: list[str] = []
-            for span in line.get("spans") or []:
-                stype = str(span.get("type") or "text").strip()
+            raw_spans = list(line.get("spans") or [])
+            flat_spans = []
+            for sp in raw_spans:
+                if isinstance(sp, dict) and str(sp.get("type") or "").strip().lower() == "hyperlink" and isinstance(sp.get("children"), list):
+                    flat_spans.extend(c for c in sp["children"] if isinstance(c, dict))
+                elif isinstance(sp, dict):
+                    flat_spans.append(sp)
+            for span in flat_spans:
+                stype = str(span.get("type") or "text").strip().lower()
                 content = str(span.get("content") or "").strip()
                 if not content and span.get("html"):
                     content = _clean_html_text(str(span.get("html") or ""))
@@ -306,6 +339,10 @@ class MinerUCloudOCRProvider(OCRProvider):
                     clean_eq = content.strip("$").strip()
                     if clean_eq:
                         line_parts.append(f"${clean_eq}$")
+                elif stype in {"interline_equation", "equation"}:
+                    clean_eq = content.strip("$").strip()
+                    if clean_eq:
+                        line_parts.append(f"$${clean_eq}$$")
                 else:
                     line_parts.append(content)
             if line_parts:
@@ -381,7 +418,7 @@ class MinerUCloudOCRProvider(OCRProvider):
                     if ib.get("type") == 1 and ib.get("bbox")
                 ]
                 figure_regions = cluster_figure_regions(drawing_rects, image_rects, pdf_w, pdf_h)
-                table_regions = _extract_table_regions(page, figure_regions)
+                table_regions = _extract_table_regions(page, drawing_rects)
                 blocks: list[dict] = []
 
                 def add_leaf(leaf: dict, parent_type: str = "") -> None:
@@ -416,25 +453,75 @@ class MinerUCloudOCRProvider(OCRProvider):
                         })
                         return
 
+                    raw_lines = leaf.get("lines") or []
+                    line_groups = self._split_cross_column_lines(raw_lines, sx, sy, pdf_w) if len(raw_lines) >= 2 else [raw_lines]
+                    if len(line_groups) > 1:
+                        for lg in line_groups:
+                            sub_lbs = [
+                                [round(float(l["bbox"][0]) * sx, 2), round(float(l["bbox"][1]) * sy, 2), round(float(l["bbox"][2]) * sx, 2), round(float(l["bbox"][3]) * sy, 2)]
+                                for l in lg if isinstance(l.get("bbox"), list) and len(l["bbox"]) >= 4
+                            ]
+                            if not sub_lbs:
+                                continue
+                            sub_bbox = [
+                                min(b[0] for b in sub_lbs),
+                                min(b[1] for b in sub_lbs),
+                                max(b[2] for b in sub_lbs),
+                                max(b[3] for b in sub_lbs),
+                            ]
+                            add_leaf({**leaf, "lines": lg, "bbox": [sub_bbox[0] / sx, sub_bbox[1] / sy, sub_bbox[2] / sx, sub_bbox[3] / sy]}, parent_type=parent_type)
+                        return
                     txt, lbs = self._extract_lines_and_text(leaf, sx, sy)
                     if not txt:
                         return
                     bh = max(8.0, bbox[3] - bbox[1])
                     n_lines = max(1, len(lbs) or round(bh / 12.0))
+                    if btype in {"header", "footer", "page_number", "page_header", "page_footer", "aside_text"}:
+                        blocks.append({
+                            "block_id": f"p{page_idx}b{len(blocks):04d}",
+                            "kind": "header_footer",
+                            "text": txt,
+                            "bbox": bbox,
+                            "line_bboxes": lbs or [bbox],
+                            "font_size_pt": 8.5,
+                            "is_bold": False,
+                            "is_math_font": False,
+                            "policy": {"translate": False, "preserve_reason": "header_footer", "redact_source": False},
+                        })
+                        return
                     is_title = btype == "title" and int(leaf.get("level", 1) or 1) == 1 and page_idx == 0 and bbox[1] < pdf_h * 0.25
                     is_heading = btype == "title" and not is_title
                     is_formula = btype in {"interline_equation", "equation", "formula"}
                     font_sz = 14.0 if is_title else (11.0 if is_heading else min(10.5, max(7.5, bh / (n_lines * 1.18))))
-                    blocks.append({
+                    # Probe native PDF span font size inside bbox when digital text layer is available
+                    try:
+                        clip_d = page.get_text("dict", clip=pymupdf.Rect(bbox))
+                        sp_szs = [
+                            float(sp["size"])
+                            for b_d in clip_d.get("blocks", [])
+                            if b_d.get("type") == 0
+                            for l_d in b_d.get("lines", [])
+                            for sp in l_d.get("spans", [])
+                            if (sp.get("text") or "").strip() and sp.get("size") and float(sp["size"]) >= 6.0
+                        ]
+                        if sp_szs:
+                            sp_szs.sort()
+                            font_sz = sp_szs[len(sp_szs) // 2]
+                    except Exception:
+                        pass
+                    blk_entry = {
                         "block_id": f"p{page_idx}b{len(blocks):04d}",
-                        "kind": "text",
+                        "kind": "formula" if is_formula else "text",
                         "text": txt,
                         "bbox": bbox,
                         "line_bboxes": lbs or [bbox],
                         "font_size_pt": round(font_sz, 2),
                         "is_bold": is_title or is_heading,
                         "is_math_font": is_formula,
-                    })
+                    }
+                    if is_formula:
+                        blk_entry["policy"] = {"translate": False, "preserve_reason": "formula", "redact_source": False}
+                    blocks.append(blk_entry)
 
                 for blk in p_info.get("para_blocks") or []:
                     children = blk.get("blocks")

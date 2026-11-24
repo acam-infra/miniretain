@@ -1129,6 +1129,7 @@ class AutoOCRProvider(OCRProvider):
         auto_cfg = self.config.get("auto") if isinstance(self.config.get("auto"), dict) else {}
         self.scanned_char_threshold = int(auto_cfg.get("scanned_char_threshold", 20))
         self.fallback_provider = str(auto_cfg.get("fallback_provider") or "").strip()
+        self.pure_ocr = bool(auto_cfg.get("pure_ocr") or self.config.get("pure_ocr", False))
         if self.fallback_provider and self.fallback_provider not in {"paddle-http", "paddle-cpu", "paddle-cloud", "mineru", "none"}:
             raise OCRConfigError(
                 f"auto.fallback_provider must be one of ['paddle-http', 'paddle-cpu', 'paddle-cloud', 'mineru', 'none'], got {self.fallback_provider!r}"
@@ -1149,6 +1150,16 @@ class AutoOCRProvider(OCRProvider):
             from ocr.adapter import StubOCRProvider
             pages = StubOCRProvider().parse(source)
             self.routed_providers = {"stub": [p["page_index"] for p in pages]}
+            self.parse_seconds = round(time.perf_counter() - t0, 3)
+            return pages
+
+        if self.pure_ocr and self.fallback_provider in ("mineru", "paddle-cloud", "paddle-http", "paddle-cpu"):
+            from ocr.adapter import get_provider
+            pure_prov = get_provider(self.fallback_provider, self.config)
+            pages = pure_prov.parse(source)
+            self.service_info = getattr(pure_prov, "service_info", {}) or {"provider": self.fallback_provider, "pure_ocr": True}
+            self.paddle_pages = [p["page_index"] for p in pages]
+            self.routed_providers = {self.fallback_provider: list(self.paddle_pages)}
             self.parse_seconds = round(time.perf_counter() - t0, 3)
             return pages
 

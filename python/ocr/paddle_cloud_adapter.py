@@ -25,7 +25,7 @@ from ocr.pymupdf_adapter import _extract_table_regions
 
 DEFAULT_PADDLE_JOB_URL = "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
 DEFAULT_PADDLE_MODEL = "PaddleOCR-VL-1.6"
-_TAG_RE = re.compile(r"<[^>]+>")
+_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9\-]*(?:\s+[^<>]*)?>")
 
 
 _BOLD_TAG_RE = re.compile(r"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>", re.IGNORECASE | re.DOTALL)
@@ -314,7 +314,7 @@ class PaddleCloudOCRProvider(OCRProvider):
                     if ib.get("type") == 1 and ib.get("bbox")
                 ]
                 figure_regions = cluster_figure_regions(drawing_rects, image_rects, pdf_w, pdf_h)
-                table_regions = _extract_table_regions(page, figure_regions)
+                table_regions = _extract_table_regions(page, drawing_rects)
 
                 blocks: list[dict] = []
                 parsing_res_list = pruned.get("parsing_res_list") or []
@@ -351,27 +351,59 @@ class PaddleCloudOCRProvider(OCRProvider):
                         })
                         continue
 
-                    text_clean = _clean_html_text(raw_content) if "<" in raw_content else " ".join(raw_content.split()).strip()
+                    text_clean = _clean_html_text(raw_content) if _TAG_RE.search(raw_content) else " ".join(raw_content.split()).strip()
                     if not text_clean:
                         continue
 
+                    if label in {"header", "footer", "number", "page_number", "aside_text"}:
+                        blocks.append({
+                            "block_id": f"p{page_idx}b{len(blocks):04d}",
+                            "kind": "header_footer",
+                            "text": text_clean,
+                            "bbox": bbox,
+                            "line_bboxes": [bbox],
+                            "font_size_pt": 8.5,
+                            "is_bold": False,
+                            "is_math_font": False,
+                            "policy": {"translate": False, "preserve_reason": "header_footer", "redact_source": False},
+                        })
+                        continue
                     bh = max(8.0, bbox[3] - bbox[1])
                     est_lines = max(1, round(bh / 12.0))
                     is_title = label == "doc_title"
                     is_heading = label == "paragraph_title"
                     is_formula = label in {"display_formula", "formula", "formula_number"}
                     font_sz = 14.0 if is_title else (11.0 if is_heading else min(10.5, max(7.5, bh / (est_lines * 1.18))))
+                    lbs = [bbox]
+                    try:
+                        clip_d = page.get_text("dict", clip=pymupdf.Rect(bbox))
+                        sp_szs = [
+                            float(sp["size"])
+                            for b_d in clip_d.get("blocks", [])
+                            if b_d.get("type") == 0
+                            for l_d in b_d.get("lines", [])
+                            for sp in l_d.get("spans", [])
+                            if (sp.get("text") or "").strip() and sp.get("size") and float(sp["size"]) >= 6.0
+                        ]
+                        if sp_szs:
+                            sp_szs.sort()
+                            font_sz = sp_szs[len(sp_szs) // 2]
+                    except Exception:
+                        pass
 
-                    blocks.append({
+                    blk_entry = {
                         "block_id": f"p{page_idx}b{len(blocks):04d}",
-                        "kind": "text",
+                        "kind": "formula" if is_formula else "text",
                         "text": text_clean,
                         "bbox": bbox,
-                        "line_bboxes": [bbox],
+                        "line_bboxes": lbs,
                         "font_size_pt": round(font_sz, 2),
                         "is_bold": is_title or is_heading,
                         "is_math_font": is_formula,
-                    })
+                    }
+                    if is_formula:
+                        blk_entry["policy"] = {"translate": False, "preserve_reason": "formula", "redact_source": False}
+                    blocks.append(blk_entry)
 
                 raw_pages.append({
                     "page_index": page_idx,

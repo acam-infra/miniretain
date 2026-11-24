@@ -228,3 +228,38 @@ def test_upstream_formula_safety_and_formula_guard_redaction_protection():
     for f in frags:
         overlap = f & formula_guard
         assert overlap.is_empty or overlap.width <= 0 or overlap.height <= 0
+
+
+def test_pure_ocr_flag_and_inequality_html_safety(monkeypatch):
+    from ocr.adapter import _FACTORIES, REGISTRY
+    from ocr.mineru_cloud_adapter import _clean_html_text as mineru_clean
+    from ocr.paddle_cloud_adapter import _TAG_RE, _clean_html_text as paddle_clean
+    from ocr.pymupdf_adapter import AutoOCRProvider
+
+    # 1. Mathematical '<' and '>' must NEVER be mistaken for HTML tags
+    ineq = "Let $a < b$ and $\\rho_k^d > 0$ hold for all $k < K$."
+    assert not _TAG_RE.search(ineq)
+    assert paddle_clean("<b>Bold.</b> " + ineq) == "**Bold.** " + ineq
+    assert mineru_clean("<i>Italic.</i> " + ineq) == "*Italic.* " + ineq
+
+    # 2. AutoOCRProvider with pure_ocr=True routes digital PDFs directly to fallback_provider
+    called = []
+
+    class DummyCloudProv:
+        name = "mineru"
+        service_info = {"provider": "mineru", "model_version": "vlm"}
+
+        def __init__(self, config=None):
+            self.config = config or {}
+
+        def parse(self, source):
+            called.append(source)
+            return [{"page_index": 0, "width": 612.0, "height": 792.0, "is_scanned": False, "ocr_reliable": True, "blocks": []}]
+
+    monkeypatch.setitem(REGISTRY, "mineru", DummyCloudProv())
+    monkeypatch.setitem(_FACTORIES, "mineru", lambda cfg: DummyCloudProv(cfg))
+    auto_pure = AutoOCRProvider(config={"auto": {"pure_ocr": True, "fallback_provider": "mineru"}})
+    pages = auto_pure.parse("dummy.pdf")
+    assert called == ["dummy.pdf"]
+    assert auto_pure.routed_providers == {"mineru": [0]}
+    assert len(pages) == 1
