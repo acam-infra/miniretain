@@ -350,9 +350,19 @@ class MinerUCloudOCRProvider(OCRProvider):
                 line_s = re.sub(r"\$\s+([.,;:!?)\]])", r"$\1", line_s)
                 line_s = re.sub(r"([(\[])\s+\$", r"\1$", line_s)
                 chunks.append(line_s)
-        full_s = " ".join(chunks).strip()
-        full_s = re.sub(r"\$\s+([.,;:!?)\]])", r"$\1", full_s)
-        full_s = re.sub(r"([(\[])\s+\$", r"\1$", full_s)
+        btype_low = str(blk.get("type") or "").strip().lower()
+        algo_line_hits = sum(
+            1
+            for c in chunks
+            if re.match(
+                r"^(?:\*?\*?\d+[:.]|\d+\s+|(?:Input|Output|Require|Ensure|for|while|if|else|elif|end|return|Function|Procedure)\b)",
+                c.strip(),
+            )
+        )
+        sep = "\n" if (btype_low in {"algorithm", "code"} or algo_line_hits >= 2) else " "
+        full_s = sep.join(chunks).strip()
+        full_s = re.sub(r"\$[ \t]+([.,;:!?)\]])", r"$\1", full_s)
+        full_s = re.sub(r"([(\[])[ \t]+\$", r"\1$", full_s)
         return full_s, line_bboxes
 
     def parse(self, source: str) -> list[dict]:

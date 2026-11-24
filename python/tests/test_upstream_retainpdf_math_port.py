@@ -302,3 +302,45 @@ def test_compact_ocr_math_whitespace_and_display_formula_vertical_layout():
     # 4. AutoOCRProvider defaults pure_ocr=True when fallback_provider is mineru or paddle-cloud
     auto_default_pure = AutoOCRProvider(config={"auto": {"fallback_provider": "mineru"}})
     assert auto_default_pure.pure_ocr is True
+
+
+def test_closed_loop_multi_leading_selection_and_algo_line_preservation():
+    from ocr.mineru_cloud_adapter import MinerUCloudOCRProvider
+    from render.typst_renderer import _compute_block_vertical_layout
+
+    # 1. Closed-loop measured_lead_heights selects highest fitting leading up to target_h above display eq
+    fg = pymupdf.Rect(314.0, 271.0, 561.0, 309.0)
+    pm = {"formula_guard_rects": [fg], "neighbor_boxes": []}
+    above_rect = pymupdf.Rect(314.0, 109.0, 561.0, 264.0)  # height = 155pt
+    measured_leads = {
+        0.45: 121.0,
+        0.55: 127.8,
+        0.66: 135.2,
+        0.78: 143.4,
+        0.90: 151.0,
+        1.02: 159.2,  # exceeds max_h=154.2
+    }
+    best_lead, dy_off = _compute_block_vertical_layout(
+        {"layout_role": "body"},
+        above_rect,
+        chosen_sz=9.75,
+        mh=121.0,
+        pm=pm,
+        measured_lead_heights=measured_leads,
+        local_i=0,
+    )
+    assert best_lead == 0.90
+    assert dy_off == 0.0
+
+    # 2. Algorithm block preserves newline breaks instead of collapsing into a single run-on line
+    algo_blk = {
+        "type": "algorithm",
+        "lines": [
+            {"bbox": [50, 100, 250, 112], "spans": [{"type": "text", "content": "Input: Graph G=(V,E)"}]},
+            {"bbox": [50, 115, 250, 127], "spans": [{"type": "text", "content": "1: for each v in V do"}]},
+            {"bbox": [62, 130, 250, 142], "spans": [{"type": "text", "content": "2: update state(v)"}]},
+        ],
+    }
+    algo_txt, algo_lbs = MinerUCloudOCRProvider._extract_lines_and_text(algo_blk, 1.0, 1.0)
+    assert "\n" in algo_txt
+    assert len(algo_lbs) == 3

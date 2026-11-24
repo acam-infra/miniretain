@@ -566,68 +566,189 @@ def _block_justify_and_leading(text: str, sz: float, width_pt: float) -> tuple[s
     return justify_str, leading
 
 
+_CANDIDATE_LEADINGS_NORMAL = (0.45, 0.54, 0.64, 0.74, 0.82)
+_CANDIDATE_LEADINGS_FORMULA_ADJ = (0.45, 0.55, 0.66, 0.78, 0.90, 1.02, 1.14)
+
+
+def _detect_formula_adjacency(
+    rect: pymupdf.Rect,
+    formula_guards: list[pymupdf.Rect],
+) -> tuple[bool, float, bool, float]:
+    """Return (is_above_formula, min_gap_below_to_formula, is_below_formula, min_gap_above_from_formula)."""
+    is_above = False
+    gap_below = 999.0
+    is_below = False
+    gap_above = 999.0
+    for fg in formula_guards:
+        x_ov = min(rect.x1, fg.x1) - max(rect.x0, fg.x0)
+        min_w = max(1.0, min(rect.width, fg.width))
+        if x_ov < min_w * 0.18:
+            continue
+        dy_below = fg.y0 - rect.y1
+        if -4.0 <= dy_below <= 34.0:
+            is_above = True
+            gap_below = min(gap_below, max(0.0, dy_below))
+        dy_above = rect.y0 - fg.y1
+        if -4.0 <= dy_above <= 16.0:
+            is_below = True
+            gap_above = min(gap_above, max(0.0, dy_above))
+    return is_above, gap_below, is_below, gap_above
+
+
+def measure_leadings_with_typst(
+    typst_bin: str,
+    font_dir: str,
+    font_families: str,
+    workdir: Path,
+    placed_blocks: list[dict],
+    probe_name: str = "leading_probe.typ",
+    pkg_cache_dir: str | None = None,
+    bold_font_families: str | None = None,
+) -> dict[tuple[int, float], float]:
+    """Closed-loop Typst measure() probe across candidate line-leadings (em) at each block's locked font size."""
+    if not placed_blocks:
+        return {}
+    needs_mitex = any(
+        "#mi(" in b.get("rich_expr", "") or "#mitex(" in b.get("rich_expr", "")
+        for b in placed_blocks
+    )
+    lines: list[str] = []
+    if needs_mitex:
+        lines.append(_MITEX_IMPORT_LINE)
+    lines.extend([
+        f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        f'#show strong: set text(font: {bold_font_families or font_families}, weight: "bold")',
+        _CJK_EMPH_SHOW_RULE,
+        "",
+    ])
+    query_count = 0
+    for b in placed_blocks:
+        idx = b["idx"]
+        sz = b["chosen_sz"]
+        leadings = b["leadings"]
+        raw_w = max(4.0, b["width"])
+        w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
+        weight = b["weight"]
+        blk_font_attr = f'font: {bold_font_families or font_families}, ' if weight == "bold" else ""
+        rich = b["rich_expr"]
+        justify_str = b["justify_str"]
+        for lead in leadings:
+            query_count += 1
+            lines.append(
+                f'#context {{ let m = measure(block(width: {w:.2f}pt)'
+                f'[#set text({blk_font_attr}size: {sz:.2f}pt, weight: "{weight}"); '
+                f'#set par(leading: {lead:.2f}em, justify: {justify_str}); {rich}]); '
+                f'[#metadata((idx: {idx}, lead: {lead:.2f}, h: m.height / 1pt)) <leadfit>] }}'
+            )
+    if query_count == 0:
+        return {}
+    probe_typ = workdir / probe_name
+    probe_typ.write_text("\n".join(lines), encoding="utf-8")
+    proc = subprocess.run(
+        [typst_bin, "query", "--font-path", font_dir, *(_typst_pkg_args(pkg_cache_dir) if needs_mitex else []), str(probe_typ), "<leadfit>"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if proc.returncode != 0:
+        return {}
+    rows = json.loads(proc.stdout)
+    out: dict[tuple[int, float], float] = {}
+    for row in rows:
+        val = row.get("value") or {}
+        idx = int(val["idx"])
+        lead = round(float(val["lead"]), 2)
+        out[(idx, lead)] = float(val["h"])
+    return out
+
+
 def _compute_block_vertical_layout(
     it: dict,
     rect: pymupdf.Rect,
     chosen_sz: float,
     mh: float,
     pm: dict,
+    measured_lead_heights: dict[float, float] | None = None,
+    local_i: int | None = None,
 ) -> tuple[float, float]:
-    """Compute adaptive comfort line-leading (em) and vertical dy_offset (pt) to control
-    empty lines around interline (display) formulas and balance multi-line CJK blocks."""
+    """Closed-loop Typst vertical layout optimizer: uses exact Typst-measured heights across candidate
+    leadings when available (falling back to analytical estimate only in unit tests without Typst query)."""
     base_lead = _base_leading_em(chosen_sz)
     role = it.get("layout_role", "body")
-    if role not in {"body", "list_item"} or mh <= 0 or rect.height <= mh + 1.5:
+    if role not in {"body", "list_item"} or mh <= 0 or rect.height <= mh + 1.2:
         return base_lead, 0.0
 
     formula_guards: list[pymupdf.Rect] = pm.get("formula_guard_rects") or []
-    is_above_formula = False
-    gap_to_formula_below = 999.0
-    is_below_formula = False
-    gap_from_formula_above = 999.0
+    is_above_formula, gap_to_formula_below, is_below_formula, gap_from_formula_above = _detect_formula_adjacency(
+        rect, formula_guards
+    )
 
-    for fg in formula_guards:
-        x_ov = min(rect.x1, fg.x1) - max(rect.x0, fg.x0)
-        min_w = max(1.0, min(rect.width, fg.width))
-        if x_ov < min_w * 0.2:
-            continue
-        dy_below = fg.y0 - rect.y1
-        if -3.0 <= dy_below <= 30.0:
-            is_above_formula = True
-            gap_to_formula_below = min(gap_to_formula_below, max(0.0, dy_below))
-        dy_above = rect.y0 - fg.y1
-        if -4.0 <= dy_above <= 14.0:
-            is_below_formula = True
-            gap_from_formula_above = min(gap_from_formula_above, max(0.0, dy_above))
-
-    slack = max(0.0, float(rect.height) - float(mh) - 1.8)
+    h_base = float((measured_lead_heights or {}).get(round(base_lead, 2), mh))
+    slack = max(0.0, float(rect.height) - h_base - 1.2)
     dy_offset = 0.0
 
-    # 1. Below a display equation: add clean top breathing room (~8.5pt total clearance)
-    if is_below_formula and slack > 1.0:
-        target_top_gap = max(8.5, chosen_sz * 0.85)
+    # 1. Below a display equation: add clean top breathing room (~8.5-9.5pt total clearance)
+    if is_below_formula and slack > 0.8:
+        target_top_gap = max(8.5, chosen_sz * 0.88)
         needed_top = max(0.0, target_top_gap - gap_from_formula_above)
-        top_shift = min(needed_top, slack * 0.65, 8.5)
+        top_shift = min(needed_top, slack * 0.72, 9.5)
         if top_shift >= 0.5:
             dy_offset = round(top_shift, 2)
             slack = max(0.0, slack - dy_offset)
 
-    # 2. Adaptive comfort line-leading so multi-line Chinese blocks fill vertical slack
+    max_h = float(rect.height) - dy_offset - 0.8
+    neighbor_boxes = pm.get("neighbor_boxes") or []
+
+    # 2. If exact Typst multi-leading measurements are available, perform closed-loop selection
+    if measured_lead_heights:
+        max_lead_cap = 1.14 if is_above_formula else 0.82
+        fill_target_ratio = 0.94 if is_above_formula else 0.78
+        target_h = h_base + max(0.0, max_h - h_base) * fill_target_ratio
+        best_lead = base_lead
+        best_h = h_base
+        for cand_lead, cand_h in sorted(measured_lead_heights.items()):
+            if cand_lead < base_lead - 1e-4 or cand_lead > max_lead_cap + 1e-4:
+                continue
+            if cand_h > max_h + 0.2:
+                continue
+            if local_i is not None and neighbor_boxes:
+                placed_box = (rect.x0, rect.y0 + dy_offset, rect.x0 + rect.width, rect.y0 + dy_offset + cand_h)
+                if _overlaps_neighbor(
+                    placed_box,
+                    local_i,
+                    neighbor_boxes,
+                    self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
+                ):
+                    continue
+            if cand_h <= target_h + 1.5 and cand_h >= best_h - 0.1:
+                best_lead = cand_lead
+                best_h = cand_h
+        rem_slack = max(0.0, max_h - best_h)
+        if is_above_formula and rem_slack > 2.5:
+            # Push block slightly closer to the display equation while keeping ~10pt gap above the equation
+            desired_gap = max(9.5, chosen_sz * 0.98)
+            total_gap = gap_to_formula_below + rem_slack
+            if total_gap > desired_gap + 1.5:
+                add_dy = min(total_gap - desired_gap, rem_slack * 0.75, 8.5)
+                if add_dy >= 0.5:
+                    dy_offset = round(dy_offset + add_dy, 2)
+        return round(best_lead, 2), dy_offset
+
+    # 3. Fallback analytical solver when called standalone without Typst multi-leading query
     line_step = max(1.0, chosen_sz * (1.0 + base_lead))
-    est_lines = max(1, int(round(mh / line_step)))
+    est_lines = max(1, int(round(h_base / line_step)))
     chosen_lead = base_lead
     if est_lines >= 2 and slack > 1.5:
         num_gaps = est_lines - 1
-        fill_ratio = 0.88 if is_above_formula else 0.72
+        fill_ratio = 0.90 if is_above_formula else 0.72
         extra_em = (slack * fill_ratio) / (num_gaps * chosen_sz)
-        max_lead = 0.94 if is_above_formula else 0.76
+        max_lead = 1.02 if is_above_formula else 0.76
         chosen_lead = min(max_lead, round(base_lead + extra_em, 2))
         used_h = (chosen_lead - base_lead) * num_gaps * chosen_sz
         slack = max(0.0, slack - used_h)
 
-    # 3. Above a display equation: gently shift down if excess slack remains
-    if is_above_formula and slack > 3.5 and dy_offset == 0.0:
-        down_shift = min(slack * 0.45, 5.5)
+    if is_above_formula and slack > 3.0 and dy_offset == 0.0:
+        down_shift = min(slack * 0.55, 6.5)
         if down_shift >= 0.5:
             dy_offset = round(down_shift, 2)
 
@@ -1055,27 +1176,33 @@ def _render_typst_preserve(
             measured.update(measured2)
         fit_probe_s = round(time.perf_counter() - t_probe_0, 3)
 
-        # Step 3: Select largest size >= min_size passing token width, height, bounds, non-overlap
+        # Step 3: Select largest size >= min_size passing token width, height, bounds, non-overlap,
+        # unify page body font size across substantial paragraphs, and run closed-loop Typst leading probe.
         to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]] = {}
+        leading_probe_blocks: list[dict] = []
+        placed_cand_map: dict[int, tuple[dict, pymupdf.Rect, float, float, dict, int]] = {}
+
         for pm in page_meta:
             page_index = pm["page_index"]
             pw, ph = pm["pw"], pm["ph"]
-            to_render: list[tuple[dict, pymupdf.Rect, float, int]] = []
+            page_fitted: list[tuple[dict, float, int, list[float]]] = []
 
             for cand in pm["candidates"]:
                 it = cand["item"]
                 bid = it.get("block_id", "unknown")
                 rect = cand["rect"]
-                chosen_sz = None
+                fitting_szs: list[tuple[float, int]] = []
                 fail_reason = "overflow"
 
                 for step_i, sz in enumerate(cand["sizes"]):
                     tw, mh = measured.get((cand["idx"], round(sz, 2)), (1e9, 1e9))
                     if tw > rect.width + 0.5:
-                        fail_reason = "horizontal_overflow"
+                        if not fitting_szs:
+                            fail_reason = "horizontal_overflow"
                         continue
                     if mh > rect.height + 0.5:
-                        fail_reason = "vertical_overflow"
+                        if not fitting_szs:
+                            fail_reason = "vertical_overflow"
                         continue
                     placed_box = (rect.x0, rect.y0, rect.x0 + rect.width, rect.y0 + mh)
                     if (
@@ -1084,7 +1211,8 @@ def _render_typst_preserve(
                         or placed_box[2] > pw + 0.5
                         or placed_box[3] > ph + 0.5
                     ):
-                        fail_reason = "out_of_bounds"
+                        if not fitting_szs:
+                            fail_reason = "out_of_bounds"
                         continue
                     if _overlaps_neighbor(
                         placed_box,
@@ -1092,25 +1220,105 @@ def _render_typst_preserve(
                         pm["neighbor_boxes"],
                         self_orig_box=(rect.x0, rect.y0, rect.x1, rect.y1),
                     ):
-                        fail_reason = "neighbor_overlap"
+                        if not fitting_szs:
+                            fail_reason = "neighbor_overlap"
                         continue
-                    chosen_sz = sz
-                    shrunk += step_i
-                    break
+                    fitting_szs.append((sz, step_i))
 
-                if chosen_sz is None:
+                if not fitting_szs:
                     unplaced += 1
                     unplaced_block_ids.append(bid)
                     unplaced_reasons[bid] = fail_reason
                     continue
 
+                top_sz, top_step = fitting_szs[0]
+                page_fitted.append((cand, top_sz, top_step, [s for s, _ in fitting_szs]))
+
+            # Compute canonical page body font size across substantial multi-line body paragraphs
+            body_top_szs = sorted(
+                top_sz
+                for cand, top_sz, _st, _all_s in page_fitted
+                if cand["item"].get("layout_role", "body") == "body"
+                and cand["rect"].height >= 26.0
+                and len((cand["item"].get("translation") or "").strip()) >= 35
+            )
+            canonical_body_sz: float | None = None
+            if len(body_top_szs) >= 2:
+                canonical_body_sz = body_top_szs[len(body_top_szs) // 3]
+
+            to_render: list[tuple[dict, pymupdf.Rect, float, int]] = []
+            formula_guards = pm.get("formula_guard_rects") or []
+            for cand, top_sz, top_step, all_fit_szs in page_fitted:
+                it = cand["item"]
+                rect = cand["rect"]
+                role = it.get("layout_role", "body")
+                chosen_sz = top_sz
+                if (
+                    canonical_body_sz is not None
+                    and role == "body"
+                    and rect.height >= 20.0
+                    and top_sz > canonical_body_sz + 0.05
+                    and top_sz <= canonical_body_sz + 1.25
+                ):
+                    # Lock to canonical page body font size if measured or interpolable
+                    best_locked = min(all_fit_szs, key=lambda s: (abs(s - canonical_body_sz), -s))
+                    if abs(best_locked - canonical_body_sz) <= 0.26:
+                        chosen_sz = best_locked
+                shrunk += top_step
                 _, chosen_mh = measured.get((cand["idx"], round(chosen_sz, 2)), (0.0, rect.height))
-                lead_em, dy_off = _compute_block_vertical_layout(it, rect, chosen_sz, chosen_mh, pm)
-                it["_render_leading_em"] = lead_em
-                it["_render_dy_offset"] = dy_off
+                placed_cand_map[cand["idx"]] = (it, rect, chosen_sz, chosen_mh, pm, cand["local_i"])
+
+                if role in {"body", "list_item"} and rect.height > chosen_sz * 1.75:
+                    is_above, _, is_below, _ = _detect_formula_adjacency(rect, formula_guards)
+                    base_l = _base_leading_em(chosen_sz)
+                    grid = _CANDIDATE_LEADINGS_FORMULA_ADJ if (is_above or is_below) else _CANDIDATE_LEADINGS_NORMAL
+                    lead_list = sorted(set([round(base_l, 2), *[round(x, 2) for x in grid if x >= base_l]]))
+                    raw_w = max(4.0, float(rect.width))
+                    w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
+                    trans_txt = (it.get("translation") or "").strip()
+                    justify_str, _ = _block_justify_and_leading(trans_txt, chosen_sz, w)
+                    leading_probe_blocks.append({
+                        "idx": cand["idx"],
+                        "chosen_sz": chosen_sz,
+                        "leadings": lead_list,
+                        "width": raw_w,
+                        "weight": cand["weight"],
+                        "rich_expr": cand["rich_expr"],
+                        "justify_str": justify_str,
+                    })
+
                 to_render.append((it, rect, chosen_sz, cand["local_i"]))
 
             to_place_by_page[page_index] = to_render
+
+        # Run closed-loop Typst multi-leading measurement probe
+        lead_measured_raw = measure_leadings_with_typst(
+            typst_bin,
+            font_dir,
+            font_families,
+            workdir,
+            leading_probe_blocks,
+            probe_name="leading_probe.typ",
+            pkg_cache_dir=pkg_cache_dir,
+            bold_font_families=bold_font_families,
+        )
+        lead_by_idx: dict[int, dict[float, float]] = {}
+        for (idx, lead_val), h_val in lead_measured_raw.items():
+            lead_by_idx.setdefault(idx, {})[round(lead_val, 2)] = h_val
+
+        for idx, (it, rect, chosen_sz, chosen_mh, pm, local_i) in placed_cand_map.items():
+            m_leads = lead_by_idx.get(idx)
+            lead_em, dy_off = _compute_block_vertical_layout(
+                it,
+                rect,
+                chosen_sz,
+                chosen_mh,
+                pm,
+                measured_lead_heights=m_leads,
+                local_i=local_i,
+            )
+            it["_render_leading_em"] = lead_em
+            it["_render_dy_offset"] = dy_off
 
         # Step 4: Compile overlay.pdf BEFORE redacting source PDF and verify actual rendered glyph spans!
         t_overlay_0 = time.perf_counter()
