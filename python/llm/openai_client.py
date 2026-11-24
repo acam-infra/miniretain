@@ -96,13 +96,77 @@ def _extract_json_object(content: str) -> dict:
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         text = "\n".join(lines).strip()
+    _latex_bfnrt_re = re.compile(
+        r"\\(?="
+        r"(?:text|textbf|textit|textrm|textsf|texttt|theta|vartheta|tau|times|to|top|tilde|triangle|tfrac|tag|tan|tanh|tr)"
+        r"|(?:beta|bar|bf|boldsymbol|bm|big|Big|bigg|Bigg|binom|bot|bullet|boxed|begin|bmod|bowtie|bigcirc|bigcup|bigcap)"
+        r"|(?:frac|forall|flat|frown|footnotesize|fbox)"
+        r"|(?:nu|nabla|neq|ne|neg|ni|notin|not|nleq|ngeq|nsubseteq|norm|newline|nonumber|noindent|natural|nmid|nwarrow|nearrow)"
+        r"|(?:rho|varrho|rightarrow|Rightarrow|rightleftharpoons|rangle|rceil|rfloor|rm|mathrm|mathcal|mathbf|mathbb|mathsf|mathtt|mathit|operatorname|ref|right|rule)"
+        r"(?![A-Za-z])"
+        r")"
+    )
+
+    def _repair_json_latex(s: str) -> str:
+        out: list[str] = []
+        i, n, in_str = 0, len(s), False
+        while i < n:
+            ch = s[i]
+            if not in_str:
+                out.append(ch)
+                if ch == '"':
+                    in_str = True
+                i += 1
+                continue
+            if ch == '"':
+                out.append(ch)
+                in_str = False
+                i += 1
+                continue
+            if ch != "\\":
+                out.append(ch)
+                i += 1
+                continue
+            if i + 1 >= n:
+                out.append("\\\\")
+                i += 1
+                continue
+            nxt = s[i + 1]
+            if nxt == "\\":
+                out.append("\\\\")
+                i += 2
+            elif nxt in ('"', "/"):
+                out.append("\\" + nxt)
+                i += 2
+            elif nxt == "u":
+                if i + 5 < n and all(c in "0123456789abcdefABCDEF" for c in s[i + 2 : i + 6]):
+                    out.append(s[i : i + 6])
+                    i += 6
+                else:
+                    out.append("\\\\")
+                    i += 1
+            elif nxt in ("b", "f", "n", "r", "t"):
+                if _latex_bfnrt_re.match(s, i):
+                    out.append("\\\\")
+                    i += 1
+                else:
+                    out.append("\\" + nxt)
+                    i += 2
+            else:
+                out.append("\\\\")
+                i += 1
+        return "".join(out)
+
+    def _loads_lenient(s: str) -> Any:
+        return json.loads(_repair_json_latex(s), strict=False)
+
     try:
-        obj = json.loads(text)
+        obj = _loads_lenient(text)
     except json.JSONDecodeError:
         start = text.find("{")
         end = text.rfind("}")
         if start != -1 and end > start:
-            obj = json.loads(text[start : end + 1])
+            obj = _loads_lenient(text[start : end + 1])
         else:
             raise
     if not isinstance(obj, dict):
@@ -184,9 +248,10 @@ class OpenAICompatLLMClient:
         ctx_section = f"\nDocument terminology & style context:\n{doc_context}\n" if doc_context else ""
         prompt = (
             f"Translate each numbered academic paper block to {target_lang}. "
-            f"Rules: (1) Keep placeholders like ⟪F0⟫, citations like [1], URLs, numbers/units, and standard technical "
+            f"Rules: (1) Keep placeholders like ⟪F0⟫, inline/display math ($...$, $$...$$), citations like [1], URLs, numbers/units, and standard technical "
             f"acronyms (e.g., LLM, KV Cache, MoE, FFN, Prefill, Decode, LEO, ISL, TFLOPS, Gbps, DRAM, HBM) "
-            f"accurate; (2) Preserve any inline Markdown bold **...** and italic *...* markers around the corresponding "
+            f"verbatim and accurate (never drop subscripts/superscripts or emit raw LaTeX commands outside $...$); "
+            f"(2) Preserve any inline Markdown bold **...** and italic *...* markers around the corresponding "
             f"translated terms or paragraph lead-in headings (e.g., '**Batching.**' -> '**批处理。**', '*continuous batching*' -> '*连续批处理*'); "
             f"(3) Use natural, concise academic {target_lang}; "
             f"(4) Reply with ONLY a valid JSON object mapping every exact block_id -> translation (do not omit any block_id)."
@@ -274,6 +339,11 @@ class OpenAICompatLLMClient:
             effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned_nomark))
             if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and effective_len > max(32, int(len(src_raw) * 1.25)):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"suspiciously long translation for {bid}"})
+                continue
+            expected_toks = set(re.findall(r"⟪F\d+⟫", src_raw))
+            actual_toks = set(re.findall(r"⟪F\d+⟫", cleaned))
+            if actual_toks - expected_toks:
+                out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"foreign formula tokens {sorted(actual_toks - expected_toks)} for {bid}"})
                 continue
             if _is_verbatim_untranslated_echo(item, cleaned, target_lang):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"untranslated verbatim echo for {bid}"})

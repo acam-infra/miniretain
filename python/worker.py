@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -180,7 +181,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
 
         if t_status == "ok" and trans_text:
             restored, missing_toks = restore_formulas(trans_text, formula_tokens_by_idx.get(idx, {}))
-            trans_text = restored
+            trans_text = re.sub(r"⟪F\d+⟫", "", restored)
             if missing_toks:
                 formula_warnings.append(f"{item['block_id']}: missing formula tokens {missing_toks}")
             p_stat["succeeded"] += 1

@@ -201,6 +201,11 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
     s = text.strip()
     if not s:
         return False
+    # If removing delimited math ($...$ / $$...$$) leaves no prose words, the block is a pure formula fragment
+    if "$" in s:
+        outside = re.sub(r"\$\$[^$]+\$\$|\$[^$\n]+\$", " ", s)
+        if not re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]", outside):
+            return True
     if re.match(r"^\(\d+(?:\.\d+)*\)$", s):
         return True
     if _BIG_O_ONLY_RE.match(s):

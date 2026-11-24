@@ -34,6 +34,7 @@ def find_typst_package_cache_dir() -> str | None:
     candidates.extend([
         Path.home() / ".cache" / "typst" / "packages",
         Path("/root/.cache/typst/packages"),
+        Path("/home/agentuser/.cache/typst/packages"),
         Path("/home/ccds/.cache/typst/packages"),
     ])
     seen: set[str] = set()
@@ -114,6 +115,59 @@ def _breakable_url_display(url: str) -> str:
     if len(out) <= 1:
         return f"#{typst_str_literal(url)}"
     return "#sym.zws ".join(f"#{typst_str_literal(p)}" for p in out)
+
+
+
+_SQRT_ARG_RE = re.compile(
+    r"√(?:\{([^{}]+)\}|\(([^()]+)\)|((?:\\[A-Za-z]+|[^\s^_{}()+\-−=<>.,;:])(?:_(?:\{[^{}]+\}|[^\s{}])|\^(?:\{[^{}]+\}|[^\s{}]))*))"
+)
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _strip_control_chars(text: str) -> str:
+    return _CTRL_CHAR_RE.sub("", text) if text else text
+
+
+def _sanitize_latex_for_mitex(expr: str) -> str:
+    """Minimal normalization for MiTeX raw backtick strings: convert bare √ to \sqrt{...}
+    and Unicode primes to ASCII primes; pass all other Unicode math symbols untouched to MiTeX."""
+    if not expr:
+        return expr
+    s = _strip_control_chars(expr)
+    s = _SQRT_ARG_RE.sub(lambda m: rf"\sqrt{{{m.group(1) or m.group(2) or m.group(3)}}}", s)
+    return s.replace("″", "''").replace("′", "'")
+
+
+def _build_font_families(font: str, cjk_font_file: str) -> tuple[str, str]:
+    """Build (body_font_families, bold_font_families) Typst font lists.
+
+    Respects explicit `render.font` (family name or file path). For CJK bold
+    (headings, titles, #strong[...]), switches CJK to Heiti (`Noto Sans CJK SC`)
+    so bold weight stands out crisply against Songti (`Noto Serif CJK SC`) body text.
+    """
+    req = (font or "").strip()
+    is_path_like = bool(req and ("/" in req or req.lower().endswith((".ttf", ".otf", ".ttc"))))
+    body_list: list[str] = ["Libertinus Serif"]
+    if req and not is_path_like:
+        body_list.append(req)
+    fname_hint = (Path(req).name if is_path_like else Path(cjk_font_file).name).lower()
+    if any(tok in fname_hint for tok in ("sans", "hei", "gothic")):
+        cjk_defaults = ["Noto Sans CJK SC", "Noto Serif CJK SC", "Source Han Sans SC", "Droid Sans Fallback"]
+    else:
+        cjk_defaults = ["Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC", "Droid Sans Fallback"]
+    for f in cjk_defaults:
+        if f not in body_list:
+            body_list.append(f)
+
+    bold_list: list[str] = ["Libertinus Serif", "Noto Sans CJK SC", "Noto Serif CJK SC", "Source Han Sans SC", "Droid Sans Fallback"]
+    if req and not is_path_like:
+        bold_list = [x for x in bold_list if x != req]
+        bold_list.insert(1, req)
+
+    def _fmt(lst: list[str]) -> str:
+        return "(" + ", ".join(f'"{x}"' for x in lst) + ")"
+
+    return _fmt(body_list), _fmt(bold_list)
 
 
 def _typst_raw_literal(expr: str) -> str:
@@ -362,7 +416,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
                     pass
             if need_left_gap:
                 parts.append(_INLINE_MATH_GAP)
-            parts.append(f"#mi({_typst_raw_literal(content)})")
+            parts.append(f"#mi({_typst_raw_literal(_sanitize_latex_for_mitex(content))})")
             if idx + 1 < n and segs[idx + 1][0] == "text":
                 nxt_raw = segs[idx + 1][1]
                 nxt_stripped = _strip_leading_hspaces(nxt_raw)
@@ -376,7 +430,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
                         segs[idx + 1][1] = nxt_stripped
         elif kind == "display_math":
             parts.append(
-                f"#block(above: 0.45em, below: 0.45em, breakable: false)[#mitex({_typst_raw_literal(content)})]"
+                f"#block(above: 0.45em, below: 0.45em, breakable: false)[#mitex({_typst_raw_literal(_sanitize_latex_for_mitex(content))})]"
             )
         else:
             if content:
@@ -386,6 +440,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
 
 def typst_rich_text_expr(text: str, *, use_mitex: bool = True) -> str:
     """Render text with clickable #link(url)[breakable_url] and #mi/#mitex for math."""
+    text = _strip_control_chars(text)
     parts: list[str] = []
     pos = 0
     for m in _URL_RE.finditer(text):
@@ -470,7 +525,10 @@ def _compute_start_size(
     if hint and isinstance(hint, (int, float)) and hint > 0:
         h_val = float(hint)
         if rect.height <= h_val * 1.45:
-            raw = min(h_val * 0.92, rect.height * 0.85)
+            if role in {"title", "heading"}:
+                raw = min(h_val * 0.98, rect.height * 0.96)
+            else:
+                raw = min(h_val * 0.92, rect.height * 0.85)
         else:
             raw = h_val * 0.98
         return min(max_cap, max(min_size, raw))
@@ -485,6 +543,7 @@ def measure_blocks_with_typst(
     candidates: list[dict],
     probe_name: str = "fit_probe.typ",
     pkg_cache_dir: str | None = None,
+    bold_font_families: str | None = None,
 ) -> dict[tuple[int, float], tuple[float, float]]:
     """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates.
 
@@ -502,6 +561,7 @@ def measure_blocks_with_typst(
         lines.append(_MITEX_IMPORT_LINE)
     lines.extend([
         f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        f'#show strong: set text(font: {bold_font_families or font_families}, weight: "bold")',
         _CJK_EMPH_SHOW_RULE,
         "",
     ])
@@ -514,13 +574,14 @@ def measure_blocks_with_typst(
         raw_w = max(4.0, c["width"])
         w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
         weight = c["weight"]
+        blk_font_attr = f'font: {bold_font_families or font_families}, ' if weight == "bold" else ""
         rich = c["rich_expr"]
         segs = c["segments"]
         ref_sz = sizes[0]
         ref_sizes[idx] = ref_sz
         if segs:
             seg_exprs = ", ".join(
-                f'measure([#set text(size: {ref_sz:.2f}pt, weight: "{weight}"); #{typst_str_literal(s)}]).width / 1pt'
+                f'measure([#set text({blk_font_attr}size: {ref_sz:.2f}pt, weight: "{weight}"); #{typst_str_literal(s)}]).width / 1pt'
                 for s in segs
             )
             lines.append(
@@ -531,7 +592,7 @@ def measure_blocks_with_typst(
             leading = "0.35em" if sz < 8.5 else "0.45em"
             lines.append(
                 f'#context {{ let m = measure(block(width: {w:.2f}pt)'
-                f'[#set text(size: {sz:.2f}pt, weight: "{weight}"); '
+                f'[#set text({blk_font_attr}size: {sz:.2f}pt, weight: "{weight}"); '
                 f'#set par(leading: {leading}, justify: true); {rich}]); '
                 f'[#metadata((kind: "h", idx: {idx}, sz: {sz:.2f}, h: m.height / 1pt)) <fit>] }}'
             )
@@ -600,6 +661,7 @@ def _emit_overlay_typ(
     to_place_by_page: dict[int, list[tuple[dict, pymupdf.Rect, float, int]]],
     font_families: str,
     use_mitex: bool = True,
+    bold_font_families: str | None = None,
 ) -> str:
     body_lines: list[str] = []
     needs_mitex = False
@@ -616,6 +678,7 @@ def _emit_overlay_typ(
             is_italic = bool(it.get("is_italic") or (it.get("content") or {}).get("is_italic"))
             role = it.get("layout_role", "body")
             weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
+            blk_font_attr = f'font: {bold_font_families or font_families}, ' if weight == "bold" else ""
             style_attr = ', style: "italic"' if is_italic else ""
             raw_w = max(4.0, float(rect.width))
             w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
@@ -627,7 +690,7 @@ def _emit_overlay_typ(
             body_lines.append(
                 f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
                 f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
-                f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"{style_attr}); '
+                f'[#set text({blk_font_attr}size: {chosen_sz:.2f}pt, weight: "{weight}"{style_attr}); '
                 f'#set par(leading: {leading}, justify: true); {rich}])'
             )
     header: list[str] = []
@@ -636,6 +699,7 @@ def _emit_overlay_typ(
     header.extend([
         '#set page(margin: 0pt, fill: none)',
         f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        f'#show strong: set text(font: {bold_font_families or font_families}, weight: "bold")',
         _CJK_EMPH_SHOW_RULE,
         '#set par(justify: true, leading: 0.45em)',
         '',
@@ -753,7 +817,7 @@ def _render_typst_preserve(
     typst_bin = find_typst()
     cjk_font_file = find_cjk_font(font)
     font_dir = str(Path(cjk_font_file).parent)
-    font_families = '("Libertinus Serif", "Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC", "Droid Sans Fallback")'
+    font_families, bold_font_families = _build_font_families(font, cjk_font_file)
 
     doc = pymupdf.open(source_pdf)
     preserved = 0
@@ -853,7 +917,7 @@ def _render_typst_preserve(
             p1_szs = [szs[0]] if len(szs) <= 1 else [szs[0], szs[min(2, len(szs) - 1)]]
             pass1_candidates.append({**c, "sizes": p1_szs})
         measured = measure_blocks_with_typst(
-            typst_bin, font_dir, font_families, workdir, pass1_candidates, probe_name="fit_probe.typ", pkg_cache_dir=pkg_cache_dir
+            typst_bin, font_dir, font_families, workdir, pass1_candidates, probe_name="fit_probe.typ", pkg_cache_dir=pkg_cache_dir, bold_font_families=bold_font_families
         )
 
         # Check which candidates need Pass 2 (remaining sizes)
@@ -887,7 +951,7 @@ def _render_typst_preserve(
                         pass2_candidates.append({**cand, "sizes": rem_szs})
         if pass2_candidates:
             measured2 = measure_blocks_with_typst(
-                typst_bin, font_dir, font_families, workdir, pass2_candidates, probe_name="fit_probe_p2.typ", pkg_cache_dir=pkg_cache_dir
+                typst_bin, font_dir, font_families, workdir, pass2_candidates, probe_name="fit_probe_p2.typ", pkg_cache_dir=pkg_cache_dir, bold_font_families=bold_font_families
             )
             measured.update(measured2)
         fit_probe_s = round(time.perf_counter() - t_probe_0, 3)
@@ -950,7 +1014,7 @@ def _render_typst_preserve(
         overlay_typ = workdir / "overlay.typ"
         overlay_pdf = workdir / "overlay.pdf"
         overlay_typ.write_text(
-            _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
+            _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex, bold_font_families=bold_font_families),
             encoding="utf-8",
         )
         proc = subprocess.run(
@@ -986,7 +1050,7 @@ def _render_typst_preserve(
             if not changed:
                 break
             overlay_typ.write_text(
-                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex, bold_font_families=bold_font_families),
                 encoding="utf-8",
             )
             proc_retry = subprocess.run(
@@ -1014,7 +1078,7 @@ def _render_typst_preserve(
                 to_place_by_page[page_index] = kept
             # Recompile clean overlay.pdf without overflowing blocks
             overlay_typ.write_text(
-                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex),
+                _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex, bold_font_families=bold_font_families),
                 encoding="utf-8",
             )
             proc2 = subprocess.run(

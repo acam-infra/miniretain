@@ -6,7 +6,7 @@ import re
 _PATTERNS = [
     # Complete math spans first (aligned with Typst MiTeX renderer):
     # Display math $$...$$ and \[...\]
-    re.compile(r"\$\$[^$]+\$\$"),
+    re.compile(r"(?<!\$)\$\$(?!\$)[^$]+?(?<!\$)\$\$(?!\$)"),
     re.compile(r"\\\[[\s\S]+?\\\]"),
     # Inline math \(...\) and $...$
     re.compile(r"\\\([^\n]+?\\\)"),

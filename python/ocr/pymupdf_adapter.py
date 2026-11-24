@@ -8,28 +8,44 @@ import pymupdf
 from ocr.base import OCRConfigError, OCRProvider
 from ocr.normalize import cluster_figure_regions, normalize_pages
 
-_MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY", "STANDARDSYML")
+_MATH_FONT_TOKENS = (
+    "CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY", "STANDARDSYML",
+    "LIBERTINUSMATH", "STIX", "NEWCMMATH", "CAMBRIAMATH", "LATINMODERNMATH", "XITS",
+    "TXMI", "TXSY", "NTXMI", "NTXSY", "EUFM", "EUSM", "BBM", "DSROM", "LMMATH",
+)
+_BOLD_FONT_RE = re.compile(
+    r"(?:^|[+\-_])(?:CM|LM|SF|EC|TC|CMSS)?BX\d*"
+    r"|(?:^|[+\-_])(?:CMB|PTMB|UTMB|PPLB|PHVB|NTXB|TXB)\d*"
+    r"|SEMIBOLD|EXTRABOLD|ULTRABOLD|ULTRAHEAVY|ULTRABLACK|LIBERTINET?B|BIOLINUMB"
+)
+_ITALIC_FONT_RE = re.compile(
+    r"(?:^|[+\-_])(?:SFIT|LMIT|CMSSQI|PTMRI|UTMRI)\d*|LIBERTINET?I"
+)
 _REF_START_RE = re.compile(r"^\[\d+\]\s+")
 _STANDALONE_EQ_NUM_RE = re.compile(r"^\(\d+(?:\.\d+)*\)$")
 _TABLE_CAPTION_RE = re.compile(r"^(?:Table|Tab\.|Fig\.|Figure|Algorithm|Listing)\s*\d+", re.IGNORECASE)
 _EXISTING_MATH_DELIM_RE = re.compile(r"\$\$|\\\(|\\\)|\\\[|\\\]|(?<!\\)\$")
 _GREEK_TO_LATEX = {
-    "θ": r"\theta",
-    "µ": r"\mu",
-    "μ": r"\mu",
-    "σ": r"\sigma",
-    "η": r"\eta",
-    "λ": r"\lambda",
-    "α": r"\alpha",
-    "β": r"\beta",
-    "γ": r"\gamma",
-    "δ": r"\delta",
-    "ε": r"\epsilon",
-    "ρ": r"\rho",
-    "τ": r"\tau",
-    "φ": r"\phi",
-    "ω": r"\omega",
+    "α": r"\alpha", "β": r"\beta", "γ": r"\gamma", "δ": r"\delta",
+    "ε": r"\varepsilon", "ϵ": r"\epsilon", "ζ": r"\zeta", "η": r"\eta",
+    "θ": r"\theta", "ϑ": r"\vartheta", "ι": r"\iota", "κ": r"\kappa",
+    "λ": r"\lambda", "µ": r"\mu", "μ": r"\mu", "ν": r"\nu",
+    "ξ": r"\xi", "π": r"\pi", "ρ": r"\rho", "ϱ": r"\varrho",
+    "σ": r"\sigma", "ς": r"\varsigma", "τ": r"\tau", "υ": r"\upsilon",
+    "φ": r"\varphi", "ϕ": r"\phi", "χ": r"\chi", "ψ": r"\psi", "ω": r"\omega",
+    "Γ": r"\Gamma", "Δ": r"\Delta", "Θ": r"\Theta", "Λ": r"\Lambda",
+    "Ξ": r"\Xi", "Π": r"\Pi", "Σ": r"\Sigma", "Υ": r"\Upsilon",
+    "Φ": r"\Phi", "Ψ": r"\Psi", "Ω": r"\Omega",
 }
+
+
+def _is_unicode_math_alnum(ch: str) -> bool:
+    cp = ord(ch)
+    return (0x1D400 <= cp <= 0x1D7FF) or ch in ("\u210e", "ℝ", "ℕ", "ℤ", "ℚ", "ℂ", "𝔼", "ℙ", "ℓ")
+
+
+def _has_unicode_math_alnum(text: str) -> bool:
+    return any(_is_unicode_math_alnum(ch) for ch in text)
 
 
 def _is_math_span_font(font_name: str) -> bool:
@@ -45,6 +61,7 @@ def _is_span_bold(s: dict) -> bool:
     return bool(
         (flags & 16)
         or any(tok in fname for tok in ("BOLD", "CMBX", "MEDI", "DEMI", "HEAVY", "BLACK"))
+        or _BOLD_FONT_RE.search(fname)
         or fname.endswith("-B")
     )
 
@@ -57,6 +74,7 @@ def _is_span_italic(s: dict) -> bool:
     return bool(
         (flags & 2)
         or any(tok in fname for tok in ("ITAL", "CMTI", "SLANT", "OBLIQUE", "CMSL"))
+        or _ITALIC_FONT_RE.search(fname)
         or fname.endswith("-I")
     )
 
@@ -94,28 +112,51 @@ def _line_baseline_metrics(spans: list[dict]) -> tuple[float, float]:
     return sizes[len(sizes) // 2], ys[len(ys) // 2]
 
 
+_SCRIPT_TOKEN_RE = re.compile(r"^[A-Za-z0-9,+\-−′'*★⋆†‡\u0370-\u03ff\U0001d400-\U0001d7ff]+$")
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
 def _is_proven_superscript(span: dict, base_sz: float, base_y: float) -> bool:
     t = (span.get("text") or "").strip()
-    if not (1 <= len(t) <= 4) or not span.get("origin") or not span.get("size"):
+    if not (1 <= len(t) <= 12) or not span.get("origin") or not span.get("size"):
+        return False
+    if any(ch in t for ch in "()[]{}.,;:?!"):
+        return False
+    if len(t) > 4 and not _SCRIPT_TOKEN_RE.match(t):
         return False
     return float(span["size"]) < base_sz * 0.85 and float(span["origin"][1]) < base_y - 1.2
 
 
 def _is_proven_subscript(span: dict, base_sz: float, base_y: float) -> bool:
     t = (span.get("text") or "").strip()
-    if not (1 <= len(t) <= 4) or not span.get("origin") or not span.get("size"):
+    if not (1 <= len(t) <= 12) or not span.get("origin") or not span.get("size"):
+        return False
+    if any(ch in t for ch in "()[]{}.,;:?!"):
+        return False
+    if len(t) > 4 and not _SCRIPT_TOKEN_RE.match(t):
         return False
     return float(span["size"]) < base_sz * 0.85 and float(span["origin"][1]) > base_y + 0.8
 
 
-def _fmt_latex_atom(has_hat: bool, g_char: str, sub: str | None, sup: str | None) -> str:
-    base = _GREEK_TO_LATEX[g_char]
+def _fmt_script(val: str) -> str:
+    val = val.replace("−", "-")
+    if len(val) == 1:
+        return val
+    if re.match(r"^[A-Za-z]{3,}$", val):
+        return rf"{{\mathrm{{{val}}}}}"
+    return f"{{{val}}}"
+
+
+def _fmt_latex_atom(has_hat: bool, base_sym: str, sub: str | None, sup: str | None, *, has_sqrt: bool = False) -> str:
+    base = _GREEK_TO_LATEX.get(base_sym, base_sym)
     if has_hat:
         base = rf"\hat{{{base}}}"
     if sub:
-        base += f"_{sub}" if len(sub) == 1 else f"_{{{sub}}}"
+        base += f"_{_fmt_script(sub)}"
     if sup:
-        base += f"^{sup}" if len(sup) == 1 else f"^{{{sup}}}"
+        base += f"^{_fmt_script(sup)}"
+    if has_sqrt:
+        base = rf"\sqrt{{{base}}}"
     return base
 
 
@@ -129,10 +170,11 @@ def _render_line_with_evidenced_math(
     verifiable PDF span-geometry evidence (hat accent span, raised smaller superscript, or
     lowered smaller subscript), and optionally wrapping partial inline bold (**...**) and
     italic (*...*) span runs. Lines already containing math delimiters pass through untouched."""
-    raw = "".join(s.get("text", "") for s in spans).strip()
+    raw = _CTRL_CHAR_RE.sub("", "".join(s.get("text", "") for s in spans)).strip()
     if not raw:
         return ""
-    if _EXISTING_MATH_DELIM_RE.search(raw):
+    skip_math_recon = bool(_EXISTING_MATH_DELIM_RE.search(raw))
+    if skip_math_recon and not want_inline_bold and not want_inline_italic:
         return raw
     has_geom = any(s.get("origin") and s.get("size") for s in spans)
     if not has_geom and not want_inline_bold and not want_inline_italic:
@@ -153,19 +195,41 @@ def _render_line_with_evidenced_math(
         else:
             runs.append((style, txt))
 
+    def _collect_scripts(start_j: int) -> tuple[str | None, str | None, int]:
+        sup_v: str | None = None
+        sub_v: str | None = None
+        jj = start_j
+        while jj < n:
+            cand = spans[jj]
+            if sup_v is None and _is_proven_superscript(cand, base_sz, base_y):
+                sup_v = (cand.get("text") or "").strip()
+                jj += 1
+                continue
+            if sub_v is None and _is_proven_subscript(cand, base_sz, base_y):
+                sub_v = (cand.get("text") or "").strip()
+                jj += 1
+                continue
+            break
+        return sup_v, sub_v, jj
+
     while i < n:
         s = spans[i]
         st = s.get("text") or ""
         stripped = st.strip()
 
-        if has_geom:
-            # Check optional hat accent span immediately before a Greek letter span
+        if has_geom and not skip_math_recon:
+            # Optional sqrt or hat prefix span immediately before a math variable
+            has_sqrt = False
             has_hat = False
             g_idx = i
             lead_ws = ""
-            if stripped == "ˆ" and i + 1 < n:
+            if stripped == "√" and i + 1 < n:
+                has_sqrt = True
+                g_idx = i + 1
+                lead_ws = " " if st.startswith(" ") else ""
+            elif stripped == "ˆ" and i + 1 < n:
                 nxt_t = (spans[i + 1].get("text") or "").strip()
-                if len(nxt_t) == 1 and nxt_t in _GREEK_TO_LATEX:
+                if len(nxt_t) == 1 and (nxt_t in _GREEK_TO_LATEX or nxt_t.isalpha() or _is_unicode_math_alnum(nxt_t)):
                     has_hat = True
                     g_idx = i + 1
                     lead_ws = " " if st.startswith(" ") else ""
@@ -173,26 +237,54 @@ def _render_line_with_evidenced_math(
             g_span = spans[g_idx]
             g_raw = g_span.get("text") or ""
             g_strip = g_raw.strip()
-            if len(g_strip) == 1 and g_strip in _GREEK_TO_LATEX:
-                if not has_hat and g_raw.startswith(" "):
+            g_is_greek = len(g_strip) == 1 and g_strip in _GREEK_TO_LATEX
+            g_is_single_latin = (
+                len(g_strip) == 1
+                and g_strip.isascii()
+                and g_strip.isalpha()
+                and (
+                    has_hat
+                    or has_sqrt
+                    or _is_math_span_font(g_span.get("font") or "")
+                    or _is_span_italic(g_span)
+                    or not runs
+                    or runs[-1][1].endswith((" ", "(", "[", ",", "=", "/", "+", "-", "·", "×", "√"))
+                )
+            )
+            g_is_math_alnum = bool(g_strip and _has_unicode_math_alnum(g_strip) and len(g_strip) <= 8)
+
+            if g_is_greek or g_is_single_latin:
+                if not has_hat and not has_sqrt and g_raw.startswith(" "):
                     lead_ws = " "
-                sup: str | None = None
-                sub: str | None = None
-                j = g_idx + 1
-                while j < n:
-                    cand = spans[j]
-                    if sup is None and _is_proven_superscript(cand, base_sz, base_y):
-                        sup = (cand.get("text") or "").strip()
-                        j += 1
-                        continue
-                    if sub is None and _is_proven_subscript(cand, base_sz, base_y):
-                        sub = (cand.get("text") or "").strip()
-                        j += 1
-                        continue
-                    break
-                if has_hat or sup is not None or sub is not None:
-                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup)
-                    _append_run("math", f"{lead_ws}${atom}$")
+                sup, sub, j = _collect_scripts(g_idx + 1)
+                # Guard against footnote markers (digits or †/‡/*/§/¶) on non-math single letters
+                is_footnote_mark = (
+                    g_is_single_latin
+                    and not has_hat
+                    and not has_sqrt
+                    and not _is_math_span_font(g_span.get("font") or "")
+                    and sub is None
+                    and sup is not None
+                    and (
+                        sup in {"*", "†", "‡", "§", "¶"}
+                        or (sup.isdigit() and (not _is_span_italic(g_span) or g_strip in {"a", "I"}))
+                    )
+                )
+                if (has_hat or has_sqrt or sup is not None or sub is not None) and not is_footnote_mark:
+                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup, has_sqrt=has_sqrt)
+                    trail_ws = " " if g_raw.endswith(" ") and j == g_idx + 1 else ""
+                    _append_run("math", f"{lead_ws}${atom}${trail_ws}")
+                    evidenced_count += 1
+                    i = j
+                    continue
+            elif g_is_math_alnum:
+                if not has_hat and not has_sqrt and g_raw.startswith(" "):
+                    lead_ws = " "
+                sup, sub, j = _collect_scripts(g_idx + 1)
+                if has_hat or has_sqrt or sup is not None or sub is not None:
+                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup, has_sqrt=has_sqrt)
+                    trail_ws = " " if g_raw.endswith(" ") and j == g_idx + 1 else ""
+                    _append_run("math", f"{lead_ws}${atom}${trail_ws}")
                     evidenced_count += 1
                     i = j
                     continue
@@ -223,8 +315,14 @@ def _render_line_with_evidenced_math(
         else:
             out.append(txt)
 
-    text = "".join(out).strip()
+    text = _CTRL_CHAR_RE.sub("", "".join(out)).strip()
     if evidenced_count > 0:
+        # Merge touching inline math runs ($a$$b$ -> $a b$) so they never form display-math $$ delimiters
+        while "$$" in text:
+            nxt_t = re.sub(r"\$([^$\n]+)\$\$([^$\n]+)\$", r"$\1 \2$", text)
+            if nxt_t == text:
+                break
+            text = nxt_t
         # Coalesce adjacent span-evidenced $...$ atoms into compound distribution / fraction expressions.
         text = re.sub(
             r"\$([^$\n]+)\$\s*[∼~]\s*N\s*\(\s*\$([^$\n]+)\$\s*,\s*\$([^$\n]+)\$\s*\)",
@@ -364,13 +462,11 @@ def _build_block_from_lines(
     is_italic = (not is_bold) and (italic_chars > char_count * 0.6 if char_count else False)
     want_inline_bold = (
         (not is_bold)
-        and (not has_algo_or_eq_ops)
         and (0 < bold_chars <= char_count * 0.6)
         and (math_chars <= char_count * 0.4)
     )
     want_inline_italic = (
         (not is_italic)
-        and (not has_algo_or_eq_ops)
         and (0 < italic_chars <= char_count * 0.6)
         and (math_chars <= char_count * 0.35)
     )
@@ -620,6 +716,7 @@ def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bo
     if not (
         (len(base_txt) == 1 and base_txt in _GREEK_TO_LATEX)
         or _is_math_span_font(base_span.get("font") or "")
+        or (base_txt and _has_unicode_math_alnum(base_txt))
     ):
         return False
     if not _is_proven_superscript(sup_span, base_sz, base_y):
@@ -629,7 +726,10 @@ def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bo
     if not _is_proven_subscript(sub_span, base_sz, base_y):
         return False
     sub_txt = (sub_span.get("text") or "").strip()
-    if not re.match(r"^[A-Za-z0-9]{1,3}$", sub_txt):
+    if not (
+        re.match(r"^[A-Za-z0-9]{1,4}$", sub_txt)
+        or (1 <= len(sub_txt) <= 4 and all(c.isalnum() or _is_unicode_math_alnum(c) or c in ",+-−" for c in sub_txt))
+    ):
         return False
     sup_bb = sup_span.get("bbox")
     sub_bb = sub_span.get("bbox")
