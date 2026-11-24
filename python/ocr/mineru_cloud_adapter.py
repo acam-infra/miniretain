@@ -346,8 +346,14 @@ class MinerUCloudOCRProvider(OCRProvider):
                 else:
                     line_parts.append(content)
             if line_parts:
-                chunks.append(" ".join(line_parts))
-        return " ".join(chunks).strip(), line_bboxes
+                line_s = " ".join(line_parts)
+                line_s = re.sub(r"\$\s+([.,;:!?)\]])", r"$\1", line_s)
+                line_s = re.sub(r"([(\[])\s+\$", r"\1$", line_s)
+                chunks.append(line_s)
+        full_s = " ".join(chunks).strip()
+        full_s = re.sub(r"\$\s+([.,;:!?)\]])", r"$\1", full_s)
+        full_s = re.sub(r"([(\[])\s+\$", r"\1$", full_s)
+        return full_s, line_bboxes
 
     def parse(self, source: str) -> list[dict]:
         t0 = time.perf_counter()

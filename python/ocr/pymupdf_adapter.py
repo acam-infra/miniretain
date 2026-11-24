@@ -1129,7 +1129,9 @@ class AutoOCRProvider(OCRProvider):
         auto_cfg = self.config.get("auto") if isinstance(self.config.get("auto"), dict) else {}
         self.scanned_char_threshold = int(auto_cfg.get("scanned_char_threshold", 20))
         self.fallback_provider = str(auto_cfg.get("fallback_provider") or "").strip()
-        self.pure_ocr = bool(auto_cfg.get("pure_ocr") or self.config.get("pure_ocr", False))
+        default_pure_ocr = self.fallback_provider in {"mineru", "paddle-cloud"}
+        raw_pure = auto_cfg.get("pure_ocr") if "pure_ocr" in auto_cfg else self.config.get("pure_ocr")
+        self.pure_ocr = default_pure_ocr if raw_pure is None else bool(raw_pure)
         if self.fallback_provider and self.fallback_provider not in {"paddle-http", "paddle-cpu", "paddle-cloud", "mineru", "none"}:
             raise OCRConfigError(
                 f"auto.fallback_provider must be one of ['paddle-http', 'paddle-cpu', 'paddle-cloud', 'mineru', 'none'], got {self.fallback_provider!r}"

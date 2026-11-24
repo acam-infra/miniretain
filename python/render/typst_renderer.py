@@ -261,7 +261,23 @@ def _split_math_segments(text: str) -> list[tuple[str, str]]:
 
 
 _CJK_PUNCT = set("，。、；：？！（）「」《》【】“”‘’—…·")
-_INLINE_MATH_GAP = "#h(0.18em, weak: true)"
+_INLINE_MATH_GAP = "#h(0.06em, weak: true)"
+_CJK_PUNCT_AFTER_SPACE_RE = re.compile(r"([，。、；：？！（【「『《“‘])[ \t]+")
+_CJK_PUNCT_BEFORE_SPACE_RE = re.compile(r"[ \t]+([，。、；：？！）】」』》”’])")
+_CJK_INTER_CHAR_SPACE_RE = re.compile(r"([\u4e00-\u9fff])[ \t]+([\u4e00-\u9fff])")
+
+
+def _normalize_cjk_text_spacing(s: str) -> str:
+    """Strip stray ASCII spaces around fullwidth CJK punctuation and between CJK characters."""
+    if not s:
+        return s
+    s = _CJK_PUNCT_AFTER_SPACE_RE.sub(r"\1", s)
+    s = _CJK_PUNCT_BEFORE_SPACE_RE.sub(r"\1", s)
+    prev = None
+    while s != prev:
+        prev = s
+        s = _CJK_INTER_CHAR_SPACE_RE.sub(r"\1\2", s)
+    return re.sub(r"[ \t]{2,}", " ", s)
 
 
 def _is_cjk_char(ch: str) -> bool:
@@ -377,9 +393,14 @@ def _distribute_style_around_math(segment: str) -> str:
 
 def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     if not use_mitex or ("$" not in segment and r"\(" not in segment and r"\[" not in segment):
-        return _render_styled_text_literal(segment)
+        return _render_styled_text_literal(_normalize_cjk_text_spacing(segment))
+    segment = re.sub(r"\$[ \t]+([.,;:!?)}\]])", r"$\1", segment)
+    segment = re.sub(r"([(\[{])[ \t]+\$", r"\1$", segment)
     segment = _distribute_style_around_math(segment)
-    raw_segs = _split_math_segments(segment)
+    raw_segs = [
+        (k, _normalize_cjk_text_spacing(c) if k == "text" else c)
+        for k, c in _split_math_segments(segment)
+    ]
     # Normalize spacing around inline math in this single shared expression builder
     # so fit_probe.typ measurement and overlay.typ placement stay 100% consistent:
     # - Pure superscripts ($^{14}$, $^\dagger$): stay tight against CJK text and punctuation
@@ -422,6 +443,15 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
                     elif first_ch in _CJK_PUNCT or first_ch == "\n":
                         segs[idx + 1][1] = nxt_stripped
         elif kind == "display_math":
+            if idx > 0 and segs[idx - 1][0] == "text":
+                prev_clean = segs[idx - 1][1].rstrip(" \t\r\n")
+                if parts:
+                    if prev_clean:
+                        parts[-1] = _render_styled_text_literal(prev_clean)
+                    else:
+                        parts.pop()
+            if idx + 1 < n and segs[idx + 1][0] == "text":
+                segs[idx + 1][1] = segs[idx + 1][1].lstrip(" \t\r\n")
             parts.append(
                 f"#block(above: 0.45em, below: 0.45em, breakable: false)[#mitex({_typst_raw_literal(_sanitize_latex_for_mitex(content))})]"
             )
@@ -521,6 +551,10 @@ def _compute_start_size(
     return min(max_cap, max(min_size, rect.height * 0.78))
 
 
+def _base_leading_em(sz: float) -> float:
+    return 0.35 if sz < 8.5 else 0.45
+
+
 def _block_justify_and_leading(text: str, sz: float, width_pt: float) -> tuple[str, str]:
     """Ported from upstream formula_safety.py: disable justify when a block has long inline math
     risk so wide inline formulas don't stretch CJK character gaps on the preceding line."""
@@ -528,8 +562,76 @@ def _block_justify_and_leading(text: str, sz: float, width_pt: float) -> tuple[s
         text, font_size_pt=sz, box_width_pt=width_pt
     )
     justify_str = "false" if long_math_risk else "true"
-    leading = "0.35em" if sz < 8.5 else "0.45em"
+    leading = f"{_base_leading_em(sz):.2f}em"
     return justify_str, leading
+
+
+def _compute_block_vertical_layout(
+    it: dict,
+    rect: pymupdf.Rect,
+    chosen_sz: float,
+    mh: float,
+    pm: dict,
+) -> tuple[float, float]:
+    """Compute adaptive comfort line-leading (em) and vertical dy_offset (pt) to control
+    empty lines around interline (display) formulas and balance multi-line CJK blocks."""
+    base_lead = _base_leading_em(chosen_sz)
+    role = it.get("layout_role", "body")
+    if role not in {"body", "list_item"} or mh <= 0 or rect.height <= mh + 1.5:
+        return base_lead, 0.0
+
+    formula_guards: list[pymupdf.Rect] = pm.get("formula_guard_rects") or []
+    is_above_formula = False
+    gap_to_formula_below = 999.0
+    is_below_formula = False
+    gap_from_formula_above = 999.0
+
+    for fg in formula_guards:
+        x_ov = min(rect.x1, fg.x1) - max(rect.x0, fg.x0)
+        min_w = max(1.0, min(rect.width, fg.width))
+        if x_ov < min_w * 0.2:
+            continue
+        dy_below = fg.y0 - rect.y1
+        if -3.0 <= dy_below <= 30.0:
+            is_above_formula = True
+            gap_to_formula_below = min(gap_to_formula_below, max(0.0, dy_below))
+        dy_above = rect.y0 - fg.y1
+        if -4.0 <= dy_above <= 14.0:
+            is_below_formula = True
+            gap_from_formula_above = min(gap_from_formula_above, max(0.0, dy_above))
+
+    slack = max(0.0, float(rect.height) - float(mh) - 1.8)
+    dy_offset = 0.0
+
+    # 1. Below a display equation: add clean top breathing room (~8.5pt total clearance)
+    if is_below_formula and slack > 1.0:
+        target_top_gap = max(8.5, chosen_sz * 0.85)
+        needed_top = max(0.0, target_top_gap - gap_from_formula_above)
+        top_shift = min(needed_top, slack * 0.65, 8.5)
+        if top_shift >= 0.5:
+            dy_offset = round(top_shift, 2)
+            slack = max(0.0, slack - dy_offset)
+
+    # 2. Adaptive comfort line-leading so multi-line Chinese blocks fill vertical slack
+    line_step = max(1.0, chosen_sz * (1.0 + base_lead))
+    est_lines = max(1, int(round(mh / line_step)))
+    chosen_lead = base_lead
+    if est_lines >= 2 and slack > 1.5:
+        num_gaps = est_lines - 1
+        fill_ratio = 0.88 if is_above_formula else 0.72
+        extra_em = (slack * fill_ratio) / (num_gaps * chosen_sz)
+        max_lead = 0.94 if is_above_formula else 0.76
+        chosen_lead = min(max_lead, round(base_lead + extra_em, 2))
+        used_h = (chosen_lead - base_lead) * num_gaps * chosen_sz
+        slack = max(0.0, slack - used_h)
+
+    # 3. Above a display equation: gently shift down if excess slack remains
+    if is_above_formula and slack > 3.5 and dy_offset == 0.0:
+        down_shift = min(slack * 0.45, 5.5)
+        if down_shift >= 0.5:
+            dy_offset = round(down_shift, 2)
+
+    return chosen_lead, dy_offset
 
 
 def measure_blocks_with_typst(
@@ -677,13 +779,18 @@ def _emit_overlay_typ(
             w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
             trans_txt = it["translation"].strip()
-            justify_str, leading = _block_justify_and_leading(trans_txt, chosen_sz, w)
+            justify_str, base_leading = _block_justify_and_leading(trans_txt, chosen_sz, w)
+            lead_em = it.get("_render_leading_em")
+            leading = f"{float(lead_em):.2f}em" if isinstance(lead_em, (int, float)) and lead_em > 0 else base_leading
+            dy_off = float(it.get("_render_dy_offset") or 0.0)
+            place_dy = rect.y0 + dy_off
+            place_h = max(2.0, h - dy_off)
             rich = typst_rich_text_expr(trans_txt, use_mitex=use_mitex)
             if "#mi(" in rich or "#mitex(" in rich:
                 needs_mitex = True
             body_lines.append(
-                f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
-                f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
+                f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {place_dy:.2f}pt, '
+                f'block(width: {w:.2f}pt, height: {place_h:.2f}pt, clip: false)'
                 f'[#set text({blk_font_attr}size: {chosen_sz:.2f}pt, weight: "{weight}"{style_attr}); '
                 f'#set par(leading: {leading}, justify: {justify_str}); {rich}])'
             )
@@ -997,6 +1104,10 @@ def _render_typst_preserve(
                     unplaced_reasons[bid] = fail_reason
                     continue
 
+                _, chosen_mh = measured.get((cand["idx"], round(chosen_sz, 2)), (0.0, rect.height))
+                lead_em, dy_off = _compute_block_vertical_layout(it, rect, chosen_sz, chosen_mh, pm)
+                it["_render_leading_em"] = lead_em
+                it["_render_dy_offset"] = dy_off
                 to_render.append((it, rect, chosen_sz, cand["local_i"]))
 
             to_place_by_page[page_index] = to_render
@@ -1029,9 +1140,23 @@ def _render_typst_preserve(
                 updated = []
                 for it, rect, csz, li in plist:
                     bid = it.get("block_id", "unknown")
+                    if bid in compiled_bad:
+                        base_l = _base_leading_em(csz)
+                        cur_l = float(it.get("_render_leading_em") or base_l)
+                        cur_dy = float(it.get("_render_dy_offset") or 0.0)
+                        if cur_l > base_l + 0.02 or cur_dy > 0.2:
+                            new_l = base_l if (cur_l - base_l) <= 0.10 else round(base_l + (cur_l - base_l) * 0.45, 2)
+                            new_dy = 0.0 if cur_dy <= 1.2 else round(cur_dy * 0.4, 2)
+                            it["_render_leading_em"] = new_l
+                            it["_render_dy_offset"] = new_dy
+                            changed = True
+                            updated.append((it, rect, csz, li))
+                            continue
                     if bid in compiled_bad and csz > min_size + 1e-6:
                         step = 0.25 if csz > 7.0 + 1e-6 else 0.5
                         new_sz = max(min_size, round(csz - step, 2))
+                        it["_render_leading_em"] = _base_leading_em(new_sz)
+                        it["_render_dy_offset"] = 0.0
                         shrunk += 1
                         changed = True
                         updated.append((it, rect, new_sz, li))

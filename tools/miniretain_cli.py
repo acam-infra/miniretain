@@ -337,7 +337,8 @@ def main() -> int:
     parser.add_argument("--api", default=None, help="Miniretain server base URL (overrides config server.addr)")
     parser.add_argument("--api-pool", default=None, help="Comma-separated pool of Miniretain server URLs for batch load balancing")
     parser.add_argument("--ocr", choices=ALLOWED_OCR_PROVIDERS, default=None, help="OCR provider: auto | pymupdf | mineru | paddle-cloud | paddle-http | paddle-cpu")
-    parser.add_argument("--pure-ocr", action="store_true", help="Force pure Cloud/VLM OCR mode (MinerU v4 VLM with automatic failover to PaddleOCR-VL-1.6) even on digital PDFs")
+    parser.add_argument("--pure-ocr", dest="pure_ocr", action="store_true", default=True, help="Default: use pure Cloud/VLM OCR mode (MinerU v4 VLM with automatic failover to PaddleOCR-VL-1.6)")
+    parser.add_argument("--no-pure-ocr", dest="pure_ocr", action="store_false", help="Disable pure OCR mode and allow PyMuPDF digital text extraction when provider=auto")
     parser.add_argument("--fallback-ocr", choices=("paddle-http", "paddle-cloud", "mineru", "paddle-cpu", "none"), default=None, help="Fallback OCR provider on scanned pages or quota failover")
     parser.add_argument("--out-dir", default="./miniretain_out", help="Output directory for translated PDFs and guide")
     parser.add_argument("--target-lang", default=None, help="Target language (default from YAML or zh)")
@@ -378,7 +379,13 @@ def main() -> int:
         for u in (args.api_pool or os.environ.get("MINIRETAIN_API_POOL") or primary_api).split(",")
         if u.strip()
     ]
-    ocr_provider = args.ocr or ("mineru" if args.pure_ocr else str(ocr_cfg.get("provider") or "auto"))
+    cfg_provider = str(ocr_cfg.get("provider") or "mineru")
+    if args.ocr:
+        ocr_provider = args.ocr
+    elif args.pure_ocr and cfg_provider in ("", "auto"):
+        ocr_provider = "mineru"
+    else:
+        ocr_provider = cfg_provider
     target_lang = args.target_lang or str(cfg.get("target_lang") or "zh")
     llm_model = args.model or str(llm_cfg.get("model") or "gemini-3.6-flash")
     batch_size = int(args.batch_size if args.batch_size is not None else (llm_cfg.get("batch_size") or 18))
@@ -387,15 +394,15 @@ def main() -> int:
     timeout_ms = int(llm_cfg.get("timeout_ms") or 120000)
     strict_mode = False if args.no_strict else bool(ren_cfg.get("strict", True))
 
+    use_pure_ocr = bool(args.pure_ocr and ocr_provider != "pymupdf")
     ocr_req: dict[str, Any] = {"provider": ocr_provider}
-    if args.pure_ocr or args.fallback_ocr:
-        fb = args.fallback_ocr or ("paddle-cloud" if ocr_provider == "mineru" else "mineru")
-        ocr_req["config"] = {
-            "pure_ocr": bool(args.pure_ocr),
-            "auto": {"pure_ocr": bool(args.pure_ocr), "fallback_provider": fb},
-            "paddle_cloud": {"fallback_provider": args.fallback_ocr or "mineru"},
-            "mineru": {"fallback_provider": args.fallback_ocr or "paddle-cloud"},
-        }
+    fb = args.fallback_ocr or ("paddle-cloud" if ocr_provider == "mineru" else "mineru")
+    ocr_req["config"] = {
+        "pure_ocr": use_pure_ocr,
+        "auto": {"pure_ocr": use_pure_ocr, "fallback_provider": fb},
+        "paddle_cloud": {"fallback_provider": args.fallback_ocr or "mineru"},
+        "mineru": {"fallback_provider": args.fallback_ocr or "paddle-cloud"},
+    }
 
     llm_req: dict[str, Any] = {
         "provider": "openai-compat",

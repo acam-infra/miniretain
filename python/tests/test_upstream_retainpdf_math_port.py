@@ -263,3 +263,42 @@ def test_pure_ocr_flag_and_inequality_html_safety(monkeypatch):
     assert called == ["dummy.pdf"]
     assert auto_pure.routed_providers == {"mineru": [0]}
     assert len(pages) == 1
+
+
+def test_compact_ocr_math_whitespace_and_display_formula_vertical_layout():
+    from ocr.pymupdf_adapter import AutoOCRProvider
+    from render.typst_renderer import _INLINE_MATH_GAP, _compute_block_vertical_layout, typst_rich_text_expr
+
+    # 1. Compact spaced OCR LaTeX subscripts, superscripts, commands, and set braces
+    assert _INLINE_MATH_GAP == "#h(0.06em, weak: true)"
+    compacted = prepare_formula_for_render(
+        r"\Phi_ {k} (q _ {k}) = - w _ {k} (\tau q _ {k} / D _ {k} ^ {\max}) ^ {2}, \{sat, gnd\}, E _ {s} ^ {\mathrm{c o n}}"
+    )
+    assert r"\Phi_{k}(q_{k})" in compacted
+    assert r"(\tau q_{k}/D_{k}^{\max})^{2}" in compacted
+    assert r"\{\mathrm{sat}, \mathrm{gnd}\}" in compacted
+    assert r"E_{s}^{\mathrm{con}}" in compacted
+
+    # 2. Strip stray spaces after fullwidth Chinese punctuation
+    expr = typst_rich_text_expr("设 $S$ 为星群集合， L 为有向链路集合， $N_s$ 为卫星数。", use_mitex=True)
+    assert '#"为星群集合，L 为有向链路集合，"' in expr
+
+    # 3. Interline (display) formula vertical spacing control: above and below display equation
+    formula_guard = pymupdf.Rect(90.0, 272.2, 265.0, 310.1)
+    pm = {"formula_guard_rects": [formula_guard]}
+    above_rect = pymupdf.Rect(54.0, 113.8, 290.0, 260.7)  # height 146.9pt
+    lead_above, dy_above = _compute_block_vertical_layout(
+        {"layout_role": "body"}, above_rect, chosen_sz=10.25, mh=114.0, pm=pm
+    )
+    assert lead_above >= 0.78  # expands comfort leading to eliminate 3-line gap above display eq
+
+    below_rect = pymupdf.Rect(54.0, 313.4, 290.0, 441.4)  # starts only 3.3pt below formula_guard.y1
+    lead_below, dy_below = _compute_block_vertical_layout(
+        {"layout_role": "body"}, below_rect, chosen_sz=10.0, mh=96.0, pm=pm
+    )
+    assert dy_below >= 4.5  # shifts down to provide clean top clearance below display eq
+    assert lead_below > 0.45
+
+    # 4. AutoOCRProvider defaults pure_ocr=True when fallback_provider is mineru or paddle-cloud
+    auto_default_pure = AutoOCRProvider(config={"auto": {"fallback_provider": "mineru"}})
+    assert auto_default_pure.pure_ocr is True

@@ -16,7 +16,7 @@ target_lang: "zh"
 
 ocr:
   # Supported: auto | pymupdf | mineru | paddle-cloud | paddle-http | paddle-cpu | stub
-  provider: "auto"
+  provider: "mineru"
   paddle_cloud:
     job_url: "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs"
     model: "PaddleOCR-VL-1.6"
@@ -44,7 +44,7 @@ ocr:
     lang: "en"
   auto:
     scanned_char_threshold: 20
-    fallback_provider: "paddle-cloud"
+    fallback_provider: "mineru"
   options: {}
 
 llm:

@@ -12,8 +12,8 @@ import pymupdf
 MAX_INLINE_MATH_CHARS = 1200
 MIN_SAFE_CONTENT_HEIGHT_PT = 8.0
 MAX_FORMULA_INSET_HEIGHT_RATIO = 0.18
-LONG_INLINE_MATH_MIN_BODY_CHARS = 42
-LONG_INLINE_MATH_WIDTH_RATIO = 0.68
+LONG_INLINE_MATH_MIN_BODY_CHARS = 24
+LONG_INLINE_MATH_WIDTH_RATIO = 0.42
 FORMULA_WIDTH_UNIT_PT_RATIO = 1.0
 MIN_CLEANUP_SEGMENT_WIDTH_PT = 1.0
 MIN_CLEANUP_SEGMENT_HEIGHT_PT = 1.5
@@ -224,6 +224,40 @@ def normalize_angstrom_in_text(text: str) -> str:
     return _ANGSTROM_COMMAND_RE.sub(lambda match: _ANGSTROM_BY_LETTER[match.group(1)[0]], text)
 
 
+def _compact_ocr_math_whitespace(expr: str) -> str:
+    r"""Compact extra spaces emitted by MinerU / PaddleOCR inside LaTeX subscripts, superscripts,
+    commands (e.g. '\Phi_ {k} (q _ {k})', 'D _ {k} ^ {\max}', '\frac {a}{b}'), and wrap multi-letter
+    set words like '\{sat, gnd\}' in \mathrm{...}."""
+    s = expr
+    s = re.sub(
+        r"\\(mathrm|text|textrm|mathbf|operatorname)\s*\{\s*([A-Za-z](?:\s+[A-Za-z])+)\s*\}",
+        lambda m: "\\" + m.group(1) + "{" + "".join(m.group(2).split()) + "}",
+        s,
+    )
+    prev = None
+    while s != prev:
+        prev = s
+        s = re.sub(r"([_^])\s+\{", r"\1{", s)
+        s = re.sub(r"_\{\s*([^{}]+?)\s*\}", lambda m: "_{" + m.group(1).strip() + "}", s)
+        s = re.sub(r"\^\{\s*([^{}]+?)\s*\}", lambda m: "^{" + m.group(1).strip() + "}", s)
+        s = re.sub(r"(\\[A-Za-z]+|[A-Za-z0-9\}\)\]])\s+([_^])", r"\1\2", s)
+        s = re.sub(r"\\(frac|dfrac|tfrac|sqrt|hat|bar|tilde|vec|mathcal|mathrm|mathbf|mathbb|operatorname)\s+\{", r"\\\1{", s)
+    s = re.sub(r"\(\s+", "(", s)
+    s = re.sub(r"\s+\)", ")", s)
+    s = re.sub(r"\[\s+", "[", s)
+    s = re.sub(r"\s+\]", "]", s)
+    s = re.sub(r"\s+,", ",", s)
+    s = re.sub(r"(?<=[A-Za-z0-9\}])\s+\(", "(", s)
+    s = re.sub(r"\\\{\s+", r"\{", s)
+    s = re.sub(r"\s+\\\}", r"\}", s)
+    s = re.sub(r"\s+/\s+", "/", s)
+    s = re.sub(
+        r"\\\{\s*([a-z]{2,}(?:\s*,\s*[a-z]{2,})+)\s*\\\}",
+        lambda m: "\\{" + ", ".join(f"\\mathrm{{{w.strip()}}}" for w in m.group(1).split(",")) + "\\}",
+        s,
+    )
+    return s
+
 def prepare_formula_for_render(expr: str, *, display: bool = False) -> str:
     """Ported upstream retainpdf_math formula preparation before passing to MiTeX."""
     if not expr:
@@ -232,6 +266,7 @@ def prepare_formula_for_render(expr: str, *, display: bool = False) -> str:
     s = _SQRT_ARG_RE.sub(lambda m: rf"\sqrt{{{m.group(1) or m.group(2) or m.group(3)}}}", s)
     s = s.replace("″", "''").replace("′", "'")
     s = collapse_doubled_command_backslashes(s)
+    s = _compact_ocr_math_whitespace(s)
     s = separate_double_scripts(s)
     s = balance_left_right(s)
     s = re.sub(r"\\cal\s+([A-Za-z])", r"\\mathcal{\1}", s)
