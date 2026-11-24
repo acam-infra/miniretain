@@ -7,10 +7,10 @@ import os
 import re
 import threading
 import time
+from typing import Any
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any
 
 from common.pool import (
     EndpointKeyProxyPool,
@@ -182,12 +182,11 @@ class OpenAICompatLLMClient:
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or {}
         self._pool: EndpointKeyProxyPool | None = None
+        self._pool_sig: tuple[Any, ...] | None = None
         self._pool_lock = threading.Lock()
 
     def _get_pool(self, requested_model: str) -> EndpointKeyProxyPool:
         with self._pool_lock:
-            if self._pool is not None:
-                return self._pool
             base = str(
                 self.config.get("base_url")
                 or os.environ.get("OPENAI_BASE_URL", "http://127.0.0.1:18083/v1")
@@ -208,6 +207,9 @@ class OpenAICompatLLMClient:
                 explicit_list=self.config.get("fallback_models") if isinstance(self.config.get("fallback_models"), list) else None,
                 env_var="OPENAI_FALLBACK_MODELS",
             )
+            sig = (base, tuple(keys), tuple(proxies), tuple(fallback_models), requested_model)
+            if self._pool is not None and self._pool_sig == sig:
+                return self._pool
             endpoints: list[dict[str, Any]] | None = None
             if isinstance(self.config.get("endpoints"), list):
                 endpoints = self.config["endpoints"]
@@ -232,6 +234,7 @@ class OpenAICompatLLMClient:
                 endpoints=endpoints,
                 per_slot_concurrency=int(self.config.get("concurrency") or 8),
             )
+            self._pool_sig = sig
             return self._pool
 
     def pool_snapshot(self) -> dict[str, Any]:
@@ -258,13 +261,12 @@ class OpenAICompatLLMClient:
             f"{ctx_section}\n{lines}"
         )
 
-        # Try up to min(len(pool.slots), 3) distinct slots transparently when multiple keys/proxies exist
         max_slot_attempts = min(max(1, len(pool.slots)), 3)
         tried_slots: set[str] = set()
         last_exc: Exception | None = None
         data: dict[str, Any] | None = None
 
-        for attempt_idx in range(max_slot_attempts):
+        for _attempt_idx in range(max_slot_attempts):
             slot = pool.acquire(exclude_slot_ids=tried_slots)
             tried_slots.add(slot.slot_id)
             t0 = time.perf_counter()
@@ -308,7 +310,6 @@ class OpenAICompatLLMClient:
                 err_str = f"LLM HTTP {exc.code}{ra_note} (slot={slot.slot_id}): {detail}"
                 pool.release_failure(slot, is_rate_limit=is_rl, cooldown_s=cooldown, error_msg=err_str)
                 last_exc = RuntimeError(err_str)
-                # For single-slot 401/403, fail immediately as required by unit tests
                 if exc.code in (401, 403, 400) and len(pool.slots) <= 1:
                     raise last_exc from exc
             except Exception as exc:  # noqa: BLE001

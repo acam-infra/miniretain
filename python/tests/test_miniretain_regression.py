@@ -971,7 +971,7 @@ def test_builtin_registry_defaults_and_instance_reuse():
     """Preserve baseline 680d079 REGISTRY contents, default instance reuse, lazy paddle-cpu, and isolated configured instances."""
     from ocr.adapter import REGISTRY, get_provider
 
-    expected = ["auto", "paddle-cpu", "paddle-http", "pymupdf", "stub"]
+    expected = ["auto", "mineru", "paddle-cloud", "paddle-cpu", "paddle-http", "pymupdf", "stub"]
     assert sorted(REGISTRY) == expected
 
     for name in expected:

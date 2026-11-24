@@ -10,8 +10,13 @@ from ocr.normalize import cluster_figure_regions, normalize_pages
 
 _MATH_FONT_TOKENS = (
     "CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY", "STANDARDSYML",
-    "LIBERTINUSMATH", "STIX", "NEWCMMATH", "CAMBRIAMATH", "LATINMODERNMATH", "XITS",
-    "TXMI", "TXSY", "NTXMI", "NTXSY", "EUFM", "EUSM", "BBM", "DSROM", "LMMATH",
+    "LIBERTINUSMATH", "LIBERTINEMATH", "STIX", "NEWCMMATH", "CAMBRIAMATH", "LATINMODERNMATH", "XITS",
+    "TXMI", "TXSY", "TXSYS", "TXMIA", "NTXMI", "NTXSY", "NEWTXMI", "NEWTXSY", "NEWTX",
+    "EUFM", "EUSM", "EUSB", "BBM", "DSROM", "LMMATH", "FOURIER", "PXMI", "PXSY", "KPX",
+)
+_CALLIGRAPHIC_FONT_RE = re.compile(
+    r"(?:^|[+\-_])(?:TXSYS|TXSY|CMSY|CMBSY|EUSM|EUSB|NTXSY|NEWTXSY|RSFS)\d*",
+    re.IGNORECASE,
 )
 _BOLD_FONT_RE = re.compile(
     r"(?:^|[+\-_])(?:CM|LM|SF|EC|TC|CMSS)?BX\d*"
@@ -37,6 +42,25 @@ _GREEK_TO_LATEX = {
     "Ξ": r"\Xi", "Π": r"\Pi", "Σ": r"\Sigma", "Υ": r"\Upsilon",
     "Φ": r"\Phi", "Ψ": r"\Psi", "Ω": r"\Omega",
 }
+_OP_TO_LATEX = {
+    "∈": r"\in",
+    "∉": r"\notin",
+    "⊆": r"\subseteq",
+    "⊂": r"\subset",
+    "⊇": r"\supseteq",
+    "⊃": r"\supset",
+    "∪": r"\cup",
+    "∩": r"\cap",
+    "×": r"\times",
+    "·": r"\cdot",
+    "⋅": r"\cdot",
+    "≤": r"\le",
+    "≥": r"\ge",
+    "≠": r"\ne",
+    "≈": r"\approx",
+    "∼": r"\sim",
+    "−": "-",
+}
 
 
 def _is_unicode_math_alnum(ch: str) -> bool:
@@ -51,6 +75,10 @@ def _has_unicode_math_alnum(text: str) -> bool:
 def _is_math_span_font(font_name: str) -> bool:
     u = (font_name or "").upper()
     return any(tok in u for tok in _MATH_FONT_TOKENS)
+
+
+def _is_calligraphic_math_font(font_name: str) -> bool:
+    return bool(_CALLIGRAPHIC_FONT_RE.search(font_name or ""))
 
 
 def _is_span_bold(s: dict) -> bool:
@@ -112,28 +140,35 @@ def _line_baseline_metrics(spans: list[dict]) -> tuple[float, float]:
     return sizes[len(sizes) // 2], ys[len(ys) // 2]
 
 
-_SCRIPT_TOKEN_RE = re.compile(r"^[A-Za-z0-9,+\-−′'*★⋆†‡\u0370-\u03ff\U0001d400-\U0001d7ff]+$")
+_SCRIPT_TOKEN_RE = re.compile(r"^[A-Za-z0-9,:()+\-−′'*/=<>★⋆†‡\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]+$")
+_SCRIPT_HAS_ATOM_RE = re.compile(r"[A-Za-z0-9+\-−′'*★⋆†‡\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]")
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _is_valid_script_text(t: str) -> bool:
+    if not (1 <= len(t) <= 16):
+        return False
+    if any(ch in t for ch in "[]{}?!;"):
+        return False
+    if t.count("(") != t.count(")"):
+        return False
+    if "." in t and not re.match(r"^[+\-−]?\d+\.\d+$", t):
+        return False
+    if not _SCRIPT_HAS_ATOM_RE.search(t):
+        return False
+    return bool(_SCRIPT_TOKEN_RE.match(t))
 
 
 def _is_proven_superscript(span: dict, base_sz: float, base_y: float) -> bool:
     t = (span.get("text") or "").strip()
-    if not (1 <= len(t) <= 12) or not span.get("origin") or not span.get("size"):
-        return False
-    if any(ch in t for ch in "()[]{}.,;:?!"):
-        return False
-    if len(t) > 4 and not _SCRIPT_TOKEN_RE.match(t):
+    if not span.get("origin") or not span.get("size") or not _is_valid_script_text(t):
         return False
     return float(span["size"]) < base_sz * 0.85 and float(span["origin"][1]) < base_y - 1.2
 
 
 def _is_proven_subscript(span: dict, base_sz: float, base_y: float) -> bool:
     t = (span.get("text") or "").strip()
-    if not (1 <= len(t) <= 12) or not span.get("origin") or not span.get("size"):
-        return False
-    if any(ch in t for ch in "()[]{}.,;:?!"):
-        return False
-    if len(t) > 4 and not _SCRIPT_TOKEN_RE.match(t):
+    if not span.get("origin") or not span.get("size") or not _is_valid_script_text(t):
         return False
     return float(span["size"]) < base_sz * 0.85 and float(span["origin"][1]) > base_y + 0.8
 
@@ -147,8 +182,19 @@ def _fmt_script(val: str) -> str:
     return f"{{{val}}}"
 
 
-def _fmt_latex_atom(has_hat: bool, base_sym: str, sub: str | None, sup: str | None, *, has_sqrt: bool = False) -> str:
-    base = _GREEK_TO_LATEX.get(base_sym, base_sym)
+def _fmt_latex_atom(
+    has_hat: bool,
+    base_sym: str,
+    sub: str | None,
+    sup: str | None,
+    *,
+    has_sqrt: bool = False,
+    is_calligraphic: bool = False,
+) -> str:
+    if is_calligraphic and len(base_sym) == 1 and base_sym.isascii() and base_sym.isupper():
+        base = rf"\mathcal{{{base_sym}}}"
+    else:
+        base = _GREEK_TO_LATEX.get(base_sym, base_sym)
     if has_hat:
         base = rf"\hat{{{base}}}"
     if sub:
@@ -160,16 +206,146 @@ def _fmt_latex_atom(has_hat: bool, base_sym: str, sub: str | None, sup: str | No
     return base
 
 
+def _split_leading_prefix_and_base(raw_text: str) -> tuple[str, str, str]:
+    """If a span contains leading punctuation/delimiters/operators before a trailing math symbol
+    (e.g. ', 𝐷', ', 𝜌', '−𝜌', ') = [𝜌'), split it into (prefix, base_sym, trailing_ws)."""
+    if not raw_text:
+        return "", "", ""
+    r_stripped = raw_text.rstrip()
+    trail_ws = raw_text[len(r_stripped) :]
+    if not r_stripped:
+        return raw_text, "", ""
+    l_stripped = r_stripped.lstrip()
+    lead_ws = r_stripped[: len(r_stripped) - len(l_stripped)]
+    if len(l_stripped) <= 1:
+        return lead_ws, l_stripped, trail_ws
+    last_ch = l_stripped[-1]
+    prefix_part = l_stripped[:-1]
+    if (
+        (last_ch in _GREEK_TO_LATEX or _is_unicode_math_alnum(last_ch) or (last_ch.isascii() and last_ch.isalpha()))
+        and all(c in " ,;:()[]{}-−+=/<>≤≥∈⊆×·" for c in prefix_part)
+    ):
+        return lead_ws + prefix_part, last_ch, trail_ws
+    return lead_ws, l_stripped, trail_ws
+
+
+def _coalesce_line_math_expressions(text: str) -> str:
+    """Ported upstream pdf_text_recovery-aligned math expression coalescer.
+    Combines adjacent span-evidenced $...$ atoms across function arguments, tuples,
+    brackets with superscripts, and relational/binary math operators into unified $...$ spans."""
+    # 1. Merge touching inline math runs ($a$$b$ -> $a b$) so they never form display-math $$
+    while "$$" in text:
+        nxt_t = re.sub(r"\$([^$\n]+)\$\$([^$\n]+)\$", r"$\1 \2$", text)
+        if nxt_t == text:
+            break
+        text = nxt_t
+
+    # 2. Normal distribution pattern $a$ ~ N($b$, $c$)
+    text = re.sub(
+        r"\$([^$\n]+)\$\s*[∼~]\s*N\s*\(\s*\$([^$\n]+)\$\s*,\s*\$([^$\n]+)\$\s*\)",
+        lambda m: rf"${m.group(1)} \sim \mathcal{{N}}({m.group(2)}, {m.group(3)})$",
+        text,
+    )
+
+    # 3. Simple digit fraction 1/$a$ -> $1/a$
+    text = re.sub(
+        r"(?<![A-Za-z0-9$])(\d+)\s*/\s*\$([^$\n]+)\$",
+        lambda m: f"${m.group(1)}/{m.group(2)}$",
+        text,
+    )
+
+    def _map_op(op: str) -> str:
+        op_s = op.strip()
+        return _OP_TO_LATEX.get(op_s, op_s)
+
+    for _ in range(4):
+        prev = text
+        # 4a. Function application: $f$($x$, $y$) or $f$($x$) -> $f(x, y)$
+        text = re.sub(
+            r"\$([^$\n]+)\$\(\s*\$([^$\n]+)\$(?:\s*,\s*\$([^$\n]+)\$)*\s*\)",
+            lambda m: "$"
+            + m.group(1)
+            + "("
+            + ", ".join(part.strip() for part in re.findall(r"\$([^$\n]+)\$", m.group(0)[len(m.group(1)) + 2 :]))
+            + ")$",
+            text,
+        )
+        # 4b. Function application with short math variable/tuple arg: $\mathcal{C}_k$(𝑡) or $\tau_k$(𝑐)
+        text = re.sub(
+            r"\$([^$\n]+)\$\(\s*([A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]{1,4}(?:\s*,\s*[A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]{1,4})*)\s*\)",
+            lambda m: f"${m.group(1)}({m.group(2).strip()})$",
+            text,
+        )
+        # 4c-0. Math span or variable equated to short math tuple: $c$ = (s,m) -> $c = (s, m)$
+        text = re.sub(
+            r"\$([^$\n]+)\$\s*=\s*\(\s*([A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]{1,4}(?:\s*,\s*[A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff\u2113]{1,4})+)\s*\)",
+            lambda m: "$" + m.group(1).strip() + " = (" + ", ".join(x.strip() for x in m.group(2).split(",")) + ")$",
+            text,
+        )
+        # 4c. Parenthesized tuple of >=2 math expressions: ($a$, $b$, ...) -> $(a, b, ...)$
+        text = re.sub(
+            r"\(\s*\$([^$\n]+)\$(?:\s*,\s*\$([^$\n]+)\$)+\s*\)",
+            lambda m: "$(" + ", ".join(p.strip() for p in re.findall(r"\$([^$\n]+)\$", m.group(0))) + ")$",
+            text,
+        )
+        # 4d. Bracketed math expression with superscript: [$a$ − $b$]$^+$ -> $[a - b]^+$
+        def _coalesce_bracket_sup(m: re.Match[str]) -> str:
+            inner = m.group(1).replace("$", "")
+            for u_op, l_op in _OP_TO_LATEX.items():
+                inner = inner.replace(u_op, f" {l_op} ")
+            inner = " ".join(inner.split())
+            sup_part = m.group(2)
+            return f"$[{inner}]^{sup_part}$"
+
+        text = re.sub(
+            r"\[\s*(\$[^\[\]\n]+?\$)\s*\]\$\^(\{[^{}]+\}|[^\s$]+)\$",
+            _coalesce_bracket_sup,
+            text,
+        )
+        # 4e. Binary / relational math operators connecting two $...$ spans
+        text = re.sub(
+            r"\$([^$\n]+)\$\s*(=|\+|-|−|/|<|>|≤|≥|≠|≈|∼|∈|∉|⊆|⊂|⊇|⊃|∪|∩|×|·|⋅)\s*\$([^$\n]+)\$",
+            lambda m: f"${m.group(1).strip()} {_map_op(m.group(2))} {m.group(3).strip()}$",
+            text,
+        )
+        if text == prev:
+            break
+
+    # 5. Trailing comparison with numeric constant: $\rho_k^d$ > 0 -> $\rho_k^d > 0$
+    text = re.sub(
+        r"\$([^$\n]+)\$\s*(=|<|>|≤|≥|≠|≈)\s*([+\-−]?\d+(?:\.\d+)?)(?![A-Za-z0-9_])",
+        lambda m: f"${m.group(1).strip()} {_map_op(m.group(2))} {m.group(3).replace('−', '-')}$",
+        text,
+    )
+
+    # 6. Leading single math variable or tuple assignment before relational operator + $...$:
+    # e.g. "𝑐= (𝑠,𝑚) ∈ $\mathcal{C}_k(t)...$" or "𝑠 ∈ $\mathcal{S}_k(t)$"
+    def _coalesce_leading_lhs(m: re.Match[str]) -> str:
+        lhs = m.group(1).strip()
+        lhs = re.sub(r"\s*=\s*\(\s*", " = (", lhs)
+        lhs = re.sub(r"\s*,\s*", ", ", lhs)
+        op = _map_op(m.group(2))
+        rhs = m.group(3).strip()
+        return f"${lhs} {op} {rhs}$"
+
+    text = re.sub(
+        r"(?<![A-Za-z0-9$])([A-Za-z\u0370-\u03ff\U0001d400-\U0001d7ff\u2113](?:\s*=\s*\([A-Za-z0-9\u0370-\u03ff\U0001d400-\U0001d7ff\u2113,\s]{1,12}\))?)\s*(∈|∉|⊆|⊂|≤|≥|∼)\s*\$([^$\n]+)\$",
+        _coalesce_leading_lhs,
+        text,
+    )
+    return text
+
+
 def _render_line_with_evidenced_math(
     spans: list[dict],
     *,
     want_inline_bold: bool = False,
     want_inline_italic: bool = False,
 ) -> str:
-    """Build line text while reconstructing LaTeX $...$ ONLY for Greek/math spans that have
-    verifiable PDF span-geometry evidence (hat accent span, raised smaller superscript, or
-    lowered smaller subscript), and optionally wrapping partial inline bold (**...**) and
-    italic (*...*) span runs. Lines already containing math delimiters pass through untouched."""
+    """Build line text while reconstructing LaTeX $...$ for Greek/math spans with verifiable
+    PDF span-geometry evidence (hat/sqrt prefix, raised superscript, lowered subscript,
+    calligraphic OMS symbol font, or standalone math-font variable), coalescing compound
+    inline math expressions, and optionally wrapping inline bold (**...**) and italic (*...*)."""
     raw = _CTRL_CHAR_RE.sub("", "".join(s.get("text", "") for s in spans)).strip()
     if not raw:
         return ""
@@ -195,22 +371,49 @@ def _render_line_with_evidenced_math(
         else:
             runs.append((style, txt))
 
+    def _has_physical_gap_before(idx: int) -> bool:
+        if idx <= 0:
+            return False
+        b_prev = spans[idx - 1].get("bbox")
+        b_cur = spans[idx].get("bbox")
+        if not b_prev or not b_cur:
+            return False
+        return float(b_cur[0]) - float(b_prev[2]) >= base_sz * 0.16
+
+    def _has_physical_gap_after(last_idx: int, next_idx: int) -> bool:
+        if next_idx >= n or last_idx < 0:
+            return False
+        b_prev = spans[last_idx].get("bbox")
+        b_nxt = spans[next_idx].get("bbox")
+        if not b_prev or not b_nxt:
+            return False
+        return float(b_nxt[0]) - float(b_prev[2]) >= base_sz * 0.16
+
     def _collect_scripts(start_j: int) -> tuple[str | None, str | None, int]:
-        sup_v: str | None = None
-        sub_v: str | None = None
+        sup_parts: list[str] = []
+        sub_parts: list[str] = []
         jj = start_j
+        last_kind: str | None = None
         while jj < n:
             cand = spans[jj]
-            if sup_v is None and _is_proven_superscript(cand, base_sz, base_y):
-                sup_v = (cand.get("text") or "").strip()
+            if _is_proven_superscript(cand, base_sz, base_y):
+                if sup_parts and last_kind != "sup":
+                    break
+                sup_parts.append((cand.get("text") or "").strip())
+                last_kind = "sup"
                 jj += 1
                 continue
-            if sub_v is None and _is_proven_subscript(cand, base_sz, base_y):
-                sub_v = (cand.get("text") or "").strip()
+            if _is_proven_subscript(cand, base_sz, base_y):
+                if sub_parts and last_kind != "sub":
+                    break
+                sub_parts.append((cand.get("text") or "").strip())
+                last_kind = "sub"
                 jj += 1
                 continue
             break
-        return sup_v, sub_v, jj
+        sup_v = "".join(sup_parts).rstrip(",:") if sup_parts else None
+        sub_v = "".join(sub_parts).rstrip(",:") if sub_parts else None
+        return (sup_v or None), (sub_v or None), jj
 
     while i < n:
         s = spans[i]
@@ -218,6 +421,16 @@ def _render_line_with_evidenced_math(
         stripped = st.strip()
 
         if has_geom and not skip_math_recon:
+            # Handle closing bracket/paren immediately followed by a proven superscript (e.g. [...]^+)
+            if stripped.endswith(("]", ")")) and evidenced_count > 0:
+                sup_b, sub_b, j_b = _collect_scripts(i + 1)
+                if sup_b is not None and sub_b is None:
+                    _append_run("normal", st.rstrip())
+                    _append_run("math", f"$^{_fmt_script(sup_b)}$")
+                    evidenced_count += 1
+                    i = j_b
+                    continue
+
             # Optional sqrt or hat prefix span immediately before a math variable
             has_sqrt = False
             has_hat = False
@@ -236,7 +449,16 @@ def _render_line_with_evidenced_math(
 
             g_span = spans[g_idx]
             g_raw = g_span.get("text") or ""
-            g_strip = g_raw.strip()
+            g_font = g_span.get("font") or ""
+            is_cal_font = _is_calligraphic_math_font(g_font)
+
+            if not has_hat and not has_sqrt:
+                prefix_part, g_strip, trail_part = _split_leading_prefix_and_base(g_raw)
+            else:
+                prefix_part = ""
+                g_strip = g_raw.strip()
+                trail_part = " " if g_raw.endswith(" ") else ""
+
             g_is_greek = len(g_strip) == 1 and g_strip in _GREEK_TO_LATEX
             g_is_single_latin = (
                 len(g_strip) == 1
@@ -245,24 +467,23 @@ def _render_line_with_evidenced_math(
                 and (
                     has_hat
                     or has_sqrt
-                    or _is_math_span_font(g_span.get("font") or "")
+                    or is_cal_font
+                    or _is_math_span_font(g_font)
                     or _is_span_italic(g_span)
+                    or bool(prefix_part)
                     or not runs
-                    or runs[-1][1].endswith((" ", "(", "[", ",", "=", "/", "+", "-", "·", "×", "√"))
+                    or runs[-1][1].endswith((" ", "(", "[", ",", "=", "/", "+", "-", "−", "·", "×", "√"))
                 )
             )
             g_is_math_alnum = bool(g_strip and _has_unicode_math_alnum(g_strip) and len(g_strip) <= 8)
 
-            if g_is_greek or g_is_single_latin:
-                if not has_hat and not has_sqrt and g_raw.startswith(" "):
-                    lead_ws = " "
+            if g_is_greek or g_is_single_latin or g_is_math_alnum:
                 sup, sub, j = _collect_scripts(g_idx + 1)
-                # Guard against footnote markers (digits or †/‡/*/§/¶) on non-math single letters
                 is_footnote_mark = (
                     g_is_single_latin
                     and not has_hat
                     and not has_sqrt
-                    and not _is_math_span_font(g_span.get("font") or "")
+                    and not _is_math_span_font(g_font)
                     and sub is None
                     and sup is not None
                     and (
@@ -270,20 +491,66 @@ def _render_line_with_evidenced_math(
                         or (sup.isdigit() and (not _is_span_italic(g_span) or g_strip in {"a", "I"}))
                     )
                 )
-                if (has_hat or has_sqrt or sup is not None or sub is not None) and not is_footnote_mark:
-                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup, has_sqrt=has_sqrt)
-                    trail_ws = " " if g_raw.endswith(" ") and j == g_idx + 1 else ""
-                    _append_run("math", f"{lead_ws}${atom}${trail_ws}")
-                    evidenced_count += 1
-                    i = j
-                    continue
-            elif g_is_math_alnum:
-                if not has_hat and not has_sqrt and g_raw.startswith(" "):
-                    lead_ws = " "
-                sup, sub, j = _collect_scripts(g_idx + 1)
-                if has_hat or has_sqrt or sup is not None or sub is not None:
-                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup, has_sqrt=has_sqrt)
-                    trail_ws = " " if g_raw.endswith(" ") and j == g_idx + 1 else ""
+                has_script_evidence = (has_hat or has_sqrt or sup is not None or sub is not None) and not is_footnote_mark
+
+                # Calligraphic OMS uppercase letter (in txsys/CMSY/EUSM, A-Z are exclusively \mathcal{A}..\mathcal{Z})
+                is_standalone_cal = (
+                    not has_script_evidence
+                    and is_cal_font
+                    and len(g_strip) == 1
+                    and g_strip.isascii()
+                    and g_strip.isupper()
+                )
+
+                # Standalone single-character Unicode math-font variable bounded by spaces/punctuation (or U+2113 \ell)
+                left_has_space = bool(
+                    (prefix_part and prefix_part.endswith(" "))
+                    or lead_ws == " "
+                    or (not prefix_part and runs and runs[-1][1].endswith(" "))
+                    or (not prefix_part and _has_physical_gap_before(i))
+                )
+                right_has_space_or_punct = bool(
+                    trail_part == " "
+                    or (j < n and (spans[j].get("text") or "").startswith((" ", ",", ".", ";", ":", "?", "!")))
+                    or _has_physical_gap_after(j - 1, j)
+                )
+                is_standalone_math_var = (
+                    not has_script_evidence
+                    and len(g_strip) == 1
+                    and (
+                        g_strip == "ℓ"
+                        or (
+                            _is_math_span_font(g_font)
+                            and (_is_unicode_math_alnum(g_strip) or g_strip in _GREEK_TO_LATEX)
+                            and left_has_space
+                            and right_has_space_or_punct
+                        )
+                    )
+                )
+
+                if has_script_evidence or is_standalone_cal or is_standalone_math_var:
+                    if prefix_part:
+                        _append_run("normal", prefix_part)
+                    elif not lead_ws and runs and not runs[-1][1].endswith((" ", "\t", "\n", "(", "[", "{", "/", "-", "−", "=", "+", "<", ">")):
+                        if _has_physical_gap_before(i) or re.search(r"[A-Za-z]{2,}$", runs[-1][1]):
+                            lead_ws = " "
+
+                    atom = _fmt_latex_atom(
+                        has_hat,
+                        g_strip,
+                        sub,
+                        sup,
+                        has_sqrt=has_sqrt,
+                        is_calligraphic=is_cal_font,
+                    )
+                    trail_ws = " " if (trail_part and j == g_idx + 1) else ""
+                    if (
+                        not trail_ws
+                        and j < n
+                        and not (spans[j].get("text") or "").startswith((" ", "\t", "\n", ")", "]", "}", ".", ",", ";", ":", "?", "!", "/", "-", "−", "+", "="))
+                        and (_has_physical_gap_after(j - 1, j) or re.match(r"^[A-Za-z]{2,}", (spans[j].get("text") or "")))
+                    ):
+                        trail_ws = " "
                     _append_run("math", f"{lead_ws}${atom}${trail_ws}")
                     evidenced_count += 1
                     i = j
@@ -302,6 +569,14 @@ def _render_line_with_evidenced_math(
                     style = "italic"
                     styled_count += 1
 
+        if (
+            st
+            and not st.startswith((" ", "\t", "\n", ")", "]", "}", ".", ",", ";", ":", "?", "!", "/", "-", "−", "'"))
+            and runs
+            and not runs[-1][1].endswith((" ", "\t", "\n", "(", "[", "{", "/", "-", "−"))
+            and _has_physical_gap_before(i)
+        ):
+            st = " " + st
         _append_run(style, st)
         i += 1
 
@@ -317,23 +592,7 @@ def _render_line_with_evidenced_math(
 
     text = _CTRL_CHAR_RE.sub("", "".join(out)).strip()
     if evidenced_count > 0:
-        # Merge touching inline math runs ($a$$b$ -> $a b$) so they never form display-math $$ delimiters
-        while "$$" in text:
-            nxt_t = re.sub(r"\$([^$\n]+)\$\$([^$\n]+)\$", r"$\1 \2$", text)
-            if nxt_t == text:
-                break
-            text = nxt_t
-        # Coalesce adjacent span-evidenced $...$ atoms into compound distribution / fraction expressions.
-        text = re.sub(
-            r"\$([^$\n]+)\$\s*[∼~]\s*N\s*\(\s*\$([^$\n]+)\$\s*,\s*\$([^$\n]+)\$\s*\)",
-            lambda m: rf"${m.group(1)} \sim \mathcal{{N}}({m.group(2)}, {m.group(3)})$",
-            text,
-        )
-        text = re.sub(
-            r"(?<![A-Za-z0-9$])(\d+)\s*/\s*\$([^$\n]+)\$",
-            lambda m: f"${m.group(1)}/{m.group(2)}$",
-            text,
-        )
+        text = _coalesce_line_math_expressions(text)
     return text
 
 
@@ -453,11 +712,9 @@ def _build_block_from_lines(
                 bold_chars += n
             elif _is_span_italic(s):
                 italic_chars += n
-            if any(tok in fname for tok in _MATH_FONT_TOKENS):
+            if any(tok in fname for tok in _MATH_FONT_TOKENS) or _has_unicode_math_alnum(st):
                 math_chars += n
 
-    raw_block_str = "".join(raw_chars)
-    has_algo_or_eq_ops = any(ch in raw_block_str for ch in "←∈∀∃∑∏∫")
     is_bold = bold_chars > char_count * 0.6 if char_count else False
     is_italic = (not is_bold) and (italic_chars > char_count * 0.6 if char_count else False)
     want_inline_bold = (
@@ -510,14 +767,7 @@ def _extract_table_regions(
     drawing_rects: list[list[float]],
     blocks: list[dict] | None = None,
 ) -> list[list[float]]:
-    """Detect bordered and minimal-border (booktabs) table regions on a digital PDF page.
-
-    Combines PyMuPDF's native `find_tables()` (multi-row, multi-column) with a
-    conservative horizontal-rule booktabs detector (>=3 aligned horizontal rules
-    with a compact header band). Splits rule groups across intervening prose/captions
-    or inter-table gaps and rejects fallback boxes that span already-detected tables,
-    preventing two same-width tables from swallowing body text between them.
-    """
+    """Detect bordered and minimal-border (booktabs) table regions on a digital PDF page."""
     pw = float(page.rect.width)
     ph = float(page.rect.height)
     regions: list[list[float]] = []
@@ -541,7 +791,6 @@ def _extract_table_regions(
             bb = b.get("bbox")
             if not bb:
                 continue
-            # Block sits vertically between the two rules and horizontally in the same band
             if bb[1] >= y_lo - 2.0 and bb[3] <= y_hi + 2.0 and bb[2] > gx0 + 10.0 and bb[0] < gx1 - 10.0:
                 txt = (b.get("text") or "").strip()
                 if not txt:
@@ -559,12 +808,10 @@ def _extract_table_regions(
                 ys.append(r[1])
         return len(ys)
 
-    # Booktabs / minimal-border table detector: group aligned horizontal rules per table.
     hlines = [
         r for r in drawing_rects
         if (r[2] - r[0]) >= 60.0 and (r[3] - r[1]) <= 3.0 and (r[2] - r[0]) <= pw * 0.96
     ]
-    # Bucket rules by horizontal alignment (x0, x1) first, then split vertically into independent tables.
     x_buckets: list[list[list[float]]] = []
     for r in sorted(hlines, key=lambda x: (x[1], x[0])):
         placed = False
@@ -584,8 +831,6 @@ def _extract_table_regions(
             gap = r[1] - prev_y
             gx0 = min(x[0] for x in cur)
             gx1 = max(x[2] for x in cur)
-            # Split into a new table if gap is large, prose/caption sits between rules,
-            # or current group already forms a complete >=3-rule booktabs table before a >28pt gap.
             if (
                 gap > 180.0
                 or _has_intervening_prose(gx0, gx1, prev_y, r[1])
@@ -598,14 +843,12 @@ def _extract_table_regions(
         groups.append(cur)
 
     for g in groups:
-        # Collapse near-duplicate double rules (within 4pt vertically)
         ys: list[float] = []
         for r in g:
             if not ys or abs(r[1] - ys[-1]) > 4.0:
                 ys.append(r[1])
         if len(ys) < 3:
             continue
-        # Booktabs tables have a compact header band between toprule and midrule (<= 45pt)
         if (ys[1] - ys[0]) > 45.0:
             continue
         box = [
@@ -617,7 +860,6 @@ def _extract_table_regions(
         th = box[3] - box[1]
         if not (24.0 <= th <= ph * 0.75):
             continue
-        # Reject any fallback box that overlaps/merges already-detected independent find_tables() regions
         overlaps_existing = False
         for er in regions:
             ix = max(0.0, min(box[2], er[2]) - max(box[0], er[0]))
@@ -672,7 +914,7 @@ def _extract_page_blocks(
 
 def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bool:
     """Return True ONLY when span geometry proves prev_lines[-1] and nxt_lines[0] were split
-    mid-formula at a simultaneous superscript + lowered subscript (e.g. σ^2 / _b sharing x0)."""
+    mid-formula at a simultaneous superscript + lowered subscript (e.g. D^max / _k sharing x0)."""
     if not prev_lines or not nxt_lines:
         return False
     prev_last = prev_lines[-1]
@@ -694,11 +936,13 @@ def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bo
     if y_ov < 0.45 * min_h:
         return False
     prev_left = min(l["bbox"][0] for l in prev_lines if l.get("bbox"))
-    if nl[0] <= prev_left + 40.0:
+    if nl[0] < prev_left - 2.0:
         return False
-    if len(nxt_lines) >= 2:
-        nxt_body_left = min(l["bbox"][0] for l in nxt_lines[1:] if l.get("bbox"))
-        if abs(nxt_body_left - prev_left) > 22.0:
+    # Check subsequent lines that sit vertically BELOW the split line (not same-line continuations)
+    below_lines = [l for l in nxt_lines[1:] if l.get("bbox") and l["bbox"][1] >= nl[3] - 2.0]
+    if below_lines:
+        nxt_body_left = min(l["bbox"][0] for l in below_lines)
+        if abs(nxt_body_left - prev_left) > 25.0:
             return False
 
     prev_spans = [s for s in (prev_last.get("spans") or []) if (s.get("text") or "").strip()]
@@ -710,13 +954,20 @@ def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bo
     sup_span = prev_spans[-1]
     base_span = prev_spans[-2]
     sub_span = nxt_spans[0]
+    if base_span.get("origin") and base_span.get("size") and float(base_span["size"]) >= base_sz * 0.85:
+        base_sz = float(base_span["size"])
+        base_y = float(base_span["origin"][1])
 
-    # Prev must end with a proven smaller raised superscript after a Greek/math-font base span
+    # Prev must end with a proven smaller raised superscript after a Greek/math/variable base span
     base_txt = (base_span.get("text") or "").strip()
+    if not base_txt:
+        return False
+    base_last = base_txt[-1]
     if not (
-        (len(base_txt) == 1 and base_txt in _GREEK_TO_LATEX)
+        base_last in _GREEK_TO_LATEX
         or _is_math_span_font(base_span.get("font") or "")
-        or (base_txt and _has_unicode_math_alnum(base_txt))
+        or _has_unicode_math_alnum(base_txt)
+        or (base_last.isascii() and base_last.isalpha())
     ):
         return False
     if not _is_proven_superscript(sup_span, base_sz, base_y):
@@ -726,23 +977,21 @@ def _is_math_split_boundary(prev_lines: list[dict], nxt_lines: list[dict]) -> bo
     if not _is_proven_subscript(sub_span, base_sz, base_y):
         return False
     sub_txt = (sub_span.get("text") or "").strip()
-    if not (
-        re.match(r"^[A-Za-z0-9]{1,4}$", sub_txt)
-        or (1 <= len(sub_txt) <= 4 and all(c.isalnum() or _is_unicode_math_alnum(c) or c in ",+-−" for c in sub_txt))
-    ):
+    if not _is_valid_script_text(sub_txt):
         return False
     sup_bb = sup_span.get("bbox")
     sub_bb = sub_span.get("bbox")
     if not sup_bb or not sub_bb:
         return False
-    return abs(sub_bb[0] - sup_bb[0]) <= 6.0 or (sup_bb[0] - 2.0 <= sub_bb[0] <= sup_bb[2] + 4.0)
+    return abs(sub_bb[0] - sup_bb[0]) <= 6.0 or (sup_bb[0] - 4.0 <= sub_bb[0] <= sup_bb[2] + 6.0)
 
 
 def _merge_inline_math_split_blocks(
     block_groups: list[tuple[str, list[dict]]]
 ) -> list[tuple[str, list[dict]]]:
-    """Merge consecutive (block_id, lines) groups ONLY when _is_math_split_boundary proves
-    they belong to the same split inline math formula (never merges plain text/columns/headings)."""
+    """Merge consecutive (block_id, lines) groups when _is_math_split_boundary proves
+    they belong to the same split inline math formula, including same-line continuation
+    lines immediately following the lowered subscript."""
     if len(block_groups) < 2:
         return block_groups
     merged: list[tuple[str, list[dict]]] = []
@@ -761,7 +1010,32 @@ def _merge_inline_math_split_blocks(
                 ],
                 "spans": list(prev_lines[-1].get("spans") or []) + list(lines[0].get("spans") or []),
             }
-            merged[-1] = (prev_bid, list(prev_lines[:-1]) + [joined_line] + list(lines[1:]))
+            # Also coalesce any immediately following lines in `lines` that sit on the SAME visual line
+            # (PyMuPDF puts the subscript in Line 0 and the rest of the same visual line in Line 1)
+            k = 1
+            while k < len(lines):
+                cand_line = lines[k]
+                cb = cand_line.get("bbox")
+                jb = joined_line["bbox"]
+                if not cb:
+                    break
+                min_h = max(1.0, min(jb[3] - jb[1], cb[3] - cb[1]))
+                y_ov = min(jb[3], cb[3]) - max(jb[1], cb[1])
+                if y_ov >= 0.45 * min_h and jb[0] <= cb[0] <= jb[2] + 18.0:
+                    joined_line = {
+                        **joined_line,
+                        "bbox": [
+                            min(jb[0], cb[0]),
+                            min(jb[1], cb[1]),
+                            max(jb[2], cb[2]),
+                            max(jb[3], cb[3]),
+                        ],
+                        "spans": list(joined_line.get("spans") or []) + list(cand_line.get("spans") or []),
+                    }
+                    k += 1
+                else:
+                    break
+            merged[-1] = (prev_bid, list(prev_lines[:-1]) + [joined_line] + list(lines[k:]))
             continue
         merged.append((bid, lines))
     return merged
@@ -785,7 +1059,6 @@ def _merge_split_references(blocks: list[dict]) -> list[dict]:
             and 0 <= blocks[i + 1]["bbox"][1] - cur["bbox"][3] <= 12.0
         ):
             nxt = blocks[i + 1]
-            # Keep merging if there's another continuation? Usually 1 continuation block
             comb_lines = _join_lines_smart([cur["text"], nxt["text"]])
             comb_lbs = list(cur["line_bboxes"]) + list(nxt["line_bboxes"])
             comb_bbox = [

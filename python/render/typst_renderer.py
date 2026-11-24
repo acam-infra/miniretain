@@ -1,20 +1,30 @@
 """Typst renderer for Miniretain: supports layout-preserving per-page overlay
-(RetainPDF-aligned) with Typst-native measure() + compiled-span fit verification
+(RetainPDF-aligned) with Typst-native measure() + compiled-span fit verification,
+ported upstream retainpdf_math / formula_safety / formula_guard mechanisms,
 and A4 streaming fallback.
 """
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import time
-from pathlib import Path
 
 import pymupdf
 
 from render.layout import find_cjk_font, pdf_rect
+from render.math_normalizer import (
+    close_trailing_inline_math,
+    formula_safety_insets_pt,
+    has_long_inline_math_layout_risk,
+    is_pure_superscript,
+    prepare_formula_for_render,
+    split_rect_away_from_formula_guards,
+    strip_control_chars,
+)
 from render.side_by_side import build_side_by_side_pdf, merge_interleaved
 
 _URL_RE = re.compile(r"https?://[^\s)\]>]+")
@@ -32,7 +42,7 @@ def find_typst_package_cache_dir() -> str | None:
     if xdg_cache:
         candidates.append(Path(xdg_cache) / "typst" / "packages")
     candidates.extend([
-        Path.home() / ".cache" / "typst" / "packages",
+        Path.home() / ".cache/typst/packages",
         Path("/root/.cache/typst/packages"),
         Path("/home/agentuser/.cache/typst/packages"),
         Path("/home/ccds/.cache/typst/packages"),
@@ -117,34 +127,17 @@ def _breakable_url_display(url: str) -> str:
     return "#sym.zws ".join(f"#{typst_str_literal(p)}" for p in out)
 
 
-
-_SQRT_ARG_RE = re.compile(
-    r"√(?:\{([^{}]+)\}|\(([^()]+)\)|((?:\\[A-Za-z]+|[^\s^_{}()+\-−=<>.,;:])(?:_(?:\{[^{}]+\}|[^\s{}])|\^(?:\{[^{}]+\}|[^\s{}]))*))"
-)
-_CTRL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-
-
 def _strip_control_chars(text: str) -> str:
-    return _CTRL_CHAR_RE.sub("", text) if text else text
+    return strip_control_chars(text)
 
 
 def _sanitize_latex_for_mitex(expr: str) -> str:
-    """Minimal normalization for MiTeX raw backtick strings: convert bare √ to \sqrt{...}
-    and Unicode primes to ASCII primes; pass all other Unicode math symbols untouched to MiTeX."""
-    if not expr:
-        return expr
-    s = _strip_control_chars(expr)
-    s = _SQRT_ARG_RE.sub(lambda m: rf"\sqrt{{{m.group(1) or m.group(2) or m.group(3)}}}", s)
-    return s.replace("″", "''").replace("′", "'")
+    """Normalize LaTeX expression for MiTeX raw backtick strings using upstream retainpdf_math rules."""
+    return prepare_formula_for_render(expr)
 
 
 def _build_font_families(font: str, cjk_font_file: str) -> tuple[str, str]:
-    """Build (body_font_families, bold_font_families) Typst font lists.
-
-    Respects explicit `render.font` (family name or file path). For CJK bold
-    (headings, titles, #strong[...]), switches CJK to Heiti (`Noto Sans CJK SC`)
-    so bold weight stands out crisply against Songti (`Noto Serif CJK SC`) body text.
-    """
+    """Build (body_font_families, bold_font_families) Typst font lists."""
     req = (font or "").strip()
     is_path_like = bool(req and ("/" in req or req.lower().endswith((".ttf", ".otf", ".ttc"))))
     body_list: list[str] = ["Libertinus Serif"]
@@ -192,6 +185,7 @@ def _looks_like_currency_span(inner: str) -> bool:
 
 def _split_math_segments(text: str) -> list[tuple[str, str]]:
     """Split non-URL text into ('text'|'inline_math'|'display_math', content) segments."""
+    text = close_trailing_inline_math(text)
     out: list[tuple[str, str]] = []
     buf: list[str] = []
     i = 0
@@ -388,6 +382,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     raw_segs = _split_math_segments(segment)
     # Normalize spacing around inline math in this single shared expression builder
     # so fit_probe.typ measurement and overlay.typ placement stay 100% consistent:
+    # - Pure superscripts ($^{14}$, $^\dagger$): stay tight against CJK text and punctuation
     # - Between CJK char and #mi(): replace arbitrary/stretched ASCII spaces with weak 0.18em gap
     # - Between CJK punctuation (or explicit newline) and #mi(): keep tight (no stray space)
     # - Between English/ASCII words and #mi(): preserve necessary word spaces
@@ -396,6 +391,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     n = len(segs)
     for idx, (kind, content) in enumerate(segs):
         if kind == "inline_math":
+            pure_sup = is_pure_superscript(content)
             need_left_gap = False
             if idx > 0 and segs[idx - 1][0] == "text":
                 prev_raw = segs[idx - 1][1]
@@ -404,16 +400,12 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
                 if prev_visible:
                     last_ch = prev_visible[-1]
                     if _is_cjk_char(last_ch):
-                        # Replace trailing spaces (if any) on the previously emitted text part
                         if parts:
                             parts[-1] = _render_styled_text_literal(prev_stripped)
-                        need_left_gap = True
+                        need_left_gap = not pure_sup
                     elif last_ch in _CJK_PUNCT or last_ch == "\n":
                         if parts:
                             parts[-1] = _render_styled_text_literal(prev_stripped)
-                elif prev_raw and not prev_raw.strip(" \t"):
-                    # Pure horizontal whitespace between something and inline_math
-                    pass
             if need_left_gap:
                 parts.append(_INLINE_MATH_GAP)
             parts.append(f"#mi({_typst_raw_literal(_sanitize_latex_for_mitex(content))})")
@@ -424,7 +416,8 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
                 if nxt_visible:
                     first_ch = nxt_visible[0]
                     if _is_cjk_char(first_ch):
-                        parts.append(_INLINE_MATH_GAP)
+                        if not pure_sup:
+                            parts.append(_INLINE_MATH_GAP)
                         segs[idx + 1][1] = nxt_stripped
                     elif first_ch in _CJK_PUNCT or first_ch == "\n":
                         segs[idx + 1][1] = nxt_stripped
@@ -477,10 +470,8 @@ def _unbreakable_segments(text: str) -> list[str]:
         if kind == "text":
             for am in _ASCII_RUN_RE.finditer(_strip_style_markers(seg_text)):
                 segs.append(am.group(0))
-    # Also keep longest single CJK char as minimum width check
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
         segs.append("汉")
-    # Deduplicate preserving longest segments first
     uniq = sorted(set(s for s in segs if s), key=len, reverse=True)
     return uniq[:12]
 
@@ -515,12 +506,7 @@ def _compute_start_size(
     min_size: float,
     role: str = "body",
 ) -> float:
-    """Line-aware initial font size.
-
-    Multi-line blocks (paragraphs, captions, references) start closer to the source
-    font size (0.98x) so CJK body text retains full readability; single-line boxes
-    are capped by box height (0.85x) because CJK em-boxes are taller than Latin glyphs.
-    """
+    """Line-aware initial font size."""
     max_cap = 16.0 if role == "title" else 14.0
     if hint and isinstance(hint, (int, float)) and hint > 0:
         h_val = float(hint)
@@ -535,6 +521,17 @@ def _compute_start_size(
     return min(max_cap, max(min_size, rect.height * 0.78))
 
 
+def _block_justify_and_leading(text: str, sz: float, width_pt: float) -> tuple[str, str]:
+    """Ported from upstream formula_safety.py: disable justify when a block has long inline math
+    risk so wide inline formulas don't stretch CJK character gaps on the preceding line."""
+    long_math_risk = has_long_inline_math_layout_risk(
+        text, font_size_pt=sz, box_width_pt=width_pt
+    )
+    justify_str = "false" if long_math_risk else "true"
+    leading = "0.35em" if sz < 8.5 else "0.45em"
+    return justify_str, leading
+
+
 def measure_blocks_with_typst(
     typst_bin: str,
     font_dir: str,
@@ -545,11 +542,7 @@ def measure_blocks_with_typst(
     pkg_cache_dir: str | None = None,
     bold_font_families: str | None = None,
 ) -> dict[tuple[int, float], tuple[float, float]]:
-    """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates.
-
-    Unbreakable token widths scale linearly with font size, so each candidate's
-    segments are measured once at its reference size and scaled for other sizes.
-    """
+    """Measure exact Typst (max_token_width_pt, block_height_pt) for all candidates."""
     if not candidates:
         return {}
     needs_mitex = any(
@@ -577,6 +570,7 @@ def measure_blocks_with_typst(
         blk_font_attr = f'font: {bold_font_families or font_families}, ' if weight == "bold" else ""
         rich = c["rich_expr"]
         segs = c["segments"]
+        trans_txt = (c.get("item") or {}).get("translation") or ""
         ref_sz = sizes[0]
         ref_sizes[idx] = ref_sz
         if segs:
@@ -589,11 +583,11 @@ def measure_blocks_with_typst(
                 f'[#metadata((kind: "tw", idx: {idx}, sz: {ref_sz:.2f}, tw: tw)) <fit>] }}'
             )
         for sz in sizes:
-            leading = "0.35em" if sz < 8.5 else "0.45em"
+            justify_str, leading = _block_justify_and_leading(trans_txt, sz, w)
             lines.append(
                 f'#context {{ let m = measure(block(width: {w:.2f}pt)'
                 f'[#set text({blk_font_attr}size: {sz:.2f}pt, weight: "{weight}"); '
-                f'#set par(leading: {leading}, justify: true); {rich}]); '
+                f'#set par(leading: {leading}, justify: {justify_str}); {rich}]); '
                 f'[#metadata((kind: "h", idx: {idx}, sz: {sz:.2f}, h: m.height / 1pt)) <fit>] }}'
             )
     probe_typ = workdir / probe_name
@@ -649,7 +643,6 @@ def _overlaps_neighbor(
                 oy0 = max(self_orig_box[1], nb[1])
                 ox1 = min(self_orig_box[2], nb[2])
                 oy1 = min(self_orig_box[3], nb[3])
-                # Ignore pre-existing source bbox touch/overlap if rendered box didn't grow past it
                 if (ox1 - ox0) > 0 and (oy1 - oy0) > 0 and (y1 - y0) <= (oy1 - oy0) + tol_pt:
                     continue
             return True
@@ -683,15 +676,16 @@ def _emit_overlay_typ(
             raw_w = max(4.0, float(rect.width))
             w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
-            leading = "0.35em" if chosen_sz < 8.5 else "0.45em"
-            rich = typst_rich_text_expr(it["translation"].strip(), use_mitex=use_mitex)
+            trans_txt = it["translation"].strip()
+            justify_str, leading = _block_justify_and_leading(trans_txt, chosen_sz, w)
+            rich = typst_rich_text_expr(trans_txt, use_mitex=use_mitex)
             if "#mi(" in rich or "#mitex(" in rich:
                 needs_mitex = True
             body_lines.append(
                 f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
                 f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
                 f'[#set text({blk_font_attr}size: {chosen_sz:.2f}pt, weight: "{weight}"{style_attr}); '
-                f'#set par(leading: {leading}, justify: true); {rich}])'
+                f'#set par(leading: {leading}, justify: {justify_str}); {rich}])'
             )
     header: list[str] = []
     if needs_mitex:
@@ -722,7 +716,6 @@ def _find_compiled_overflow_blocks(
         if not placed_list or page_index >= len(overlay_doc):
             continue
         opage = overlay_doc[page_index]
-        # Build spatial index of placed blocks on this page
         for blk in opage.get_text("dict").get("blocks", []):
             for line in blk.get("lines", []):
                 line_compact = "".join("".join((s.get("text") or "") for s in line.get("spans", [])).split())
@@ -732,9 +725,6 @@ def _find_compiled_overflow_blocks(
                     span_w = max(0.5, sx1 - sx0)
                     span_h = max(0.5, sy1 - sy0)
                     span_area = span_w * span_h
-                    # Primary match: pick placed block with highest text + 2D overlap.
-                    # Using full line_probe avoids misattributing short accent/symbol spans (e.g. "ˆ")
-                    # to an overlapping adjacent block that happens to share the same single glyph.
                     sp_compact = "".join((span.get("text") or "").split())
                     sp_probe = line_probe if len(line_probe) >= 3 else sp_compact[:12]
                     best = None
@@ -768,7 +758,6 @@ def _find_compiled_overflow_blocks(
                                     best_score = score
                                     best = (it, rect, local_i)
                     if best is None:
-                        # Fallback for spans that escaped all rects: match nearest in same vertical/column band
                         best_dist = 1e9
                         left_pad = max(8.0, span_h)
                         for it, rect, _sz, local_i in placed_list:
@@ -847,10 +836,14 @@ def _render_typst_preserve(
 
             page_items = [it for it in items if it["page_index"] == page_index]
             neighbor_boxes: list[tuple[int, tuple[float, float, float, float]]] = []
+            formula_guard_rects: list[pymupdf.Rect] = []
             for local_i, it in enumerate(page_items):
                 if it.get("bbox"):
                     r = pdf_rect(it["bbox"], scale)
                     neighbor_boxes.append((local_i, (r.x0, r.y0, r.x1, r.y1)))
+                    pol = it.get("policy") or {}
+                    if pol.get("translate") is False and it.get("layout_role") == "formula":
+                        formula_guard_rects.append(r)
 
             p_preserved = 0
             p_failed = 0
@@ -902,14 +895,13 @@ def _render_typst_preserve(
                 "is_scanned": bool(page_scanned.get(page_index, False)),
                 "total_blocks": len(page_items),
                 "neighbor_boxes": neighbor_boxes,
+                "formula_guard_rects": formula_guard_rects,
                 "p_preserved": p_preserved,
                 "p_failed": p_failed,
                 "candidates": p_candidates,
             })
 
         # Step 2: Two-tier Typst fit measurement.
-        # Pass 1 probes only the top size (and one fallback size) per block; Pass 2
-        # probes remaining sizes ONLY for blocks that did not fit in Pass 1.
         t_probe_0 = time.perf_counter()
         pass1_candidates: list[dict] = []
         for c in probe_candidates:
@@ -1029,7 +1021,6 @@ def _render_typst_preserve(
         with pymupdf.open(overlay_pdf) as check_doc:
             compiled_bad = _find_compiled_overflow_blocks(check_doc, page_meta, to_place_by_page)
 
-        # Retry any compiled-overflow blocks step-by-step down to min_size
         for _retry_step in range(24):
             if not compiled_bad:
                 break
@@ -1076,7 +1067,6 @@ def _render_typst_preserve(
                     else:
                         kept.append(tup)
                 to_place_by_page[page_index] = kept
-            # Recompile clean overlay.pdf without overflowing blocks
             overlay_typ.write_text(
                 _emit_overlay_typ(page_meta, to_place_by_page, font_families, use_mitex=use_mitex, bold_font_families=bold_font_families),
                 encoding="utf-8",
@@ -1098,7 +1088,7 @@ def _render_typst_preserve(
 
         overlay_compile_s = round(time.perf_counter() - t_overlay_0, 3)
 
-        # Step 5: Now redact ONLY verified fitted blocks on source PDF, composite overlay, and count `placed`
+        # Step 5: Redact verified fitted blocks (splitting redaction rects away from preserved display formula guards)
         t_comp_0 = time.perf_counter()
         placed = 0
         per_page: list[dict] = []
@@ -1112,16 +1102,23 @@ def _render_typst_preserve(
                 page = doc[page_index]
                 scale = pm["scale"]
                 to_render = to_place_by_page.get(page_index, [])
+                formula_guards = pm.get("formula_guard_rects") or []
                 redact_fill = (1, 1, 1) if pm["is_scanned"] else None
                 for it, _rect, _sz, _li in to_render:
                     for lb in it.get("line_bboxes") or [it["bbox"]]:
-                        page.add_redact_annot(pdf_rect(lb, scale), fill=redact_fill)
+                        raw_rect = pdf_rect(lb, scale)
+                        safe_rects = (
+                            split_rect_away_from_formula_guards(raw_rect, formula_guards)
+                            if formula_guards
+                            else [raw_rect]
+                        )
+                        for sr in safe_rects:
+                            page.add_redact_annot(sr, fill=redact_fill)
                 if to_render:
                     page.apply_redactions(images=0, graphics=0, text=0)
                     page.show_pdf_page(page.rect, overlay_doc, page_index, overlay=True)
                     placed += len(to_render)
 
-                # Restore clickable URI links on rendered page (handling wrapped URLs)
                 existing_uris = {
                     (round(lk["from"].x0, 1), round(lk["from"].y0, 1), lk.get("uri"))
                     for lk in page.get_links()

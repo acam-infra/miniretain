@@ -28,7 +28,12 @@ _NUMERIC_TICK_RE = re.compile(
     r")$"
 )
 _MATH_CHARS = set("=∑∫∏∈∉≤≥≠≈→←↔±×÷√∞∂∇αβγδεζηθκλμνξπρστυφχψωΔΣΠΩ·−∼⊂⊆∪∩∀∃∝‖⟨⟩")
-_MATH_FONT_TOKENS = ("CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY")
+_MATH_FONT_TOKENS = (
+    "CMMI", "CMSY", "CMEX", "MSAM", "MSBM", "SYMBOL", "MTMI", "MTSY", "STANDARDSYML",
+    "LIBERTINUSMATH", "LIBERTINEMATH", "STIX", "NEWCMMATH", "CAMBRIAMATH", "LATINMODERNMATH", "XITS",
+    "TXMI", "TXSY", "TXSYS", "TXMIA", "NTXMI", "NTXSY", "NEWTXMI", "NEWTXSY", "NEWTX",
+    "EUFM", "EUSM", "EUSB", "BBM", "DSROM", "LMMATH", "FOURIER", "PXMI", "PXSY", "KPX",
+)
 _EMAIL_RE = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
 _AFFIL_KW_RE = re.compile(
     r"\b(?:University|Institute|Research|Google|Microsoft|Berkeley|Stanford|MIT|CMU|Department|Laboratory|Labs)\b"
@@ -46,7 +51,6 @@ def _is_code_listing(text: str) -> bool:
     s = text.strip()
     if not s or len(s) > 800:
         return False
-    # Strip inline/display LaTeX math spans so LaTeX subscripts like \theta_b are never mistaken for snake_case code.
     s_nomath = re.sub(r"\$\$[^$]+\$\$|\$[^$\n]+\$|\\\([^\n]+?\\\)|\\\[[\s\S]+?\\\]", " ", s)
     if "←" in s_nomath and re.search(r"\b\d+:", s_nomath):
         return True
@@ -74,10 +78,8 @@ def _is_author_affiliation(
 ) -> bool:
     if page_idx != 0:
         return False
-    # Never misclassify large title text as an author/affiliation line
     if font_size and font_size >= median_font * 1.25:
         return False
-    # Restrict to the geometric author region on page 0 (above Abstract, or top 35% of page)
     if bbox is not None:
         if abstract_y0 is not None:
             if bbox[3] > abstract_y0 + 6.0:
@@ -95,10 +97,8 @@ def _is_author_affiliation(
         return True
     if _AFFIL_KW_RE.search(s) and not s.endswith("."):
         return True
-    # Multiple "First Last<digit>" author entries on one line (with or without space before marker)
     if len(re.findall(r"\b[A-Z][a-z]+\s+(?:[A-Z]\.\s*)?[A-Z][a-z]+[\d∗†‡§,\s]*\d", s)) >= 2:
         return True
-    # IEEE / arXiv comma-separated author lists without superscript markers (e.g. "Zheng Lin, Member, IEEE, ...")
     if re.search(r"\b(?:Fellow|Member|Senior Member|Student Member),\s*IEEE\b", s):
         return True
     if not s.endswith((".", "?", "!")) and "," in s:
@@ -143,7 +143,6 @@ def cluster_figure_regions(
     rects: list[list[float]] = []
     for r in drawing_rects:
         w, h = r[2] - r[0], r[3] - r[1]
-        # Ignore full-page borders or tiny hairlines (< 2pt both ways)
         if w > page_width * 0.96 and h > page_height * 0.96:
             continue
         if w < 2.0 and h < 2.0:
@@ -158,7 +157,6 @@ def cluster_figure_regions(
     if not rects:
         return []
 
-    # Iteratively merge intersecting/nearby rects within `margin`
     merged = [list(r) for r in rects]
     changed = True
     while changed:
@@ -189,16 +187,10 @@ def cluster_figure_regions(
             out.append(cur)
         merged = out
 
-    # Keep only non-trivial regions (at least 30x20 pt)
     return [r for r in merged if (r[2] - r[0]) >= 30.0 and (r[3] - r[1]) >= 20.0]
 
 
 def _is_numeric_axis_tick(text: str) -> bool:
-    """Detect pure numeric / log-scale exponent axis ticks (e.g. '35', '1000', '103', '10−1', '10³').
-
-    Preserving these verbatim prevents PyMuPDF/Typst from flattening superscript
-    exponents (like 10^3 -> 103) and keeps axis tick geometry untouched.
-    """
     s = text.strip()
     if not s or len(s) > 32:
         return False
@@ -209,16 +201,15 @@ def _is_formula_text(text: str, is_math_font: bool = False) -> bool:
     s = text.strip()
     if not s:
         return False
-    # If removing delimited math ($...$ / $$...$$) leaves no prose words, the block is a pure formula fragment
-    if "$" in s:
-        outside = re.sub(r"\$\$[^$]+\$\$|\$[^$\n]+\$", " ", s)
-        if not re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]", outside):
-            return True
+    outside = re.sub(r"\$\$[^$]+\$\$|\$[^$\n]+\$", " ", s) if "$" in s else s
+    outside_prose_words = re.findall(r"[A-Za-z]{3,}", outside)
+    if "$" in s and not re.search(r"[A-Za-z]{2,}|[\u4e00-\u9fff]", outside):
+        return True
     if re.match(r"^\(\d+(?:\.\d+)*\)$", s):
         return True
     if _BIG_O_ONLY_RE.match(s):
         return True
-    if is_math_font and len(s) < 120:
+    if is_math_font and len(s) < 120 and len(outside_prose_words) <= 3:
         return True
     math_count = sum(1 for ch in s if ch in _MATH_CHARS)
     alpha_words = re.findall(r"[A-Za-z]{3,}", s)
@@ -240,7 +231,6 @@ def _assign_columns(blocks: list[dict], page_width: float) -> list[dict]:
     if not blocks:
         return []
     mid = page_width * 0.5
-    # Heuristic: if substantial blocks sit clearly left of mid and right of mid, 2-column
     left_blocks = [b for b in blocks if b.get("bbox") and b["bbox"][2] <= mid + 12.0]
     right_blocks = [b for b in blocks if b.get("bbox") and b["bbox"][0] >= mid - 12.0]
     is_two_col = len(left_blocks) >= 2 and len(right_blocks) >= 2
@@ -251,7 +241,6 @@ def _assign_columns(blocks: list[dict], page_width: float) -> list[dict]:
             b["column_index"] = 0
         return ordered
 
-    # Partition into vertical bands separated by full-width spanning blocks (e.g. title, full-width fig/caption)
     ordered_by_y = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]) if b.get("bbox") else (0.0, 0.0))
     result: list[dict] = []
     band: list[dict] = []
@@ -311,8 +300,14 @@ def normalize_pages(
         ocr_reliable = bool(page.get("ocr_reliable", True))
         raw_blocks = page.get("blocks") or []
 
-        # Compute median body font size if available
-        font_sizes = [float(b["font_size_pt"]) for b in raw_blocks if b.get("font_size_pt")]
+        prose_font_sizes = [
+            float(b["font_size_pt"])
+            for b in raw_blocks
+            if b.get("font_size_pt") and len((b.get("text") or "").strip()) >= 40
+        ]
+        font_sizes = prose_font_sizes or [
+            float(b["font_size_pt"]) for b in raw_blocks if b.get("font_size_pt")
+        ]
         median_font = statistics.median(font_sizes) if font_sizes else 10.0
 
         ordered = _assign_columns(list(raw_blocks), page_w)
@@ -346,7 +341,6 @@ def normalize_pages(
                     is_vertical = True
             col_idx = int(b.get("column_index", 0))
 
-            # Role & Policy classification
             layout_role = "body"
             translate = True
             preserve_reason: str | None = None
@@ -371,13 +365,11 @@ def normalize_pages(
                 layout_role = "caption"
                 translate = True
             elif bbox and any(_overlap_ratio(bbox, tr, pad=3.0) >= 0.5 for tr in table_regions):
-                # Table header / cell inside a detected bordered or booktabs table region
                 layout_role = "table"
                 translate = False
                 preserve_reason = "table"
                 redact_source = False
             elif bbox and any(_overlap_ratio(bbox, fr, pad=4.0) >= 0.5 for fr in figure_regions):
-                # Inside a figure/diagram region and NOT a caption
                 if len(text) <= 120 or (bbox[2] - bbox[0]) < page_w * 0.35:
                     layout_role = "figure_label"
                     translate = False
@@ -389,7 +381,6 @@ def normalize_pages(
                 and (not font_size or font_size <= max(8.5, median_font * 0.92))
                 and any(_overlap_ratio(bbox, fr, pad=14.0) >= 0.5 for fr in figure_regions)
             ):
-                # Axis / tick / legend label sitting just outside a figure frame
                 layout_role = "figure_label"
                 translate = False
                 preserve_reason = "figure_label"
@@ -413,12 +404,23 @@ def normalize_pages(
                     or (font_size and font_size <= 6.5 and (bbox[2] - bbox[0]) <= 60.0)
                 )
             ):
-                # Microscopic chart/plot axis/legend labels below Typst's minimum readable font floor
                 layout_role = "figure_label"
                 translate = False
                 preserve_reason = "tiny_figure_label"
                 redact_source = False
-            elif bbox and (bbox[1] < page_h * 0.045 or bbox[3] > page_h * 0.96) and len(text) < 80:
+            elif (
+                bbox
+                and (
+                    bbox[1] < page_h * 0.045
+                    or (
+                        bbox[1] < page_h * 0.065
+                        and bbox[3] < page_h * 0.08
+                        and (not font_size or font_size <= median_font * 0.95)
+                    )
+                    or bbox[3] > page_h * 0.955
+                )
+                and len(text) < 90
+            ):
                 layout_role = "header_footer"
                 translate = False
                 preserve_reason = "header_footer"
@@ -439,7 +441,15 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "code_listing"
                 redact_source = False
-            elif page_idx == 0 and font_size and font_size >= median_font * 1.35 and len(text) < 200:
+            elif (
+                page_idx == 0
+                and not seen_abstract
+                and font_size
+                and font_size >= max(11.5, median_font * 1.3)
+                and len(text) < 200
+                and (not bbox or bbox[1] < page_h * 0.35)
+                and not text[0].islower()
+            ):
                 layout_role = "title"
                 translate = True
             elif _is_author_affiliation(
@@ -463,7 +473,6 @@ def normalize_pages(
                 translate = True
             elif in_references:
                 layout_role = "reference"
-                # Pure [N] + author-list lines (no title/venue/URL) are preserved as fixed identifiers
                 if (
                     re.match(r"^\[\d+\]\s+[A-Z]\.", text)
                     and not any(q in text for q in ('“', '”', '"', "http", "doi:"))
@@ -475,7 +484,6 @@ def normalize_pages(
                 else:
                     translate = True
 
-            # Respect explicit pre-set policy if provided
             if isinstance(b.get("policy"), dict) and "translate" in b["policy"]:
                 translate = bool(b["policy"]["translate"])
                 preserve_reason = b["policy"].get("preserve_reason", preserve_reason)
@@ -517,7 +525,6 @@ def normalize_pages(
                 },
             }
 
-            # Cross-column / cross-page continuation detection for body blocks
             if layout_role == "body" and translate:
                 if prev_translatable_body is not None:
                     prev_txt = prev_translatable_body["text"].rstrip()
@@ -570,10 +577,7 @@ def normalize_pages(
                         }
                         break
 
-        # Algorithm pseudocode Input/Output header preservation:
-        # Preserve structured Input/Output/Require/Ensure parameter lines immediately above
-        # preserved Function/Procedure/Algorithm headers in the same column so split math
-        # subscripts (e.g. "0 Output:") and overlapping header boxes stay intact as vector PDF.
+        # Algorithm pseudocode Input/Output header preservation
         algo_anchors = [
             nb["bbox"]
             for nb in norm_blocks
@@ -608,7 +612,7 @@ def normalize_pages(
                             "redact_source": False,
                         }
 
-        # Deduplicate/merge geometrically contained translatable child blocks (e.g. split footnotes)
+        # Deduplicate/merge geometrically contained translatable child blocks
         def _box_area(box: list[float]) -> float:
             return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
