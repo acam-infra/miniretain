@@ -28,11 +28,20 @@ DEFAULT_PADDLE_MODEL = "PaddleOCR-VL-1.6"
 _TAG_RE = re.compile(r"<[^>]+>")
 
 
+_BOLD_TAG_RE = re.compile(r"<(?:b|strong)\b[^>]*>(.*?)</(?:b|strong)>", re.IGNORECASE | re.DOTALL)
+_ITALIC_TAG_RE = re.compile(r"<(?:i|em)\b[^>]*>(.*?)</(?:i|em)>", re.IGNORECASE | re.DOTALL)
+
+
 def _clean_html_text(raw: str) -> str:
     if not raw:
         return ""
-    txt = html.unescape(_TAG_RE.sub(" ", raw))
-    return " ".join(txt.split()).strip()
+    s = _BOLD_TAG_RE.sub(lambda m: f"**{m.group(1).strip()}**" if m.group(1).strip() else "", raw)
+    s = _ITALIC_TAG_RE.sub(lambda m: f"*{m.group(1).strip()}*" if m.group(1).strip() else "", s)
+    txt = html.unescape(_TAG_RE.sub(" ", s))
+    out = " ".join(txt.split()).strip()
+    out = re.sub(r"\*\*\s+\*\*", " ", out)
+    out = re.sub(r"(?<!\*)\*(?!\*)\s+(?<!\*)\*(?!\*)", " ", out)
+    return out
 
 
 def _resolve_tokens(cfg: dict[str, Any], sub: dict[str, Any]) -> list[str]:

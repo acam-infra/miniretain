@@ -317,11 +317,13 @@ def normalize_pages(
         norm_blocks: list[dict] = []
 
         for order_idx, b in enumerate(ordered):
-            text = (b.get("text") or "").strip()
+            raw_text = (b.get("text") or "").strip()
+            text = re.sub(r"\*{1,2}", "", raw_text).strip()
             bbox = b.get("bbox")
             line_bboxes = b.get("line_bboxes") or ([bbox] if bbox else None)
             font_size = float(b["font_size_pt"]) if b.get("font_size_pt") else None
             is_bold = bool(b.get("is_bold", False))
+            is_italic = bool(b.get("is_italic", False))
             is_math_font = bool(b.get("is_math_font", False))
             is_vertical = bool(b.get("is_vertical", False))
             if not is_vertical and bbox and len(text) < 80:
@@ -466,13 +468,15 @@ def normalize_pages(
                 preserve_reason = b["policy"].get("preserve_reason", preserve_reason)
                 redact_source = bool(b["policy"].get("redact_source", translate))
 
+            final_text = raw_text if translate else text
+
             nb = {
                 "block_id": b["block_id"],
                 "page_index": page_idx,
                 "reading_order": order_idx,
                 "kind": layout_role,
                 "layout_role": layout_role,
-                "text": text,
+                "text": final_text,
                 "bbox": bbox,
                 "line_bboxes": line_bboxes,
                 "geometry": {
@@ -483,9 +487,10 @@ def normalize_pages(
                     "column_index": col_idx,
                 },
                 "content": {
-                    "text": text,
+                    "text": final_text,
                     "font_size_pt": font_size,
                     "is_bold": is_bold,
+                    "is_italic": is_italic,
                     "is_math_font": is_math_font,
                 },
                 "policy": {

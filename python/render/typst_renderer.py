@@ -67,6 +67,7 @@ def find_typst() -> str:
     for p in [
         "/usr/local/bin/typst",
         "/usr/bin/typst",
+        "/home/agentuser/bin/typst",
         "/home/ccds/.local/bin/typst",
         "/home/jiangminuo/.local/bin/typst",
         os.path.expanduser("~/.local/bin/typst"),
@@ -233,9 +234,103 @@ def _strip_leading_hspaces(s: str) -> str:
     return s.lstrip(" \t")
 
 
+_INLINE_STYLE_RE = re.compile(
+    r"\*\*(?=\S)(.+?)(?<=\S)\*\*"
+    r"|(?<!\*)\*(?!\*)(?=\S)([^*\n]+?)(?<=\S)\*(?!\*)",
+    re.DOTALL,
+)
+_ITALIC_ONLY_RE = re.compile(
+    r"(?<!\*)\*(?!\*)(?=\S)([^*\n]+?)(?<=\S)\*(?!\*)",
+    re.DOTALL,
+)
+_CJK_EMPH_SHOW_RULE = '#show emph: it => { show regex("[\\p{sc=Han}]"): ch => box(skew(ax: -8deg, reflow: false, ch)); it }'
+
+
+def _strip_style_markers(text: str) -> str:
+    if not text or "*" not in text:
+        return text
+    return _INLINE_STYLE_RE.sub(lambda m: m.group(1) if m.group(1) is not None else m.group(2), text)
+
+
+def _render_italic_or_plain(text: str) -> str:
+    if not text:
+        return ""
+    if "*" not in text:
+        return f"#{typst_str_literal(text)}"
+    parts: list[str] = []
+    pos = 0
+    for m in _ITALIC_ONLY_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(f"#{typst_str_literal(text[pos:m.start()])}")
+        inner = m.group(1)
+        parts.append(f"#emph[#{typst_str_literal(inner)}]")
+        pos = m.end()
+    if pos < len(text):
+        parts.append(f"#{typst_str_literal(text[pos:])}")
+    return "".join(parts) if parts else f"#{typst_str_literal(text)}"
+
+
+def _render_styled_text_literal(text: str) -> str:
+    """Render plain text with balanced **bold** -> #strong[...] and *italic* -> #emph[...]."""
+    if not text:
+        return '""'
+    if "*" not in text:
+        return f"#{typst_str_literal(text)}"
+    parts: list[str] = []
+    pos = 0
+    for m in _INLINE_STYLE_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(f"#{typst_str_literal(text[pos:m.start()])}")
+        if m.group(1) is not None:
+            inner_bold = m.group(1)
+            parts.append(f"#strong[{_render_italic_or_plain(inner_bold)}]")
+        else:
+            inner_ital = m.group(2)
+            parts.append(f"#emph[#{typst_str_literal(inner_ital)}]")
+        pos = m.end()
+    if pos < len(text):
+        parts.append(f"#{typst_str_literal(text[pos:])}")
+    return "".join(parts) if parts else f"#{typst_str_literal(text)}"
+
+
+def _distribute_style_around_math(segment: str) -> str:
+    """If a **...** or *...* span wraps across an inline math delimiter ($...$),
+    distribute the style markers onto the text sub-segments around the math formula."""
+    if "*" not in segment:
+        return segment
+
+    def _repl(m: re.Match[str]) -> str:
+        is_bold = m.group(1) is not None
+        inner = m.group(1) if is_bold else m.group(2)
+        if "$" not in inner and r"\(" not in inner and r"\[" not in inner:
+            return m.group(0)
+        sub_segs = _split_math_segments(inner)
+        if len(sub_segs) <= 1:
+            return m.group(0)
+        marker = "**" if is_bold else "*"
+        rebuilt: list[str] = []
+        for kind, content in sub_segs:
+            if kind == "text":
+                core = content.strip()
+                if core:
+                    lead = content[: len(content) - len(content.lstrip())]
+                    trail = content[len(content.rstrip()) :]
+                    rebuilt.append(f"{lead}{marker}{core}{marker}{trail}")
+                else:
+                    rebuilt.append(content)
+            elif kind == "inline_math":
+                rebuilt.append(f"${content}$")
+            else:
+                rebuilt.append(f"$${content}$$")
+        return "".join(rebuilt)
+
+    return _INLINE_STYLE_RE.sub(_repl, segment)
+
+
 def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     if not use_mitex or ("$" not in segment and r"\(" not in segment and r"\[" not in segment):
-        return f"#{typst_str_literal(segment)}"
+        return _render_styled_text_literal(segment)
+    segment = _distribute_style_around_math(segment)
     raw_segs = _split_math_segments(segment)
     # Normalize spacing around inline math in this single shared expression builder
     # so fit_probe.typ measurement and overlay.typ placement stay 100% consistent:
@@ -251,16 +346,17 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
             if idx > 0 and segs[idx - 1][0] == "text":
                 prev_raw = segs[idx - 1][1]
                 prev_stripped = _strip_trailing_hspaces(prev_raw)
-                if prev_stripped:
-                    last_ch = prev_stripped[-1]
+                prev_visible = prev_stripped.rstrip("*")
+                if prev_visible:
+                    last_ch = prev_visible[-1]
                     if _is_cjk_char(last_ch):
                         # Replace trailing spaces (if any) on the previously emitted text part
                         if parts:
-                            parts[-1] = f"#{typst_str_literal(prev_stripped)}"
+                            parts[-1] = _render_styled_text_literal(prev_stripped)
                         need_left_gap = True
                     elif last_ch in _CJK_PUNCT or last_ch == "\n":
                         if parts:
-                            parts[-1] = f"#{typst_str_literal(prev_stripped)}"
+                            parts[-1] = _render_styled_text_literal(prev_stripped)
                 elif prev_raw and not prev_raw.strip(" \t"):
                     # Pure horizontal whitespace between something and inline_math
                     pass
@@ -270,8 +366,9 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
             if idx + 1 < n and segs[idx + 1][0] == "text":
                 nxt_raw = segs[idx + 1][1]
                 nxt_stripped = _strip_leading_hspaces(nxt_raw)
-                if nxt_stripped:
-                    first_ch = nxt_stripped[0]
+                nxt_visible = nxt_stripped.lstrip("*")
+                if nxt_visible:
+                    first_ch = nxt_visible[0]
                     if _is_cjk_char(first_ch):
                         parts.append(_INLINE_MATH_GAP)
                         segs[idx + 1][1] = nxt_stripped
@@ -283,7 +380,7 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
             )
         else:
             if content:
-                parts.append(f"#{typst_str_literal(content)}")
+                parts.append(_render_styled_text_literal(content))
     return "".join(parts) if parts else '""'
 
 
@@ -314,7 +411,7 @@ def _unbreakable_segments(text: str) -> list[str]:
         before = text[pos : m.start()]
         for kind, seg_text in _split_math_segments(before):
             if kind == "text":
-                for am in _ASCII_RUN_RE.finditer(seg_text):
+                for am in _ASCII_RUN_RE.finditer(_strip_style_markers(seg_text)):
                     segs.append(am.group(0))
         url = m.group(0).rstrip(".,;:")
         for part in re.findall(r"[^/?&=]+[/?&=]?", url):
@@ -323,7 +420,7 @@ def _unbreakable_segments(text: str) -> list[str]:
     tail = text[pos:]
     for kind, seg_text in _split_math_segments(tail):
         if kind == "text":
-            for am in _ASCII_RUN_RE.finditer(seg_text):
+            for am in _ASCII_RUN_RE.finditer(_strip_style_markers(seg_text)):
                 segs.append(am.group(0))
     # Also keep longest single CJK char as minimum width check
     if any("\u4e00" <= ch <= "\u9fff" for ch in text):
@@ -405,6 +502,7 @@ def measure_blocks_with_typst(
         lines.append(_MITEX_IMPORT_LINE)
     lines.extend([
         f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        _CJK_EMPH_SHOW_RULE,
         "",
     ])
     ref_sizes: dict[int, float] = {}
@@ -515,8 +613,10 @@ def _emit_overlay_typ(
         )
         for it, rect, chosen_sz, _local_i in to_place_by_page.get(page_index, []):
             is_bold = bool(it.get("is_bold") or (it.get("content") or {}).get("is_bold"))
+            is_italic = bool(it.get("is_italic") or (it.get("content") or {}).get("is_italic"))
             role = it.get("layout_role", "body")
             weight = "bold" if (is_bold or role in {"title", "heading"}) else "regular"
+            style_attr = ', style: "italic"' if is_italic else ""
             raw_w = max(4.0, float(rect.width))
             w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
@@ -527,7 +627,7 @@ def _emit_overlay_typ(
             body_lines.append(
                 f'#place(top + left, dx: {rect.x0:.2f}pt, dy: {rect.y0:.2f}pt, '
                 f'block(width: {w:.2f}pt, height: {h:.2f}pt, clip: false)'
-                f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"); '
+                f'[#set text(size: {chosen_sz:.2f}pt, weight: "{weight}"{style_attr}); '
                 f'#set par(leading: {leading}, justify: true); {rich}])'
             )
     header: list[str] = []
@@ -536,6 +636,7 @@ def _emit_overlay_typ(
     header.extend([
         '#set page(margin: 0pt, fill: none)',
         f'#set text(font: {font_families}, lang: "zh", fill: black, overhang: false)',
+        _CJK_EMPH_SHOW_RULE,
         '#set par(justify: true, leading: 0.45em)',
         '',
     ])
@@ -575,7 +676,7 @@ def _find_compiled_overflow_blocks(
                     best = None
                     best_score: tuple[int, float, float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
-                        tr_compact = "".join((it.get("translation") or "").split())
+                        tr_compact = "".join(_strip_style_markers(it.get("translation") or "").replace("*", "").split())
                         t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                         ix = min(sx1, rect.x1) - max(sx0, rect.x0)
                         iy_exact = min(sy1, rect.y1) - max(sy0, rect.y0)
@@ -590,7 +691,7 @@ def _find_compiled_overflow_blocks(
                                 best = (it, rect, local_i)
                     if best is None:
                         for it, rect, _sz, local_i in placed_list:
-                            tr_compact = "".join((it.get("translation") or "").split())
+                            tr_compact = "".join(_strip_style_markers(it.get("translation") or "").replace("*", "").split())
                             t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                             ix = min(sx1, rect.x1) - max(sx0, rect.x0)
                             iy = min(sy1, rect.y1 + 4.0) - max(sy0, rect.y0 - 4.0)
@@ -652,7 +753,7 @@ def _render_typst_preserve(
     typst_bin = find_typst()
     cjk_font_file = find_cjk_font(font)
     font_dir = str(Path(cjk_font_file).parent)
-    font_families = '("Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC", "Droid Sans Fallback", "Libertinus Serif")'
+    font_families = '("Libertinus Serif", "Noto Serif CJK SC", "Noto Sans CJK SC", "Source Han Serif SC", "Droid Sans Fallback")'
 
     doc = pymupdf.open(source_pdf)
     preserved = 0

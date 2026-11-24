@@ -186,8 +186,10 @@ class OpenAICompatLLMClient:
             f"Translate each numbered academic paper block to {target_lang}. "
             f"Rules: (1) Keep placeholders like ⟪F0⟫, citations like [1], URLs, numbers/units, and standard technical "
             f"acronyms (e.g., LLM, KV Cache, MoE, FFN, Prefill, Decode, LEO, ISL, TFLOPS, Gbps, DRAM, HBM) "
-            f"accurate; (2) Use natural, concise academic {target_lang}; "
-            f"(3) Reply with ONLY a valid JSON object mapping every exact block_id -> translation (do not omit any block_id)."
+            f"accurate; (2) Preserve any inline Markdown bold **...** and italic *...* markers around the corresponding "
+            f"translated terms or paragraph lead-in headings (e.g., '**Batching.**' -> '**批处理。**', '*continuous batching*' -> '*连续批处理*'); "
+            f"(3) Use natural, concise academic {target_lang}; "
+            f"(4) Reply with ONLY a valid JSON object mapping every exact block_id -> translation (do not omit any block_id)."
             f"{ctx_section}\n{lines}"
         )
 
@@ -267,8 +269,9 @@ class OpenAICompatLLMClient:
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"empty translation for {bid}"})
                 continue
             cleaned = value.strip()
-            src_raw = (item.get("text") or "").strip()
-            effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned))
+            src_raw = re.sub(r"\*{1,2}", "", (item.get("text") or "").strip())
+            cleaned_nomark = re.sub(r"\*{1,2}", "", cleaned)
+            effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned_nomark))
             if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and effective_len > max(32, int(len(src_raw) * 1.25)):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"suspiciously long translation for {bid}"})
                 continue

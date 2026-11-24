@@ -37,6 +37,49 @@ def _is_math_span_font(font_name: str) -> bool:
     return any(tok in u for tok in _MATH_FONT_TOKENS)
 
 
+def _is_span_bold(s: dict) -> bool:
+    fname = (s.get("font") or "").upper()
+    if _is_math_span_font(fname):
+        return False
+    flags = int(s.get("flags", 0))
+    return bool(
+        (flags & 16)
+        or any(tok in fname for tok in ("BOLD", "CMBX", "MEDI", "DEMI", "HEAVY", "BLACK"))
+        or fname.endswith("-B")
+    )
+
+
+def _is_span_italic(s: dict) -> bool:
+    fname = (s.get("font") or "").upper()
+    if _is_math_span_font(fname):
+        return False
+    flags = int(s.get("flags", 0))
+    return bool(
+        (flags & 2)
+        or any(tok in fname for tok in ("ITAL", "CMTI", "SLANT", "OBLIQUE", "CMSL"))
+        or fname.endswith("-I")
+    )
+
+
+def _wrap_style_run(text: str, style: str) -> str:
+    if not text or not text.strip():
+        return text
+    if "$" in text or "*" in text or any(ch in text for ch in "←∈∀∃∑∏∫∼≤≥≠"):
+        return text
+    core = text.strip()
+    lead = text[: len(text) - len(text.lstrip())]
+    trail = text[len(text.rstrip()) :]
+    if style == "bold":
+        if not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", core):
+            return text
+        return f"{lead}**{core}**{trail}"
+    if style == "italic":
+        if "_" in core or not re.search(r"[a-z]{2,}|[A-Z][a-z]{2,}|[\u4e00-\u9fff]", core):
+            return text
+        return f"{lead}*{core}*{trail}"
+    return text
+
+
 def _line_baseline_metrics(spans: list[dict]) -> tuple[float, float]:
     """Return (base_font_size, base_origin_y) from normal-sized non-empty spans on a line."""
     valid = [s for s in spans if (s.get("text") or "").strip() and s.get("size") and s.get("origin")]
@@ -76,96 +119,149 @@ def _fmt_latex_atom(has_hat: bool, g_char: str, sub: str | None, sup: str | None
     return base
 
 
-def _render_line_with_evidenced_math(spans: list[dict]) -> str:
+def _render_line_with_evidenced_math(
+    spans: list[dict],
+    *,
+    want_inline_bold: bool = False,
+    want_inline_italic: bool = False,
+) -> str:
     """Build line text while reconstructing LaTeX $...$ ONLY for Greek/math spans that have
     verifiable PDF span-geometry evidence (hat accent span, raised smaller superscript, or
-    lowered smaller subscript). Lines already containing math delimiters pass through untouched."""
+    lowered smaller subscript), and optionally wrapping partial inline bold (**...**) and
+    italic (*...*) span runs. Lines already containing math delimiters pass through untouched."""
     raw = "".join(s.get("text", "") for s in spans).strip()
     if not raw:
         return ""
     if _EXISTING_MATH_DELIM_RE.search(raw):
         return raw
-    if not any(s.get("origin") and s.get("size") for s in spans):
+    has_geom = any(s.get("origin") and s.get("size") for s in spans)
+    if not has_geom and not want_inline_bold and not want_inline_italic:
         return raw
 
-    base_sz, base_y = _line_baseline_metrics(spans)
-    out: list[str] = []
+    base_sz, base_y = _line_baseline_metrics(spans) if has_geom else (10.0, 0.0)
+    runs: list[tuple[str, str]] = []
     evidenced_count = 0
+    styled_count = 0
     i = 0
     n = len(spans)
+
+    def _append_run(style: str, txt: str) -> None:
+        if not txt:
+            return
+        if runs and runs[-1][0] == style and style in ("normal", "bold", "italic"):
+            runs[-1] = (style, runs[-1][1] + txt)
+        else:
+            runs.append((style, txt))
 
     while i < n:
         s = spans[i]
         st = s.get("text") or ""
         stripped = st.strip()
 
-        # Check optional hat accent span immediately before a Greek letter span
-        has_hat = False
-        g_idx = i
-        lead_ws = ""
-        if stripped == "ˆ" and i + 1 < n:
-            nxt_t = (spans[i + 1].get("text") or "").strip()
-            if len(nxt_t) == 1 and nxt_t in _GREEK_TO_LATEX:
-                has_hat = True
-                g_idx = i + 1
-                lead_ws = " " if st.startswith(" ") else ""
+        if has_geom:
+            # Check optional hat accent span immediately before a Greek letter span
+            has_hat = False
+            g_idx = i
+            lead_ws = ""
+            if stripped == "ˆ" and i + 1 < n:
+                nxt_t = (spans[i + 1].get("text") or "").strip()
+                if len(nxt_t) == 1 and nxt_t in _GREEK_TO_LATEX:
+                    has_hat = True
+                    g_idx = i + 1
+                    lead_ws = " " if st.startswith(" ") else ""
 
-        g_span = spans[g_idx]
-        g_raw = g_span.get("text") or ""
-        g_strip = g_raw.strip()
-        if len(g_strip) == 1 and g_strip in _GREEK_TO_LATEX:
-            if not has_hat and g_raw.startswith(" "):
-                lead_ws = " "
-            sup: str | None = None
-            sub: str | None = None
-            j = g_idx + 1
-            while j < n:
-                cand = spans[j]
-                if sup is None and _is_proven_superscript(cand, base_sz, base_y):
-                    sup = (cand.get("text") or "").strip()
-                    j += 1
+            g_span = spans[g_idx]
+            g_raw = g_span.get("text") or ""
+            g_strip = g_raw.strip()
+            if len(g_strip) == 1 and g_strip in _GREEK_TO_LATEX:
+                if not has_hat and g_raw.startswith(" "):
+                    lead_ws = " "
+                sup: str | None = None
+                sub: str | None = None
+                j = g_idx + 1
+                while j < n:
+                    cand = spans[j]
+                    if sup is None and _is_proven_superscript(cand, base_sz, base_y):
+                        sup = (cand.get("text") or "").strip()
+                        j += 1
+                        continue
+                    if sub is None and _is_proven_subscript(cand, base_sz, base_y):
+                        sub = (cand.get("text") or "").strip()
+                        j += 1
+                        continue
+                    break
+                if has_hat or sup is not None or sub is not None:
+                    atom = _fmt_latex_atom(has_hat, g_strip, sub, sup)
+                    _append_run("math", f"{lead_ws}${atom}$")
+                    evidenced_count += 1
+                    i = j
                     continue
-                if sub is None and _is_proven_subscript(cand, base_sz, base_y):
-                    sub = (cand.get("text") or "").strip()
-                    j += 1
-                    continue
-                break
-            if has_hat or sup is not None or sub is not None:
-                atom = _fmt_latex_atom(has_hat, g_strip, sub, sup)
-                out.append(f"{lead_ws}${atom}$")
-                evidenced_count += 1
-                i = j
-                continue
 
-        out.append(st)
+        style = "normal"
+        if (want_inline_bold or want_inline_italic) and stripped:
+            is_sub_or_sup = has_geom and (
+                _is_proven_superscript(s, base_sz, base_y) or _is_proven_subscript(s, base_sz, base_y)
+            )
+            if not is_sub_or_sup:
+                if want_inline_bold and _is_span_bold(s):
+                    style = "bold"
+                    styled_count += 1
+                elif want_inline_italic and _is_span_italic(s) and not _is_span_bold(s):
+                    style = "italic"
+                    styled_count += 1
+
+        _append_run(style, st)
         i += 1
 
-    text = "".join(out).strip()
-    if evidenced_count == 0:
+    if evidenced_count == 0 and styled_count == 0:
         return raw
 
-    # Coalesce adjacent span-evidenced $...$ atoms into compound distribution / fraction expressions.
-    text = re.sub(
-        r"\$([^$\n]+)\$\s*[∼~]\s*N\s*\(\s*\$([^$\n]+)\$\s*,\s*\$([^$\n]+)\$\s*\)",
-        lambda m: rf"${m.group(1)} \sim \mathcal{{N}}({m.group(2)}, {m.group(3)})$",
-        text,
-    )
-    text = re.sub(
-        r"(?<![A-Za-z0-9$])(\d+)\s*/\s*\$([^$\n]+)\$",
-        lambda m: f"${m.group(1)}/{m.group(2)}$",
-        text,
-    )
+    out: list[str] = []
+    for style, txt in runs:
+        if style in ("bold", "italic"):
+            out.append(_wrap_style_run(txt, style))
+        else:
+            out.append(txt)
+
+    text = "".join(out).strip()
+    if evidenced_count > 0:
+        # Coalesce adjacent span-evidenced $...$ atoms into compound distribution / fraction expressions.
+        text = re.sub(
+            r"\$([^$\n]+)\$\s*[∼~]\s*N\s*\(\s*\$([^$\n]+)\$\s*,\s*\$([^$\n]+)\$\s*\)",
+            lambda m: rf"${m.group(1)} \sim \mathcal{{N}}({m.group(2)}, {m.group(3)})$",
+            text,
+        )
+        text = re.sub(
+            r"(?<![A-Za-z0-9$])(\d+)\s*/\s*\$([^$\n]+)\$",
+            lambda m: f"${m.group(1)}/{m.group(2)}$",
+            text,
+        )
     return text
 
 
 def _join_lines_smart(lines_text: list[str]) -> str:
-    """Join lines within a block, repairing hyphenation and wrapped URLs."""
+    """Join lines within a block, repairing hyphenation, wrapped URLs, and wrapped inline style runs."""
     if not lines_text:
         return ""
     out = lines_text[0]
     for nxt in lines_text[1:]:
         prev_tail = out.rstrip()
         nxt_head = nxt.lstrip()
+        # Repair hyphenated word breaks inside inline bold "**disag-**" + "**gregation**"
+        if prev_tail.endswith("-**") and nxt_head.startswith("**") and len(nxt_head) > 2 and nxt_head[2].islower():
+            out = prev_tail[:-3] + nxt_head[2:]
+            continue
+        # Repair hyphenated word breaks inside inline italic "*interfer-*" + "*ence*"
+        if (
+            prev_tail.endswith("-*")
+            and not prev_tail.endswith("-**")
+            and nxt_head.startswith("*")
+            and not nxt_head.startswith("**")
+            and len(nxt_head) > 1
+            and nxt_head[1].islower()
+        ):
+            out = prev_tail[:-2] + nxt_head[1:]
+            continue
         # Repair hyphenated word breaks like "disag-" + "gregation"
         if prev_tail.endswith("-") and nxt_head and nxt_head[0].islower():
             out = prev_tail[:-1] + nxt_head
@@ -191,6 +287,8 @@ def _join_lines_smart(lines_text: list[str]) -> str:
                 out = prev_tail + nxt_head
                 continue
         out = prev_tail + " " + nxt_head
+    out = re.sub(r"\*\*\s+\*\*", " ", out)
+    out = re.sub(r"(?<!\*)\*(?!\*)\s+(?<!\*)\*(?!\*)", " ", out)
     return out.strip()
 
 
@@ -231,16 +329,14 @@ def _build_block_from_lines(
     line_texts: list[str] = []
     span_sizes: list[float] = []
     bold_chars = 0
+    italic_chars = 0
     math_chars = 0
     char_count = 0
     is_vertical = False
+    raw_chars: list[str] = []
 
     for line in lines:
         spans = line.get("spans") or []
-        lt = _render_line_with_evidenced_math(spans)
-        if not lt:
-            continue
-        line_texts.append(lt)
         if line.get("bbox"):
             line_bboxes.append([float(v) for v in line["bbox"]])
         ldir = line.get("dir")
@@ -248,17 +344,47 @@ def _build_block_from_lines(
             is_vertical = True
         for s in spans:
             st = s.get("text", "")
+            raw_chars.append(st)
             n = len(st.strip())
             if n == 0:
                 continue
             char_count += n
             span_sizes.append(float(s.get("size", 10.0)))
             fname = (s.get("font") or "").upper()
-            flags = int(s.get("flags", 0))
-            if (flags & 16) or "BOLD" in fname:
+            if _is_span_bold(s):
                 bold_chars += n
+            elif _is_span_italic(s):
+                italic_chars += n
             if any(tok in fname for tok in _MATH_FONT_TOKENS):
                 math_chars += n
+
+    raw_block_str = "".join(raw_chars)
+    has_algo_or_eq_ops = any(ch in raw_block_str for ch in "←∈∀∃∑∏∫")
+    is_bold = bold_chars > char_count * 0.6 if char_count else False
+    is_italic = (not is_bold) and (italic_chars > char_count * 0.6 if char_count else False)
+    want_inline_bold = (
+        (not is_bold)
+        and (not has_algo_or_eq_ops)
+        and (0 < bold_chars <= char_count * 0.6)
+        and (math_chars <= char_count * 0.4)
+    )
+    want_inline_italic = (
+        (not is_italic)
+        and (not has_algo_or_eq_ops)
+        and (0 < italic_chars <= char_count * 0.6)
+        and (math_chars <= char_count * 0.35)
+    )
+
+    for line in lines:
+        spans = line.get("spans") or []
+        lt = _render_line_with_evidenced_math(
+            spans,
+            want_inline_bold=want_inline_bold,
+            want_inline_italic=want_inline_italic,
+        )
+        if not lt:
+            continue
+        line_texts.append(lt)
 
     text = _join_lines_smart(line_texts)
     if not text or not line_bboxes:
@@ -276,7 +402,8 @@ def _build_block_from_lines(
         "bbox": bbox,
         "line_bboxes": line_bboxes,
         "font_size_pt": round(avg_size, 2),
-        "is_bold": bold_chars > char_count * 0.6 if char_count else False,
+        "is_bold": is_bold,
+        "is_italic": is_italic,
         "is_math_font": math_chars > char_count * 0.5 if char_count else False,
         "is_vertical": is_vertical,
     }, len(text)
