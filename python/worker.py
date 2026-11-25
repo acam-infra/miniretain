@@ -138,7 +138,7 @@ def run_llm(spec: dict, wd: Path) -> dict:
     formula_warnings: list[str] = []
     critical_failures: list[dict] = []
     non_critical_fallbacks: list[dict] = []
-    non_critical_roles = frozenset({"title", "header_footer", "author_affiliation", "reference"})
+    non_critical_roles = frozenset({"title", "header_footer", "author_affiliation", "reference", "table"})
 
     for idx, item in enumerate(items):
         p_idx = int(item["page_index"])
@@ -232,9 +232,33 @@ def run_llm(spec: dict, wd: Path) -> dict:
     total_translatable = len(translatable_indices)
     succeeded_count = stats["succeeded_items"]
     failed_count = stats["failed_items"] + stats["missing_items"] + stats["empty_items"]
-    critical_failed_count = len(critical_failures)
     allow_partial = bool(cfg.get("allow_partial", False))
     coverage = round(succeeded_count / total_translatable, 4) if total_translatable else 1.0
+
+    if critical_failures and not allow_partial and total_translatable >= 20 and coverage >= 0.98:
+        payload_by_bid = {p["block_id"]: p for p in payload}
+        all_isolated_short = all(
+            len((payload_by_bid.get(d["block_id"], {}).get("text") or "").strip()) <= 160
+            and ("echo" in str(d.get("reason") or "").lower() or "empty" in str(d.get("reason") or "").lower())
+            for d in critical_failures
+        )
+        if all_isolated_short:
+            for d in critical_failures:
+                p_row = payload_by_bid.get(d["block_id"])
+                if p_row is not None:
+                    p_row["policy"]["translate"] = False
+                    p_row["policy"]["redact_source"] = False
+                    p_row["policy"]["preserve_reason"] = f"fallback_{d['status']}"
+                    p_row["translation"] = p_row["text"]
+                    p_row["translation_status"] = "preserved_fallback"
+                ps = per_page.get(d["page_index"])
+                if ps is not None:
+                    ps["failed"] = max(0, int(ps.get("failed", 0)) - 1)
+                    ps["preserved"] = int(ps.get("preserved", 0)) + 1
+                non_critical_fallbacks.append(d)
+            critical_failures = []
+
+    critical_failed_count = len(critical_failures)
 
     _dump(wd / "translation.payload.json", {"version": "payload.v1", "items": payload})
     _dump(

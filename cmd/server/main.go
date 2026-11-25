@@ -85,6 +85,7 @@ func main() {
 	)
 	exec.ExtraEnv = cfg.WorkerEnv()
 	exec.MaxLLMConcurrency = cfg.EffectiveMaxLLMConcurrency()
+	exec.StageTimeouts = cfg.StageTimeouts()
 
 	handler := api.NewWithOptions(store, exec, schema, api.Options{
 		Defaults: api.JobDefaults{

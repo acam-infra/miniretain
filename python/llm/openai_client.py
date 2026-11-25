@@ -25,11 +25,23 @@ _EXEMPT_ECHO_ROLES = frozenset({"reference", "formula", "figure_label", "header_
 _PROTECTED_FRAGMENT_RE = re.compile(
     r"⟪F\d+⟫"
     r"|https?://\S+"
+    r"|\bdoi:\s*\S+"
+    r"|\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\b"
     r"|\b[\w.+-]+@[\w-]+\.[\w.-]+\b"
     r"|arXiv:\S+"
     r"|§\s*\d+(?:\.\d+)*"
     r"|[∗†‡§]"
     r"|\[\d+(?:\s*[-–—,]\s*\d+)*\]",
+    re.IGNORECASE,
+)
+_LOWER_CONTENT_WORD_RE = re.compile(r"\b[a-z]{3,}\b")
+_WORD_WITH_LOWER_TAIL_RE = re.compile(r"\b[A-Za-z][a-z]{2,}\b")
+_ECHO_FUNCTION_WORDS = frozenset({"the", "and", "for", "from", "with", "via"})
+_POSTAL_ADDR_RE = re.compile(
+    r",\s*(?:[A-Z]{2}\s+\d{5}(?:-\d{4})?|\d{4,6}\s+[A-Z][a-z]+|USA|U\.S\.A\.|UK|Germany|France|China|Japan)\b"
+)
+_PROSE_INDICATOR_RE = re.compile(
+    r"\b(?:we|our|this paper|demonstrate|propose|show|evaluate|present|indicate|suggest|using|which|that|where|because|however)\b",
     re.IGNORECASE,
 )
 
@@ -43,12 +55,19 @@ def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: st
     tl = (target_lang or "").lower()
     if not tl.startswith(("zh", "ja", "ko")):
         return False
-    if item.get("layout_role") in _EXEMPT_ECHO_ROLES:
+    role = item.get("layout_role")
+    if role in _EXEMPT_ECHO_ROLES:
         return False
     src = (item.get("text") or "").strip()
     if len(src) < 40 or _CJK_CHAR_RE.search(translation):
         return False
     if re.search(r"[a-z0-9\-]+/[a-z0-9\-]+", src) and " " not in src.strip():
+        return False
+    if re.match(r"^\s*\[\d{1,3}\]\s+\S+", src) and re.search(
+        r"\b(?:19|20)\d{2}\b|arXiv:|doi:|et al\.|pp\.\s*\d|Vol\.|No\.", src, re.IGNORECASE
+    ):
+        return False
+    if _POSTAL_ADDR_RE.search(src) and not _PROSE_INDICATOR_RE.search(src):
         return False
     if "←" in src or "USENIX Association" in src or "Symposium on Operating Systems" in src:
         return False
@@ -69,6 +88,15 @@ def _is_verbatim_untranslated_echo(item: dict, translation: str, target_lang: st
     rem_src = _strip_protected_fragments(src)
     if len(rem_src) < 40 or len(_LATIN_WORD_RE.findall(rem_src)) < 6:
         return False
+    if role in {"title", "heading"}:
+        if len([w for w in _WORD_WITH_LOWER_TAIL_RE.findall(rem_src) if w.lower() not in _ECHO_FUNCTION_WORDS]) < 4:
+            return False
+    else:
+        lower_content = [
+            w for w in _LOWER_CONTENT_WORD_RE.findall(rem_src) if w not in _ECHO_FUNCTION_WORDS
+        ]
+        if len(lower_content) < 4:
+            return False
     rem_trans = _strip_protected_fragments(translation)
     return translation.strip() == src or rem_trans == rem_src
 

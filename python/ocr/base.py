@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import os
+import tempfile
+import time
 from abc import ABC, abstractmethod
-from typing import Any
+from pathlib import Path
+from typing import IO, Any
 
 ALLOWED_COORD_SPACES = frozenset({"pdf_pt", "pixel"})
 
@@ -104,3 +108,157 @@ def validate_document_pages(pages: list[dict]) -> list[dict]:
                 )
 
     return pages
+
+
+class DeadlineFileReader:
+    """Binary stream wrapper enforcing a monotonic wall-clock deadline while exposing __len__."""
+
+    def __init__(self, stream: IO[bytes], size: int, deadline: float) -> None:
+        self._stream = stream
+        self._size = int(size)
+        self._deadline = float(deadline)
+
+    def __len__(self) -> int:
+        return self._size
+
+    def read(self, amt: int = -1) -> bytes:
+        if time.monotonic() >= self._deadline:
+            raise TimeoutError("OCR upload wall-clock deadline exceeded")
+        if amt is None or amt < 0:
+            amt = 65536
+        return self._stream.read(amt)
+
+
+def read_stream_with_deadline(resp: Any, deadline: float, *, chunk_size: int = 65536) -> bytes:
+    """Read an HTTP response stream in chunks, aborting immediately if wall-clock deadline passes."""
+    chunks: list[bytes] = []
+    while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("OCR download wall-clock deadline exceeded")
+        chunk = resp.read(chunk_size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def is_digital_pdf(source: str, scanned_char_threshold: int = 20) -> bool:
+    """Return True if ``source`` is a local PDF with reliable native digital text across all pages."""
+    if not source or source.startswith(("http://", "https://")):
+        return False
+    p = Path(source)
+    if not p.is_file() or p.suffix.lower() != ".pdf":
+        return False
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(str(p))
+    except Exception:
+        return False
+    try:
+        if len(doc) == 0:
+            return False
+        total_chars = 0
+        for page in doc:
+            txt = (page.get_text("text") or "").strip()
+            total_chars += len(txt)
+            if len(txt) < scanned_char_threshold:
+                raw_dict = page.get_text("dict")
+                has_image = any(b.get("type") == 1 for b in raw_dict.get("blocks", []))
+                if has_image or len(doc) == 1:
+                    return False
+        return total_chars >= max(20, scanned_char_threshold)
+    except Exception:
+        return False
+    finally:
+        doc.close()
+
+
+def prepare_cloud_pdf(
+    source: str,
+    *,
+    max_mb: float = 20.0,
+    scanned_char_threshold: int = 20,
+) -> tuple[str, str | None, dict[str, Any]]:
+    """Compress oversized local PDFs into a temp copy for cloud OCR while preserving the lossless original.
+
+    Returns ``(upload_path_or_url, temp_path_to_cleanup, meta)``.
+    If even after compression the PDF exceeds ``max_mb`` and has a complete native digital text layer,
+    ``meta["too_large_digital"]`` is set to ``True`` so callers can downgrade directly to ``pymupdf``.
+    """
+    if not source or source.startswith(("http://", "https://")) or max_mb <= 0:
+        return source, None, {"compressed": False, "too_large_digital": False}
+    src_path = Path(source)
+    if not src_path.is_file() or src_path.suffix.lower() != ".pdf":
+        return source, None, {"compressed": False, "too_large_digital": False}
+
+    orig_bytes = src_path.stat().st_size
+    orig_mb = round(orig_bytes / (1024 * 1024), 2)
+    limit_bytes = int(max_mb * 1024 * 1024)
+    if orig_bytes <= limit_bytes:
+        return source, None, {"compressed": False, "orig_mb": orig_mb, "too_large_digital": False}
+
+    fd, tmp_name = tempfile.mkstemp(prefix="miniretain_cloud_", suffix=".pdf")
+    os.close(fd)
+    comp_bytes = orig_bytes
+    compressed_ok = False
+    try:
+        import pymupdf
+
+        doc = pymupdf.open(str(src_path))
+        try:
+            doc.rewrite_images(
+                dpi_threshold=96,
+                dpi_target=72,
+                quality=40,
+                lossy=True,
+                lossless=True,
+                bitonal=True,
+            )
+            doc.save(tmp_name, garbage=4, deflate=True)
+        finally:
+            doc.close()
+        comp_bytes = Path(tmp_name).stat().st_size
+        compressed_ok = 0 < comp_bytes < orig_bytes
+    except Exception:
+        compressed_ok = False
+
+    comp_mb = round(comp_bytes / (1024 * 1024), 2)
+    if compressed_ok and comp_bytes <= limit_bytes:
+        return tmp_name, tmp_name, {
+            "compressed": True,
+            "orig_mb": orig_mb,
+            "comp_mb": comp_mb,
+            "too_large_digital": False,
+        }
+
+    # Still over threshold (or compression failed): check if native digital text allows fast local downgrade.
+    if is_digital_pdf(str(src_path), scanned_char_threshold=scanned_char_threshold):
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        return source, None, {
+            "compressed": False,
+            "orig_mb": orig_mb,
+            "comp_mb": comp_mb,
+            "too_large_digital": True,
+        }
+
+    if compressed_ok:
+        return tmp_name, tmp_name, {
+            "compressed": True,
+            "orig_mb": orig_mb,
+            "comp_mb": comp_mb,
+            "too_large_digital": False,
+        }
+
+    try:
+        os.unlink(tmp_name)
+    except OSError:
+        pass
+    return source, None, {
+        "compressed": False,
+        "orig_mb": orig_mb,
+        "too_large_digital": False,
+    }

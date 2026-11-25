@@ -17,7 +17,14 @@ _HEADING_RE = re.compile(
     r"^\s*(?:(?:[IVX]+|[0-9]+(?:\.[0-9]+)*)\.\s+\S+|Abstract\b|Introduction\b|Conclusion\b|References\b|Acknowledgments?\b)",
     re.IGNORECASE,
 )
-_REF_HEADING_RE = re.compile(r"^\s*(?:References|REFERENCES)\s*$")
+_REF_HEADING_RE = re.compile(
+    r"^\s*(?:(?:[IVX]+|[0-9]+(?:\.[0-9]+)*)\.?\s+)?(?:References|Bibliography|Works\s+Cited|REFERENCES|BIBLIOGRAPHY)\s*$",
+    re.IGNORECASE,
+)
+_STANDALONE_REF_RE = re.compile(
+    r"^\s*\[\d{1,3}\]\s+[A-Z0-9].*(?:\(\d{4}\)|\b(?:19|20)\d{2}\b|arXiv:|doi:|DOI:|https?://|et al\.|pp\.\s*\d|vol\.\s*\d|Phys\.|IEEE|Proc\.)",
+    re.IGNORECASE,
+)
 _EQ_NUM_RE = re.compile(r"\(\d+\)\s*$")
 _BIG_O_ONLY_RE = re.compile(r"^\s*O\([^)]+\)\s*$")
 _NUMERIC_TICK_RE = re.compile(
@@ -340,6 +347,7 @@ def normalize_pages(
                 if bh > bw * 2.5:
                     is_vertical = True
             col_idx = int(b.get("column_index", 0))
+            role_hint = str(b.get("layout_role_hint") or "").strip().lower()
 
             layout_role = "body"
             translate = True
@@ -361,7 +369,7 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "vertical_figure_label"
                 redact_source = False
-            elif _CAPTION_RE.match(text):
+            elif role_hint == "caption" or _CAPTION_RE.match(text):
                 layout_role = "caption"
                 translate = True
             elif bbox and any(_overlap_ratio(bbox, tr, pad=3.0) >= 0.5 for tr in table_regions):
@@ -444,15 +452,17 @@ def normalize_pages(
             elif (
                 page_idx == 0
                 and not seen_abstract
-                and font_size
-                and font_size >= max(11.5, median_font * 1.3)
-                and len(text) < 200
+                and len(text) < 220
                 and (not bbox or bbox[1] < page_h * 0.35)
                 and not text[0].islower()
+                and (
+                    (font_size and font_size >= max(11.5, median_font * 1.3))
+                    or (role_hint == "title" and (not font_size or font_size >= median_font * 1.05))
+                )
             ):
                 layout_role = "title"
                 translate = True
-            elif _is_author_affiliation(
+            elif role_hint == "author_affiliation" or _is_author_affiliation(
                 text,
                 page_idx,
                 seen_abstract,
@@ -466,12 +476,12 @@ def normalize_pages(
                 translate = False
                 preserve_reason = "author_affiliation"
                 redact_source = False
-            elif _HEADING_RE.match(text) and len(text) < 120:
+            elif role_hint != "reference" and _HEADING_RE.match(text) and len(text) < 120:
                 layout_role = "heading"
                 if re.match(r"^\s*(?:Abstract|1\.?\s+Introduction)\b", text, re.IGNORECASE):
                     seen_abstract = True
                 translate = True
-            elif in_references:
+            elif in_references or role_hint == "reference" or _STANDALONE_REF_RE.match(text):
                 layout_role = "reference"
                 if (
                     re.match(r"^\[\d+\]\s+[A-Z]\.", text)
@@ -628,6 +638,8 @@ def normalize_pages(
             for parent in norm_blocks:
                 if parent is child or not parent["policy"]["translate"] or not parent.get("bbox"):
                     continue
+                if parent.get("layout_role") == "title" and child.get("layout_role") != "title":
+                    continue
                 pb = parent["bbox"]
                 p_area = _box_area(pb)
                 if p_area <= c_area * 1.05:
@@ -663,6 +675,99 @@ def normalize_pages(
                     "preserve_reason": "contained_in_parent",
                     "redact_source": False,
                 }
+
+        def _pair_overlap(ba: list[float], bb: list[float]) -> tuple[float, float]:
+            ix0 = max(ba[0], bb[0])
+            iy0 = max(ba[1], bb[1])
+            ix1 = min(ba[2], bb[2])
+            iy1 = min(ba[3], bb[3])
+            if ix1 <= ix0 or iy1 <= iy0:
+                return 0.0, 0.0
+            inter = (ix1 - ix0) * (iy1 - iy0)
+            aa = _box_area(ba)
+            ab = _box_area(bb)
+            union = aa + ab - inter
+            min_a = min(aa, ab)
+            return (inter / union if union > 0 else 0.0), (inter / min_a if min_a > 0 else 0.0)
+
+        # Protect title and author_affiliation zones from colliding stray body/heading blocks
+        title_boxes = [
+            nb["bbox"]
+            for nb in norm_blocks
+            if nb.get("bbox") and nb.get("layout_role") == "title" and nb["policy"]["translate"]
+        ]
+        affil_boxes = [
+            nb["bbox"]
+            for nb in norm_blocks
+            if nb.get("bbox")
+            and (
+                nb.get("layout_role") == "author_affiliation"
+                or nb["policy"].get("preserve_reason") == "author_affiliation"
+            )
+        ]
+        for nb in norm_blocks:
+            if not nb["policy"]["translate"] or not nb.get("bbox"):
+                continue
+            role = nb.get("layout_role")
+            if role not in {"title", "author_affiliation"}:
+                if any(
+                    (lambda res: res[0] >= 0.08 or res[1] >= 0.20)(_pair_overlap(nb["bbox"], tb))
+                    for tb in title_boxes
+                ):
+                    nb["policy"] = {
+                        "translate": False,
+                        "preserve_reason": "title_overlap_conflict",
+                        "redact_source": False,
+                    }
+                    continue
+                if any(
+                    (lambda res: res[0] >= 0.25 or res[1] >= 0.50)(_pair_overlap(nb["bbox"], ab))
+                    for ab in affil_boxes
+                ):
+                    nb["policy"] = {
+                        "translate": False,
+                        "preserve_reason": "affil_overlap_conflict",
+                        "redact_source": False,
+                    }
+                    continue
+
+        # Suppress severe same-page IoU conflicts / near-duplicate translatable blocks
+        role_prio = {"title": 5, "heading": 4, "caption": 3, "reference": 2, "body": 1}
+        active_indices = [
+            idx
+            for idx, nb in enumerate(norm_blocks)
+            if nb["policy"]["translate"] and nb.get("bbox")
+        ]
+        for pos_a in range(len(active_indices)):
+            ia = active_indices[pos_a]
+            ba_blk = norm_blocks[ia]
+            if not ba_blk["policy"]["translate"]:
+                continue
+            for pos_b in range(pos_a + 1, len(active_indices)):
+                ib = active_indices[pos_b]
+                bb_blk = norm_blocks[ib]
+                if not bb_blk["policy"]["translate"]:
+                    continue
+                iou, min_ov = _pair_overlap(ba_blk["bbox"], bb_blk["bbox"])
+                if iou < 0.45 and min_ov < 0.75:
+                    continue
+                ta = " ".join((ba_blk.get("text") or "").split()).lower()
+                tb = " ".join((bb_blk.get("text") or "").split()).lower()
+                text_dup = (ta == tb) or (min(len(ta), len(tb)) >= 20 and (ta in tb or tb in ta))
+                ra = role_prio.get(ba_blk.get("layout_role", "body"), 0)
+                rb = role_prio.get(bb_blk.get("layout_role", "body"), 0)
+                if iou < 0.45 and not (text_dup or min(len(ta), len(tb)) < 20 or ra != rb):
+                    continue
+                key_a = (ra, len(ta), _box_area(ba_blk["bbox"]), -int(ba_blk.get("reading_order", ia)))
+                key_b = (rb, len(tb), _box_area(bb_blk["bbox"]), -int(bb_blk.get("reading_order", ib)))
+                loser = bb_blk if key_a >= key_b else ba_blk
+                loser["policy"] = {
+                    "translate": False,
+                    "preserve_reason": "overlap_conflict_dedup",
+                    "redact_source": False,
+                }
+                if loser is ba_blk:
+                    break
 
         norm_pages.append({
             "page_index": page_idx,

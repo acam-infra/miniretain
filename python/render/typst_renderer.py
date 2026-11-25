@@ -172,14 +172,53 @@ def _typst_raw_literal(expr: str) -> str:
     return f"{fence}{expr}{fence}"
 
 
-def _looks_like_currency_span(inner: str) -> bool:
-    """Return True if $...$ content looks like currency (e.g. '$50 ... $100') rather than math."""
+_CURRENCY_UNIT_RE = re.compile(
+    r"^\d[\d,.]*(?:\s*[-–—~]\s*\d[\d,.]*)?\s*/\s*(?:kg|g|mg|lb|ton|t|kW|MW|GW|kWh|MWh|Wh|W|y|yr|year|mo|month|d|day|hr|h|s|m|km|L|gal|unit|item|token|tokens|req|GB|TB|MB)\b",
+    re.IGNORECASE,
+)
+_BARE_PROSE_WORD_RE = re.compile(r"(?<![\\A-Za-z_])[a-z]{3,}(?![A-Za-z_])")
+_MATH_PROSE_STOPWORDS = frozenset({
+    "the", "and", "for", "sin", "cos", "tan", "sec", "csc", "cot", "log", "exp",
+    "max", "min", "sup", "inf", "lim", "mod", "det", "dim", "arg", "deg", "ker",
+    "var", "cov", "iff", "let", "set",
+})
+_LONG_BREAKABLE_ASCII_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9/_\-:.,–—]{8,}[A-Za-z0-9/]")
+
+
+def _soft_break_long_ascii(text: str) -> str:
+    """Insert zero-width breaks after separators inside long ASCII runs so narrow boxes wrap cleanly."""
+    if not text:
+        return text
+
+    def _brk(m: re.Match[str]) -> str:
+        tok = m.group(0)
+        if not any(sep in tok for sep in "/-_:,–—"):
+            return tok
+        return re.sub(r"([/\-_:,–—])(?=\S)", "\\1\u200b", tok)
+
+    return _LONG_BREAKABLE_ASCII_RE.sub(_brk, text)
+
+
+def _looks_like_currency_span(inner: str, after_char: str = "") -> bool:
+    """Return True if $...$ content looks like currency/prose (e.g. '$50 ... $100', '$/kW/y ... ~$810/kW/y') rather than math."""
     if not inner or inner != inner.strip():
+        return True
+    if re.match(r"^(?:[<>~≈]+\s*)?/\s*[A-Za-z]", inner):
+        return True
+    if "\\" not in inner and _CURRENCY_UNIT_RE.match(inner):
+        return True
+    if after_char.isdigit() and not re.search(r"\\[A-Za-z]+", inner):
         return True
     if re.match(r"^\d[\d,.\s]*(?:[-–—]|to|and|or)?$", inner, re.IGNORECASE):
         return True
-    if re.match(r"^\d", inner) and not any(ch in inner for ch in r"\^_{}=+*/<>()[]"):
+    if re.match(r"^\d", inner) and not any(ch in inner for ch in r"\^_{}=<>"):
         return True
+    if re.search(r"[\u4e00-\u9fff\u3040-\u30ff]", inner) and "\\" not in inner:
+        return True
+    if not re.search(r"[\\^{}=]", inner):
+        prose_words = [w for w in _BARE_PROSE_WORD_RE.findall(inner) if w not in _MATH_PROSE_STOPWORDS]
+        if len(prose_words) >= 3:
+            return True
     return False
 
 
@@ -249,7 +288,8 @@ def _split_math_segments(text: str) -> list[tuple[str, str]]:
                 j += 1
             if end != -1:
                 inner = text[i + 1 : end]
-                if not _looks_like_currency_span(inner):
+                after_char = text[end + 1] if end + 1 < n else ""
+                if not _looks_like_currency_span(inner, after_char=after_char):
                     flush_buf()
                     out.append(("inline_math", inner))
                     i = end + 1
@@ -391,14 +431,18 @@ def _distribute_style_around_math(segment: str) -> str:
     return _INLINE_STYLE_RE.sub(_repl, segment)
 
 
-def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
+def _render_non_url_expr(segment: str, *, use_mitex: bool, soft_break: bool = False) -> str:
+    def _prep_text(s: str) -> str:
+        norm = _normalize_cjk_text_spacing(s)
+        return _soft_break_long_ascii(norm) if soft_break else norm
+
     if not use_mitex or ("$" not in segment and r"\(" not in segment and r"\[" not in segment):
-        return _render_styled_text_literal(_normalize_cjk_text_spacing(segment))
+        return _render_styled_text_literal(_prep_text(segment))
     segment = re.sub(r"\$[ \t]+([.,;:!?)}\]])", r"$\1", segment)
     segment = re.sub(r"([(\[{])[ \t]+\$", r"\1$", segment)
     segment = _distribute_style_around_math(segment)
     raw_segs = [
-        (k, _normalize_cjk_text_spacing(c) if k == "text" else c)
+        (k, _prep_text(c) if k == "text" else c)
         for k, c in _split_math_segments(segment)
     ]
     # Normalize spacing around inline math in this single shared expression builder
@@ -461,23 +505,23 @@ def _render_non_url_expr(segment: str, *, use_mitex: bool) -> str:
     return "".join(parts) if parts else '""'
 
 
-def typst_rich_text_expr(text: str, *, use_mitex: bool = True) -> str:
+def typst_rich_text_expr(text: str, *, use_mitex: bool = True, soft_break: bool = False) -> str:
     """Render text with clickable #link(url)[breakable_url] and #mi/#mitex for math."""
     text = _strip_control_chars(text)
     parts: list[str] = []
     pos = 0
     for m in _URL_RE.finditer(text):
         if m.start() > pos:
-            parts.append(_render_non_url_expr(text[pos:m.start()], use_mitex=use_mitex))
+            parts.append(_render_non_url_expr(text[pos:m.start()], use_mitex=use_mitex, soft_break=soft_break))
         url = m.group(0).rstrip(".,;:")
         trail = m.group(0)[len(url):]
         ul = typst_str_literal(url)
         parts.append(f"#link({ul})[{_breakable_url_display(url)}]")
         if trail:
-            parts.append(_render_non_url_expr(trail, use_mitex=use_mitex))
+            parts.append(_render_non_url_expr(trail, use_mitex=use_mitex, soft_break=soft_break))
         pos = m.end()
     if pos < len(text):
-        parts.append(_render_non_url_expr(text[pos:], use_mitex=use_mitex))
+        parts.append(_render_non_url_expr(text[pos:], use_mitex=use_mitex, soft_break=soft_break))
     return "".join(parts) if parts else '""'
 
 
@@ -897,16 +941,22 @@ def _emit_overlay_typ(
             blk_font_attr = f'font: {bold_font_families or font_families}, ' if weight == "bold" else ""
             style_attr = ', style: "italic"' if is_italic else ""
             raw_w = max(4.0, float(rect.width))
-            w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
+            recover_overflow = bool(it.get("_render_overflow_recover"))
+            if recover_overflow:
+                w = max(4.0, raw_w - 0.5) if raw_w > 40.0 else raw_w
+            else:
+                w = max(4.0, raw_w - 4.5) if raw_w > 40.0 else raw_w
             h = max(2.0, float(rect.height))
             trans_txt = it["translation"].strip()
             justify_str, base_leading = _block_justify_and_leading(trans_txt, chosen_sz, w)
+            if recover_overflow:
+                justify_str = "false"
             lead_em = it.get("_render_leading_em")
             leading = f"{float(lead_em):.2f}em" if isinstance(lead_em, (int, float)) and lead_em > 0 else base_leading
             dy_off = float(it.get("_render_dy_offset") or 0.0)
             place_dy = rect.y0 + dy_off
             place_h = max(2.0, h - dy_off)
-            rich = typst_rich_text_expr(trans_txt, use_mitex=use_mitex)
+            rich = typst_rich_text_expr(trans_txt, use_mitex=use_mitex, soft_break=recover_overflow)
             if "#mi(" in rich or "#mitex(" in rich:
                 needs_mitex = True
             body_lines.append(
@@ -946,19 +996,19 @@ def _find_compiled_overflow_blocks(
         opage = overlay_doc[page_index]
         for blk in opage.get_text("dict").get("blocks", []):
             for line in blk.get("lines", []):
-                line_compact = "".join("".join((s.get("text") or "") for s in line.get("spans", [])).split())
+                line_compact = "".join("".join((s.get("text") or "") for s in line.get("spans", [])).replace("\u200b", "").split())
                 line_probe = line_compact[:12]
                 for span in line.get("spans", []):
                     sx0, sy0, sx1, sy1 = span["bbox"]
                     span_w = max(0.5, sx1 - sx0)
                     span_h = max(0.5, sy1 - sy0)
                     span_area = span_w * span_h
-                    sp_compact = "".join((span.get("text") or "").split())
+                    sp_compact = "".join((span.get("text") or "").replace("\u200b", "").split())
                     sp_probe = line_probe if len(line_probe) >= 3 else sp_compact[:12]
                     best = None
                     best_score: tuple[int, float, float, float, float] | None = None
                     for it, rect, _sz, local_i in placed_list:
-                        tr_compact = "".join(_strip_style_markers(it.get("translation") or "").replace("*", "").split())
+                        tr_compact = "".join(_strip_style_markers(it.get("translation") or "").replace("*", "").replace("\u200b", "").split())
                         t_match = 1 if (sp_probe and sp_probe in tr_compact) else 0
                         ix = min(sx1, rect.x1) - max(sx0, rect.x0)
                         iy_exact = min(sy1, rect.y1) - max(sy0, rect.y0)
@@ -1349,6 +1399,12 @@ def _render_typst_preserve(
                 for it, rect, csz, li in plist:
                     bid = it.get("block_id", "unknown")
                     if bid in compiled_bad:
+                        reason_bad = compiled_bad[bid]
+                        if reason_bad == "compiled_horizontal_overflow" and not it.get("_render_overflow_recover"):
+                            it["_render_overflow_recover"] = True
+                            changed = True
+                            updated.append((it, rect, csz, li))
+                            continue
                         base_l = _base_leading_em(csz)
                         cur_l = float(it.get("_render_leading_em") or base_l)
                         cur_dy = float(it.get("_render_dy_offset") or 0.0)
@@ -1360,16 +1416,28 @@ def _render_typst_preserve(
                             changed = True
                             updated.append((it, rect, csz, li))
                             continue
-                    if bid in compiled_bad and csz > min_size + 1e-6:
-                        step = 0.25 if csz > 7.0 + 1e-6 else 0.5
-                        new_sz = max(min_size, round(csz - step, 2))
-                        it["_render_leading_em"] = _base_leading_em(new_sz)
-                        it["_render_dy_offset"] = 0.0
-                        shrunk += 1
-                        changed = True
-                        updated.append((it, rect, new_sz, li))
-                    else:
-                        updated.append((it, rect, csz, li))
+                        role_b = str(it.get("layout_role") or "body")
+                        tr_b = it.get("translation") or ""
+                        has_breakable_tok = bool(_LONG_BREAKABLE_ASCII_RE.search(tr_b) and any(c in tr_b for c in "/-_:,–—"))
+                        has_inline_math = "$" in tr_b or r"\(" in tr_b
+                        local_min = (
+                            min(min_size, 4.25)
+                            if (
+                                reason_bad == "compiled_horizontal_overflow"
+                                and (role_b in {"table", "caption", "figure_label", "reference"} or has_breakable_tok or has_inline_math)
+                            )
+                            else min_size
+                        )
+                        if csz > local_min + 1e-6:
+                            step = 0.25 if csz > 7.0 + 1e-6 else 0.5
+                            new_sz = max(local_min, round(csz - step, 2))
+                            it["_render_leading_em"] = _base_leading_em(new_sz)
+                            it["_render_dy_offset"] = 0.0
+                            shrunk += 1
+                            changed = True
+                            updated.append((it, rect, new_sz, li))
+                            continue
+                    updated.append((it, rect, csz, li))
                 to_place_by_page[page_index] = updated
             if not changed:
                 break

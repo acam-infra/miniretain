@@ -30,6 +30,13 @@ func loadTestSchema(t *testing.T) *worker.Schema {
 func TestLoadExampleYAMLValidates(t *testing.T) {
 	root := repoRoot(t)
 	tmp := t.TempDir()
+	t.Setenv("HOME", tmp)
+	if err := os.MkdirAll(filepath.Join(tmp, ".miniretain"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".miniretain", "gw2a_key"), []byte("test-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	// Copy example YAML into repo-relative temp file pointing to repoRoot
 	raw, err := os.ReadFile(filepath.Join(root, "configs", "miniretain.example.yaml"))
 	if err != nil {
@@ -50,13 +57,13 @@ func TestLoadExampleYAMLValidates(t *testing.T) {
 		t.Fatalf("Validate failed: %v", err)
 	}
 
-	if cfg.Server.Addr != ":18080" {
-		t.Fatalf("addr = %q, want :18080", cfg.Server.Addr)
+	if cfg.Server.Addr != "0.0.0.0:18080" {
+		t.Fatalf("addr = %q, want 0.0.0.0:18080", cfg.Server.Addr)
 	}
 	if cfg.Paths.DataDir != filepath.Join(tmp, "data", "jobs") {
 		t.Fatalf("data_dir = %q, want relative to YAML dir %q", cfg.Paths.DataDir, filepath.Join(tmp, "data", "jobs"))
 	}
-	if cfg.OCR.Provider != "auto" || cfg.LLM.Provider != "openai-compat" || cfg.LLM.Model != "gemini-3.6-flash" {
+	if cfg.OCR.Provider != "mineru" || cfg.LLM.Provider != "openai-compat" || cfg.LLM.Model != "gemini-3.6-flash" {
 		t.Fatalf("unexpected providers/model: ocr=%+v llm=%+v", cfg.OCR, cfg.LLM)
 	}
 	if !cfg.RenderEnabledByDefault() || cfg.Render.Engine != "typst" {

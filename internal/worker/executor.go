@@ -3,14 +3,23 @@ package worker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"miniretain/internal/job"
+)
+
+const (
+	defaultOCRStageTimeout    = 900 * time.Second
+	defaultLocalOCRTimeout    = 180 * time.Second
+	defaultLLMStageTimeout    = 1800 * time.Second
+	defaultRenderStageTimeout = 600 * time.Second
 )
 
 // Executor drives the Python worker as an external process. This is the same
@@ -23,6 +32,7 @@ type Executor struct {
 	DataRoot          string // absolute path to data/jobs
 	MaxWorkers        int
 	MaxLLMConcurrency int // optional global in-flight LLM request budget across all concurrent jobs (0 = per-job only)
+	StageTimeouts     map[string]time.Duration // optional per-stage timeout overrides ("ocr", "llm", "render")
 	Store             *job.Store
 	ExtraEnv          []string // optional KEY=VAL overrides passed to Python worker processes
 
@@ -51,11 +61,129 @@ func (e *Executor) Run(ctx context.Context, j *job.Job) {
 	setStatus(e.Store, j.ID, job.Running, stages[0], "")
 	for _, stage := range stages {
 		if err := e.runStage(ctx, j, stage); err != nil {
+			if stage == "ocr" && errors.Is(err, context.DeadlineExceeded) {
+				if fbJob := e.buildOCRFallbackJob(j); fbJob != nil {
+					if fbErr := e.runStage(ctx, fbJob, "ocr"); fbErr == nil {
+						continue
+					} else {
+						err = fmt.Errorf("%w; fallback ocr failed: %v", err, fbErr)
+					}
+				}
+			}
 			setStatus(e.Store, j.ID, job.Failed, stage, err.Error())
 			return
 		}
 	}
 	setStatus(e.Store, j.ID, job.Succeeded, stages[len(stages)-1], "")
+}
+
+func toFloat64(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	default:
+		return 0, false
+	}
+}
+
+func (e *Executor) computeStageTimeout(j *job.Job, stage string) time.Duration {
+	if e.StageTimeouts != nil {
+		if d := e.StageTimeouts[stage]; d > 0 {
+			return d
+		}
+	}
+	switch stage {
+	case "ocr":
+		ocrMap, _ := j.Params["ocr"].(map[string]any)
+		prov, _ := ocrMap["provider"].(string)
+		if prov == "pymupdf" || prov == "stub" {
+			return defaultLocalOCRTimeout
+		}
+		cfgMap, _ := ocrMap["config"].(map[string]any)
+		var totalSec float64
+		for _, subKey := range []string{"mineru", "paddle_cloud"} {
+			if sub, ok := cfgMap[subKey].(map[string]any); ok {
+				if ts, ok := toFloat64(sub["total_timeout_s"]); ok && ts > 0 {
+					totalSec += ts
+				} else if ts, ok := toFloat64(sub["timeout_s"]); ok && ts > 0 {
+					totalSec += ts
+				}
+			}
+		}
+		if totalSec > 0 {
+			dur := time.Duration(totalSec+120) * time.Second
+			if dur > 1500*time.Second {
+				dur = 1500 * time.Second
+			}
+			if dur < 120*time.Second {
+				dur = 120 * time.Second
+			}
+			return dur
+		}
+		return defaultOCRStageTimeout
+	case "llm":
+		return defaultLLMStageTimeout
+	case "render":
+		return defaultRenderStageTimeout
+	default:
+		return defaultOCRStageTimeout
+	}
+}
+
+func (e *Executor) buildOCRFallbackJob(j *job.Job) *job.Job {
+	if j == nil {
+		return nil
+	}
+	ocrOrig, _ := j.Params["ocr"].(map[string]any)
+	origProv, _ := ocrOrig["provider"].(string)
+	if origProv == "" || origProv == "pymupdf" || origProv == "stub" {
+		return nil
+	}
+	cfgOrig, _ := ocrOrig["config"].(map[string]any)
+	subKey := origProv
+	if origProv == "paddle-cloud" {
+		subKey = "paddle_cloud"
+	} else if origProv == "paddle-http" {
+		subKey = "paddle_http"
+	}
+	fb := ""
+	if sub, ok := cfgOrig[subKey].(map[string]any); ok {
+		fb, _ = sub["fallback_provider"].(string)
+	}
+	if fb == "" {
+		if autoSub, ok := cfgOrig["auto"].(map[string]any); ok {
+			fb, _ = autoSub["fallback_provider"].(string)
+		}
+	}
+	fbLow := strings.ToLower(strings.TrimSpace(fb))
+	if fbLow == "none" {
+		return nil
+	}
+	targetProv := "pymupdf"
+	if fbLow == "paddle-http" {
+		targetProv = "paddle-http"
+	}
+	paramsCopy := cloneMap(j.Params)
+	ocrNew := map[string]any{
+		"provider": targetProv,
+		"config": map[string]any{
+			"fallback_from_timeout": origProv,
+		},
+	}
+	if cfgOrig != nil {
+		if t, ok := cfgOrig["scanned_char_threshold"]; ok {
+			ocrNew["config"].(map[string]any)["scanned_char_threshold"] = t
+		}
+	}
+	paramsCopy["ocr"] = ocrNew
+	return &job.Job{
+		ID:     j.ID,
+		Params: paramsCopy,
+	}
 }
 
 func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error {
@@ -102,10 +230,22 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 
 	// The worker reads BOTH the spec and the schema; no defaults are hardcoded
 	// in Python either.
+	stageTimeout := e.computeStageTimeout(j, stage)
+	stageCtx, cancel := context.WithTimeout(ctx, stageTimeout)
+	defer cancel()
+
 	started := time.Now()
-	cmd := exec.CommandContext(ctx, e.Python, e.WorkerPath,
+	cmd := exec.CommandContext(stageCtx, e.Python, e.WorkerPath,
 		"--spec", specPath, "--schema", e.SchemaPath)
 	cmd.Dir = wd
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = 5 * time.Second
 	extraEnv := append([]string(nil), e.ExtraEnv...)
 	if stage == "llm" && e.MaxLLMConcurrency > 0 {
 		slotDir := filepath.Join(e.DataRoot, ".llm_slots")
@@ -142,6 +282,9 @@ func (e *Executor) runStage(ctx context.Context, j *job.Job, stage string) error
 		tail := string(out)
 		if len(tail) > 800 {
 			tail = tail[len(tail)-800:]
+		}
+		if stageErr := stageCtx.Err(); stageErr != nil {
+			return fmt.Errorf("python %s stage timed out after %s: %w: %s", stage, stageTimeout, stageErr, strings.TrimSpace(tail))
 		}
 		return fmt.Errorf("python %s stage failed: %w: %s", stage, err, strings.TrimSpace(tail))
 	}

@@ -345,7 +345,8 @@ def main() -> int:
     parser.add_argument("--model", default=None, help="LLM model name on cc gateway (default from YAML or gemini-3.6-flash)")
     parser.add_argument("--batch-size", type=int, default=None, help="Items per LLM batch")
     parser.add_argument("--concurrency", type=int, default=None, help="Per-job LLM concurrency")
-    parser.add_argument("--no-strict", action="store_true", help="Disable strict layout overflow check")
+    parser.add_argument("--no-strict", action="store_true", help="Disable strict layout overflow check and allow partial LLM fallbacks")
+    parser.add_argument("--allow-partial", action="store_true", help="Allow job completion with source-preserved fallback when individual LLM blocks fail")
     parser.add_argument("--summary", action="store_true", default=True, help="Generate structured Markdown reading guide")
     args = parser.parse_args()
 
@@ -411,7 +412,7 @@ def main() -> int:
         "concurrency": concurrency,
         "max_retries": max_retries,
         "timeout_ms": timeout_ms,
-        "allow_partial": False,
+        "allow_partial": bool(args.no_strict or getattr(args, "allow_partial", False) or llm_cfg.get("allow_partial", False)),
     }
     render_base: dict[str, Any] = {
         "engine": str(ren_cfg.get("engine") or "typst"),

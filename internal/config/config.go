@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -62,6 +63,9 @@ type RuntimeConfig struct {
 	Typst             string `yaml:"typst"`
 	MaxWorkers        *int   `yaml:"max_workers"`
 	MaxLLMConcurrency *int   `yaml:"max_llm_concurrency"`
+	OCRTimeoutS       *int   `yaml:"ocr_timeout_s"`
+	LLMTimeoutS       *int   `yaml:"llm_timeout_s"`
+	RenderTimeoutS    *int   `yaml:"render_timeout_s"`
 }
 
 type OCRConfig struct {
@@ -84,6 +88,8 @@ type PaddleCloudConfig struct {
 	Proxies          []string `yaml:"proxies"`
 	FallbackProvider string   `yaml:"fallback_provider"`
 	TimeoutS         *float64 `yaml:"timeout_s"`
+	TotalTimeoutS    *float64 `yaml:"total_timeout_s"`
+	LargePDFMB       *float64 `yaml:"large_pdf_mb"`
 	PollIntervalS    *float64 `yaml:"poll_interval_s"`
 }
 
@@ -98,6 +104,8 @@ type MinerUConfig struct {
 	Proxies          []string `yaml:"proxies"`
 	FallbackProvider string   `yaml:"fallback_provider"`
 	TimeoutS         *float64 `yaml:"timeout_s"`
+	TotalTimeoutS    *float64 `yaml:"total_timeout_s"`
+	LargePDFMB       *float64 `yaml:"large_pdf_mb"`
 	PollIntervalS    *float64 `yaml:"poll_interval_s"`
 }
 
@@ -315,6 +323,14 @@ func (c *Config) applyDefaultsAndResolvePaths(baseDir string) {
 
 func resolveRel(baseDir, p string) string {
 	p = strings.TrimSpace(p)
+	if p == "~" || strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if p == "~" {
+				return filepath.Clean(home)
+			}
+			return filepath.Clean(filepath.Join(home, p[2:]))
+		}
+	}
 	if filepath.IsAbs(p) {
 		return filepath.Clean(p)
 	}
@@ -357,6 +373,24 @@ func (c *Config) EffectiveReadHeaderTimeoutMS() int {
 	return *c.Server.ReadHeaderTimeoutMS
 }
 
+// StageTimeouts returns optional per-stage hard execution timeouts configured in runtime YAML.
+func (c *Config) StageTimeouts() map[string]time.Duration {
+	out := map[string]time.Duration{}
+	if c.Runtime.OCRTimeoutS != nil && *c.Runtime.OCRTimeoutS > 0 {
+		out["ocr"] = time.Duration(*c.Runtime.OCRTimeoutS) * time.Second
+	}
+	if c.Runtime.LLMTimeoutS != nil && *c.Runtime.LLMTimeoutS > 0 {
+		out["llm"] = time.Duration(*c.Runtime.LLMTimeoutS) * time.Second
+	}
+	if c.Runtime.RenderTimeoutS != nil && *c.Runtime.RenderTimeoutS > 0 {
+		out["render"] = time.Duration(*c.Runtime.RenderTimeoutS) * time.Second
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // Validate checks all configuration fields, paths, enums, ranges, URLs, and credential files.
 func (c *Config) Validate(schema *worker.Schema) error {
 	if strings.TrimSpace(c.Server.Addr) == "" {
@@ -370,6 +404,15 @@ func (c *Config) Validate(schema *worker.Schema) error {
 	}
 	if c.Runtime.MaxLLMConcurrency != nil && *c.Runtime.MaxLLMConcurrency < 1 {
 		return fmt.Errorf("config validation: runtime.max_llm_concurrency must be >= 1, got %d", *c.Runtime.MaxLLMConcurrency)
+	}
+	if c.Runtime.OCRTimeoutS != nil && *c.Runtime.OCRTimeoutS < 1 {
+		return fmt.Errorf("config validation: runtime.ocr_timeout_s must be >= 1, got %d", *c.Runtime.OCRTimeoutS)
+	}
+	if c.Runtime.LLMTimeoutS != nil && *c.Runtime.LLMTimeoutS < 1 {
+		return fmt.Errorf("config validation: runtime.llm_timeout_s must be >= 1, got %d", *c.Runtime.LLMTimeoutS)
+	}
+	if c.Runtime.RenderTimeoutS != nil && *c.Runtime.RenderTimeoutS < 1 {
+		return fmt.Errorf("config validation: runtime.render_timeout_s must be >= 1, got %d", *c.Runtime.RenderTimeoutS)
 	}
 
 	workerPy := filepath.Join(c.Paths.Root, "python", "worker.py")
@@ -641,6 +684,12 @@ func (c *Config) OCRConfigMap() map[string]any {
 	if c.OCR.PaddleCloud.TimeoutS != nil {
 		paddleCloud["timeout_s"] = *c.OCR.PaddleCloud.TimeoutS
 	}
+	if c.OCR.PaddleCloud.TotalTimeoutS != nil {
+		paddleCloud["total_timeout_s"] = *c.OCR.PaddleCloud.TotalTimeoutS
+	}
+	if c.OCR.PaddleCloud.LargePDFMB != nil {
+		paddleCloud["large_pdf_mb"] = *c.OCR.PaddleCloud.LargePDFMB
+	}
 	if c.OCR.PaddleCloud.PollIntervalS != nil {
 		paddleCloud["poll_interval_s"] = *c.OCR.PaddleCloud.PollIntervalS
 	}
@@ -674,6 +723,12 @@ func (c *Config) OCRConfigMap() map[string]any {
 	}
 	if c.OCR.MinerU.TimeoutS != nil {
 		mineruCfg["timeout_s"] = *c.OCR.MinerU.TimeoutS
+	}
+	if c.OCR.MinerU.TotalTimeoutS != nil {
+		mineruCfg["total_timeout_s"] = *c.OCR.MinerU.TotalTimeoutS
+	}
+	if c.OCR.MinerU.LargePDFMB != nil {
+		mineruCfg["large_pdf_mb"] = *c.OCR.MinerU.LargePDFMB
 	}
 	if c.OCR.MinerU.PollIntervalS != nil {
 		mineruCfg["poll_interval_s"] = *c.OCR.MinerU.PollIntervalS

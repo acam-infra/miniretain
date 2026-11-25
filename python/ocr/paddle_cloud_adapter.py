@@ -5,6 +5,8 @@ import html
 import json
 import os
 import re
+import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,7 +21,15 @@ from common.pool import (
     build_opener_for_proxy,
     load_lines_from_file_or_str,
 )
-from ocr.base import OCRBackendUnavailableError, OCRConfigError, OCRProvider
+from ocr.base import (
+    DeadlineFileReader,
+    OCRBackendUnavailableError,
+    OCRConfigError,
+    OCRProvider,
+    is_digital_pdf,
+    prepare_cloud_pdf,
+    read_stream_with_deadline,
+)
 from ocr.normalize import cluster_figure_regions, normalize_pages
 from ocr.pymupdf_adapter import _extract_table_regions
 
@@ -112,6 +122,17 @@ class PaddleCloudOCRProvider(OCRProvider):
             if poll_interval_s is not None
             else (merged_sub.get("poll_interval_s") or os.environ.get("PADDLE_CLOUD_POLL_INTERVAL_S", "3.0"))
         )
+        self.large_pdf_mb = float(
+            merged_sub.get("large_pdf_mb")
+            if merged_sub.get("large_pdf_mb") is not None
+            else os.environ.get("PADDLE_CLOUD_LARGE_PDF_MB", "20")
+        )
+        self.scanned_char_threshold = int(
+            merged_sub.get("scanned_char_threshold")
+            or self.config.get("scanned_char_threshold")
+            or 20
+        )
+        self.digital_fallback = bool(merged_sub.get("digital_fallback", True))
         if not self.job_url.startswith(("http://", "https://")):
             raise OCRConfigError(f"paddle-cloud job_url must be http(s), got {self.job_url!r}")
         if self.timeout_s <= 0:
@@ -123,6 +144,13 @@ class PaddleCloudOCRProvider(OCRProvider):
             api_keys=self.tokens or [""],
             proxies=self.proxies,
         )
+        raw_total = merged_sub.get("total_timeout_s") or os.environ.get("PADDLE_CLOUD_TOTAL_TIMEOUT_S")
+        self.total_timeout_s = float(
+            raw_total
+            if raw_total is not None
+            else max(self.timeout_s, self.timeout_s * (1.2 if len(self.pool.slots) > 1 else 1.0))
+        )
+        self._tls = threading.local()
         self.parse_seconds: float = 0.0
         self.last_job_id: str = ""
         self.service_info: dict[str, Any] = {}
@@ -133,6 +161,16 @@ class PaddleCloudOCRProvider(OCRProvider):
                 "paddle-cloud token is not configured (set ocr.paddle_cloud.token_file, tokens list, PADDLE_CLOUD_TOKEN, or ~/.miniretain/paddle_cloud.key)"
             )
         opener = build_opener_for_proxy(slot.proxy)
+        active_deadline = getattr(self._tls, "deadline", None)
+        deadline = float(active_deadline) if active_deadline is not None else (time.monotonic() + self.timeout_s)
+        display_name = str(getattr(self._tls, "display_name", "") or "")
+
+        def _rem_timeout(cap: float = 60.0) -> float:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                raise OCRBackendUnavailableError(f"paddle-cloud timed out after {self.timeout_s}s")
+            return max(0.05, min(float(cap), rem))
+
         optional_payload = {
             "useDocOrientationClassify": False,
             "useDocUnwarping": False,
@@ -142,48 +180,68 @@ class PaddleCloudOCRProvider(OCRProvider):
             "Authorization": f"bearer {slot.api_key}",
             "Accept": "application/json",
         }
-        if source.startswith(("http://", "https://")):
-            body = json.dumps({
-                "fileUrl": source,
-                "model": slot.model,
-                "optionalPayload": optional_payload,
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                slot.base_url,
-                data=body,
-                headers={**headers, "Content-Type": "application/json"},
-                method="POST",
-            )
-        else:
-            file_path = Path(source)
-            if not file_path.is_file():
-                raise OCRConfigError(f"paddle-cloud source file not found: {source}")
-            boundary = f"----MiniretainPaddleCloud{int(time.time() * 1000)}"
-            parts: list[bytes] = []
-            for k, v in (("model", slot.model), ("optionalPayload", json.dumps(optional_payload))):
-                parts.append(
-                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
-                )
-            file_bytes = file_path.read_bytes()
-            parts.append(
-                f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{file_path.name}\"\r\nContent-Type: application/pdf\r\n\r\n".encode("utf-8")
-                + file_bytes
-                + f"\r\n--{boundary}--\r\n".encode("utf-8")
-            )
-            req = urllib.request.Request(
-                slot.base_url,
-                data=b"".join(parts),
-                headers={**headers, "Content-Type": f"multipart/form-data; boundary={boundary}"},
-                method="POST",
-            )
+        spool_fh = None
         try:
-            with opener.open(req, timeout=120) as resp:
-                payload = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read()[:400].decode("utf-8", errors="replace")
-            raise OCRBackendUnavailableError(f"paddle-cloud submit HTTP {exc.code} (slot={slot.slot_id}): {detail}") from exc
-        except Exception as exc:  # noqa: BLE001
-            raise OCRBackendUnavailableError(f"paddle-cloud submit failed (slot={slot.slot_id}): {exc}") from exc
+            if source.startswith(("http://", "https://")):
+                body = json.dumps({
+                    "fileUrl": source,
+                    "model": slot.model,
+                    "optionalPayload": optional_payload,
+                }).encode("utf-8")
+                req = urllib.request.Request(
+                    slot.base_url,
+                    data=body,
+                    headers={**headers, "Content-Type": "application/json"},
+                    method="POST",
+                )
+            else:
+                file_path = Path(source)
+                if not file_path.is_file():
+                    raise OCRConfigError(f"paddle-cloud source file not found: {source}")
+                remote_name = Path(display_name).name if display_name else file_path.name
+                boundary = f"----MiniretainPaddleCloud{int(time.time() * 1000)}"
+                spool_fh = tempfile.SpooledTemporaryFile(max_size=4 * 1024 * 1024)
+                for k, v in (("model", slot.model), ("optionalPayload", json.dumps(optional_payload))):
+                    spool_fh.write(
+                        f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode("utf-8")
+                    )
+                spool_fh.write(
+                    f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{remote_name}\"\r\nContent-Type: application/pdf\r\n\r\n".encode("utf-8")
+                )
+                with open(file_path, "rb") as src_fh:
+                    while True:
+                        chunk = src_fh.read(65536)
+                        if not chunk:
+                            break
+                        spool_fh.write(chunk)
+                spool_fh.write(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+                total_len = spool_fh.tell()
+                spool_fh.seek(0)
+                reader = DeadlineFileReader(spool_fh, total_len, deadline)
+                req = urllib.request.Request(
+                    slot.base_url,
+                    data=reader,
+                    headers={
+                        **headers,
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Content-Length": str(total_len),
+                    },
+                    method="POST",
+                )
+            try:
+                with opener.open(req, timeout=_rem_timeout(120.0)) as resp:
+                    payload = json.loads(read_stream_with_deadline(resp, deadline).decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:400].decode("utf-8", errors="replace")
+                raise OCRBackendUnavailableError(f"paddle-cloud submit HTTP {exc.code} (slot={slot.slot_id}): {detail}") from exc
+            except Exception as exc:  # noqa: BLE001
+                raise OCRBackendUnavailableError(f"paddle-cloud submit failed (slot={slot.slot_id}): {exc}") from exc
+        finally:
+            if spool_fh is not None:
+                try:
+                    spool_fh.close()
+                except Exception:
+                    pass
 
         err_code = int(payload.get("errorCode", 0) or 0)
         if err_code != 0:
@@ -195,13 +253,15 @@ class PaddleCloudOCRProvider(OCRProvider):
             raise OCRBackendUnavailableError(f"paddle-cloud returned empty jobId: {payload}")
         self.last_job_id = job_id
 
-        deadline = time.monotonic() + self.timeout_s
         jsonl_url = ""
-        while time.monotonic() < deadline:
+        while True:
+            rem = deadline - time.monotonic()
+            if rem <= 0:
+                break
             poll_req = urllib.request.Request(f"{slot.base_url}/{job_id}", headers=headers, method="GET")
             try:
-                with opener.open(poll_req, timeout=60) as resp:
-                    poll_payload = json.loads(resp.read().decode("utf-8"))
+                with opener.open(poll_req, timeout=min(60.0, max(0.05, rem))) as resp:
+                    poll_payload = json.loads(read_stream_with_deadline(resp, deadline).decode("utf-8"))
             except Exception as exc:  # noqa: BLE001
                 raise OCRBackendUnavailableError(f"paddle-cloud poll failed for {job_id}: {exc}") from exc
 
@@ -216,15 +276,18 @@ class PaddleCloudOCRProvider(OCRProvider):
                 raise OCRBackendUnavailableError(
                     f"paddle-cloud job {job_id} failed: {data.get('errorMsg') or 'unknown error'}"
                 )
-            time.sleep(max(0.5, self.poll_interval_s))
+            sleep_s = min(max(0.1, self.poll_interval_s), max(0.0, deadline - time.monotonic()))
+            if sleep_s <= 0:
+                break
+            time.sleep(sleep_s)
 
         if not jsonl_url:
             raise OCRBackendUnavailableError(f"paddle-cloud job {job_id} timed out after {self.timeout_s}s")
 
         dl_req = urllib.request.Request(jsonl_url, method="GET")
         try:
-            with opener.open(dl_req, timeout=180) as resp:
-                raw_text = resp.read().decode("utf-8")
+            with opener.open(dl_req, timeout=_rem_timeout(180.0)) as resp:
+                raw_text = read_stream_with_deadline(resp, deadline).decode("utf-8")
         except Exception as exc:  # noqa: BLE001
             raise OCRBackendUnavailableError(f"paddle-cloud download jsonl failed: {exc}") from exc
 
@@ -245,41 +308,106 @@ class PaddleCloudOCRProvider(OCRProvider):
 
     def parse(self, source: str) -> list[dict]:
         t0 = time.perf_counter()
+        upload_source, tmp_cleanup, prep_meta = prepare_cloud_pdf(
+            source,
+            max_mb=self.large_pdf_mb,
+            scanned_char_threshold=self.scanned_char_threshold,
+        )
+        fb_low = self.fallback_provider.strip().lower()
+        if prep_meta.get("too_large_digital") and fb_low != "none" and self.digital_fallback:
+            from ocr.pymupdf_adapter import PyMuPDFOCRProvider
+            local_prov = PyMuPDFOCRProvider(config=self.config)
+            pages = local_prov.parse(source)
+            self.service_info = {
+                "provider": self.name,
+                "fallback_triggered": "pymupdf",
+                "reason": "large_digital_pdf",
+                **prep_meta,
+            }
+            self.parse_seconds = round(time.perf_counter() - t0, 3)
+            return pages
+
         max_attempts = min(max(1, len(self.pool.slots)), 4)
         tried_slots: set[str] = set()
         last_exc: Exception | None = None
         layout_results: list[dict] | None = None
         data_info: dict = {}
+        overall_deadline = time.monotonic() + self.total_timeout_s
 
-        for _ in range(max_attempts):
-            slot = self.pool.acquire(exclude_slot_ids=tried_slots)
-            tried_slots.add(slot.slot_id)
-            st0 = time.perf_counter()
-            try:
-                layout_results, data_info = self._run_with_slot(slot, source)
-                self.pool.release_success(slot, time.perf_counter() - st0)
-                break
-            except OCRConfigError:
-                self.pool.release_failure(slot, is_rate_limit=False, cooldown_s=0.0, error_msg="config_error")
-                raise
-            except Exception as exc:  # noqa: BLE001
-                msg = str(exc)
-                is_rl = "429" in msg or "10010" in msg or "quota" in msg.lower() or "rate" in msg.lower()
-                self.pool.release_failure(slot, is_rate_limit=is_rl, cooldown_s=20.0 if is_rl else 8.0, error_msg=msg)
-                last_exc = exc
+        try:
+            for _ in range(max_attempts):
+                if time.monotonic() >= overall_deadline:
+                    break
+                slot = self.pool.acquire(exclude_slot_ids=tried_slots)
+                tried_slots.add(slot.slot_id)
+                st0 = time.perf_counter()
+                self._tls.deadline = min(time.monotonic() + self.timeout_s, overall_deadline)
+                self._tls.display_name = Path(source).name if not source.startswith(("http://", "https://")) else ""
+                try:
+                    layout_results, data_info = self._run_with_slot(slot, upload_source)
+                    self.pool.release_success(slot, time.perf_counter() - st0)
+                    break
+                except OCRConfigError:
+                    self.pool.release_failure(slot, is_rate_limit=False, cooldown_s=0.0, error_msg="config_error")
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    msg = str(exc)
+                    is_rl = "429" in msg or "10010" in msg or "quota" in msg.lower() or "rate" in msg.lower()
+                    self.pool.release_failure(slot, is_rate_limit=is_rl, cooldown_s=20.0 if is_rl else 8.0, error_msg=msg)
+                    last_exc = exc
+                finally:
+                    self._tls.deadline = None
+                    self._tls.display_name = ""
+        finally:
+            if tmp_cleanup:
+                try:
+                    os.unlink(tmp_cleanup)
+                except OSError:
+                    pass
 
         if layout_results is None:
-            if self.fallback_provider and self.fallback_provider != self.name:
+            visited = {
+                str(x).strip()
+                for x in (self.config.get("_visited_ocr_providers") or [])
+                if str(x).strip()
+            }
+            next_visited = visited | {self.name}
+            fb_name = self.fallback_provider.strip()
+            if fb_name and fb_low != "none" and fb_name not in next_visited:
                 from ocr.adapter import get_provider
-                fb = get_provider(self.fallback_provider, self.config)
-                pages = fb.parse(source)
+                fb_cfg = {**self.config, "_visited_ocr_providers": sorted(next_visited)}
+                fb = get_provider(fb_name, fb_cfg)
+                try:
+                    pages = fb.parse(source)
+                    self.service_info = {
+                        "provider": self.name,
+                        "fallback_triggered": fb_name,
+                        "fallback_detail": getattr(fb, "service_info", {}) or {},
+                        "pool": self.pool.snapshot(),
+                    }
+                    self.parse_seconds = round(time.perf_counter() - t0, 3)
+                    return pages
+                except Exception as fb_exc:  # noqa: BLE001
+                    last_exc = fb_exc
+
+            if (
+                fb_low != "none"
+                and self.digital_fallback
+                and "pymupdf" not in next_visited
+                and is_digital_pdf(source, scanned_char_threshold=self.scanned_char_threshold)
+            ):
+                from ocr.pymupdf_adapter import PyMuPDFOCRProvider
+                local_prov = PyMuPDFOCRProvider(config=self.config)
+                pages = local_prov.parse(source)
                 self.service_info = {
                     "provider": self.name,
-                    "fallback_triggered": self.fallback_provider,
+                    "fallback_triggered": "pymupdf",
+                    "reason": f"cloud_fallback_exhausted: {last_exc}",
                     "pool": self.pool.snapshot(),
                 }
                 self.parse_seconds = round(time.perf_counter() - t0, 3)
                 return pages
+
             if last_exc is not None:
                 raise last_exc
             raise OCRBackendUnavailableError("paddle-cloud pool exhausted")
@@ -289,6 +417,7 @@ class PaddleCloudOCRProvider(OCRProvider):
             "model": self.model,
             "job_id": self.last_job_id,
             "pool": self.pool.snapshot(),
+            **({"pdf_compression": prep_meta} if prep_meta.get("compressed") else {}),
         }
 
         doc = pymupdf.open(source)
@@ -391,7 +520,7 @@ class PaddleCloudOCRProvider(OCRProvider):
                     except Exception:
                         pass
 
-                    blk_entry = {
+                    blk_entry: dict[str, Any] = {
                         "block_id": f"p{page_idx}b{len(blocks):04d}",
                         "kind": "formula" if is_formula else "text",
                         "text": text_clean,
@@ -401,6 +530,14 @@ class PaddleCloudOCRProvider(OCRProvider):
                         "is_bold": is_title or is_heading,
                         "is_math_font": is_formula,
                     }
+                    if label in {"reference", "reference_content"}:
+                        blk_entry["layout_role_hint"] = "reference"
+                    elif label in {"figure_title", "table_title", "image_caption", "table_caption", "footnote"}:
+                        blk_entry["layout_role_hint"] = "caption"
+                    elif label in {"author", "affiliation"}:
+                        blk_entry["layout_role_hint"] = "author_affiliation"
+                    elif is_title and page_idx == 0:
+                        blk_entry["layout_role_hint"] = "title"
                     if is_formula:
                         blk_entry["policy"] = {"translate": False, "preserve_reason": "formula", "redact_source": False}
                     blocks.append(blk_entry)
