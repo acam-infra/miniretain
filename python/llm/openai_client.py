@@ -284,7 +284,7 @@ class OpenAICompatLLMClient:
             f"verbatim and accurate (never drop subscripts/superscripts or emit raw LaTeX commands outside $...$); "
             f"(2) Preserve any inline Markdown bold **...** and italic *...* markers around the corresponding "
             f"translated terms or paragraph lead-in headings (e.g., '**Batching.**' -> '**批处理。**', '*continuous batching*' -> '*连续批处理*'); "
-            f"(3) Use natural, concise academic {target_lang}; "
+            f"(3) Use natural, concise academic {target_lang}, translating strictly each block's own words within its block_id without moving clauses across block_ids; "
             f"(4) Reply with ONLY a valid JSON object mapping every exact block_id -> translation (do not omit any block_id)."
             f"{ctx_section}\n{lines}"
         )
@@ -366,7 +366,10 @@ class OpenAICompatLLMClient:
             src_raw = re.sub(r"\*{1,2}", "", (item.get("text") or "").strip())
             cleaned_nomark = re.sub(r"\*{1,2}", "", cleaned)
             effective_len = len(re.sub(r"\$\$?[^$\n]+\$\$?|\\\([^)]+\\\)|\\\[[^\]]+\\\]", "X", cleaned_nomark))
-            if len(items) > 1 and len(src_raw) >= 15 and "⟪F" not in src_raw and effective_len > max(32, int(len(src_raw) * 1.25)):
+            if len(items) > 1 and "⟪F" not in src_raw and (
+                (len(src_raw) >= 15 and effective_len > max(32, int(len(src_raw) * 1.25)))
+                or (6 <= len(src_raw) < 15 and effective_len > max(22, int(len(src_raw) * 1.5)))
+            ):
                 out.append({"block_id": bid, "status": "empty", "translation": None, "error": f"suspiciously long translation for {bid}"})
                 continue
             expected_toks = set(re.findall(r"⟪F\d+⟫", src_raw))

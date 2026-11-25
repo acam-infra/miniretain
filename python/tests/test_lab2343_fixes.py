@@ -365,3 +365,23 @@ def test_verbatim_echo_exemptions_and_cli_no_strict_allow_partial(tmp_path: Path
     assert rc == 0
     assert captured["llm"]["allow_partial"] is True
     assert captured["render"]["strict"] is False
+
+
+def test_find_compiled_overflow_ignores_whitespace_only_spans(tmp_path: Path):
+    from render.typst_renderer import _find_compiled_overflow_blocks
+
+    ov_pdf = tmp_path / "ov.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=612.0, height=792.0)
+    # Whitespace span from neighboring column slightly left/below target box must never blame target
+    page.insert_text((295.0, 628.0), "   ", fontsize=10.0)
+    page.insert_text((305.0, 580.0), "[34] Clean item inside box.", fontsize=9.0)
+    doc.save(ov_pdf)
+    doc.close()
+
+    with pymupdf.open(ov_pdf) as d:
+        it = {"block_id": "p13b0015", "translation": "[34] Clean item inside box."}
+        meta = [{"page_index": 0, "pw": 612.0, "ph": 792.0, "neighbor_boxes": []}]
+        placed = {0: [(it, pymupdf.Rect(304.14, 568.6, 534.25, 622.66), 9.0, 0)]}
+        bad = _find_compiled_overflow_blocks(d, meta, placed)
+        assert bad == {}

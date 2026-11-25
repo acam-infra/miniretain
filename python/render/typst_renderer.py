@@ -1004,6 +1004,8 @@ def _find_compiled_overflow_blocks(
                     span_h = max(0.5, sy1 - sy0)
                     span_area = span_w * span_h
                     sp_compact = "".join((span.get("text") or "").replace("\u200b", "").split())
+                    if not sp_compact:
+                        continue
                     sp_probe = line_probe if len(line_probe) >= 3 else sp_compact[:12]
                     best = None
                     best_score: tuple[int, float, float, float, float] | None = None
