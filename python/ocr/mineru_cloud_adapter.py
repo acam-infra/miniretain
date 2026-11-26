@@ -749,7 +749,11 @@ class MinerUCloudOCRProvider(OCRProvider):
                         "is_bold": is_title or is_heading,
                         "is_math_font": is_formula,
                     }
-                    if btype in {"ref_text", "reference"} or sub_type in {"ref_text", "reference"}:
+                    ptype_low = str(parent_type or "").strip().lower()
+                    if btype in {"algorithm", "code"} or sub_type in {"algorithm", "code"} or ptype_low in {"algorithm", "code"}:
+                        blk_entry["layout_role_hint"] = "algorithm"
+                        blk_entry["policy"] = {"translate": False, "preserve_reason": "algorithm", "redact_source": False}
+                    elif btype in {"ref_text", "reference"} or sub_type in {"ref_text", "reference"}:
                         blk_entry["layout_role_hint"] = "reference"
                     elif btype in {"image_caption", "table_caption", "chart_caption", "image_footnote", "table_footnote"}:
                         blk_entry["layout_role_hint"] = "caption"

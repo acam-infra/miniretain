@@ -54,6 +54,50 @@ _ALGO_IO_RE = re.compile(r"^(?:[A-Za-z0-9∗†‡]{1,3}\s+)?(?:Input|Output|Req
 _APPENDIX_HEADING_RE = re.compile(r"^\s*(?:Appendix\b|Supplementary\b|[A-Z]\.\s+[A-Z]\S*)", re.IGNORECASE)
 
 
+_ALGO_HEADER_RE = re.compile(r"^\s*Algorithm\s+\d+(?:\b|[:.\-])", re.IGNORECASE)
+_ALGO_LINE_CUE_RE = re.compile(
+    r"^(?:\*?\*?\d+[:.]\s+|(?:Input|Output|Require|Ensure)\s*:|"
+    r"(?:for|while|if|else|elif|elsif|end\s*(?:for|if|while)|return|repeat|until|Function|Procedure|Initialize|Initialization)\b)",
+    re.IGNORECASE,
+)
+_ALGO_INLINE_CUE_RE = re.compile(
+    r"(?:\b(?:Input|Output|Require|Ensure)\s*:|\b1:\s+(?:Initialize|Initialization|for|while|if|Set|Let|Compute|Update)\b|←|\\leftarrow)",
+    re.IGNORECASE,
+)
+
+
+def _is_algorithm_block(text: str) -> bool:
+    """Detect pseudocode / Algorithm blocks (including multi-line boxes starting with
+    'Algorithm N ...' or numbered pseudocode) while sparing body prose that merely
+    references 'Algorithm 1'."""
+    s = text.strip()
+    if not s:
+        return False
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    has_algo_header = bool(_ALGO_HEADER_RE.match(lines[0])) if lines else False
+
+    if len(lines) >= 2:
+        cue_hits = sum(
+            1
+            for ln in lines[1:]
+            if _ALGO_LINE_CUE_RE.match(ln) or "←" in ln or "\\leftarrow" in ln
+        )
+        if has_algo_header and cue_hits >= 1:
+            return True
+        all_cue_hits = sum(
+            1
+            for ln in lines
+            if _ALGO_LINE_CUE_RE.match(ln) or "←" in ln or "\\leftarrow" in ln
+        )
+        if all_cue_hits >= 2:
+            return True
+
+    # Single-line / space-joined OCR output of an Algorithm block
+    if has_algo_header and _ALGO_INLINE_CUE_RE.search(s):
+        return True
+    return False
+
+
 def _is_code_listing(text: str) -> bool:
     s = text.strip()
     if not s or len(s) > 800:
@@ -368,6 +412,11 @@ def normalize_pages(
                 layout_role = "figure_label"
                 translate = False
                 preserve_reason = "vertical_figure_label"
+                redact_source = False
+            elif role_hint in {"algorithm", "code"} or _is_algorithm_block(text):
+                layout_role = "algorithm"
+                translate = False
+                preserve_reason = "algorithm"
                 redact_source = False
             elif role_hint == "caption" or _CAPTION_RE.match(text):
                 layout_role = "caption"

@@ -446,3 +446,55 @@ def test_span_math_preserves_existing_delimiters_plain_text_and_non_math_blocks(
 
 
 
+
+
+def test_algorithm_pseudocode_blocks_preserved_and_prose_mention_translated():
+    """Real Algorithm pseudocode blocks (Algorithm N + Input/Require/numbered steps) must be
+    preserved untranslated (layout_role='algorithm', translate=False, redact_source=False),
+    while normal body prose starting with 'Algorithm 1 ...' must remain translatable."""
+    pages = [
+        {
+            "page_index": 4,
+            "width": 612.0,
+            "height": 792.0,
+            "figure_regions": [],
+            "table_regions": [],
+            "blocks": [
+                {
+                    "block_id": "p4b0000",
+                    "text": "Algorithm 1: NetKV Decode Instance Selection\nInput: Request r, prefill instance p, pool D, oracle O\nOutput: Selected decode instance $d^*$\n1: best <- None\n2: for d in D do\n3: return best",
+                    "bbox": [48.0, 49.0, 294.0, 247.0],
+                    "font_size_pt": 9.0,
+                },
+                {
+                    "block_id": "p4b0001",
+                    "text": "Algorithm 1 Control Node Placement Algorithm (CNPA)\nRequire: G: topology snapshots; k: number of control nodes\nEnsure: placement set P",
+                    "bbox": [45.0, 45.0, 301.0, 313.0],
+                    "font_size_pt": 9.0,
+                },
+                {
+                    "block_id": "p4b0002",
+                    "text": "Algorithm 1 integrates into the existing scheduling loop. Lines 5–8 add network cost computation, which is a tier lookup, two multiplications, and a comparison.",
+                    "bbox": [45.0, 450.0, 301.0, 523.0],
+                    "font_size_pt": 10.0,
+                },
+                {
+                    "block_id": "p4b0003",
+                    "text": "1: Initialize $x \\leftarrow 0$\n2: for each node $v \\in V$ do\n3: return $x$",
+                    "bbox": [310.0, 60.0, 560.0, 180.0],
+                    "font_size_pt": 9.0,
+                },
+            ],
+        }
+    ]
+    norm = normalize_pages(pages, coord_space="pdf_pt", dpi=72.0)
+    by_id = {b["block_id"]: b for b in norm[0]["blocks"]}
+
+    for bid in ("p4b0000", "p4b0001", "p4b0003"):
+        assert by_id[bid]["layout_role"] == "algorithm", f"{bid} should be algorithm"
+        assert by_id[bid]["policy"]["translate"] is False
+        assert by_id[bid]["policy"]["preserve_reason"] == "algorithm"
+        assert by_id[bid]["policy"]["redact_source"] is False
+
+    # Prose paragraph mentioning Algorithm 1 must still be translated
+    assert by_id["p4b0002"]["policy"]["translate"] is True
